@@ -1,0 +1,11 @@
+[package]
+name = "mwine-scrcpy"
+description = "Rust scrcpy 4.0 client: virtual-display video stream + control channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mwine-adb.workspace = true
+thiserror.workspace = true

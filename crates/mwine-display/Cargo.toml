@@ -1,0 +1,27 @@
+[package]
+name = "mwine-display"
+description = "M2 显示管线：qemu 帧缓冲获取（gRPC streamScreenshot 为主，VNC 备选）+ macOS 原生窗口渲染"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+png = "0.17"
+winit = { version = "0.30", optional = true }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+[features]
+default = []
+# winit + wgpu(Metal 后端) 窗口渲染；核心协议层保持零窗口依赖
+render = ["dep:winit", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[build-dependencies]
+tonic-build = "0.12"
+protox = "0.7"

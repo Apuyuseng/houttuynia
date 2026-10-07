@@ -1,0 +1,12 @@
+[package]
+name = "mwine-wine"
+description = "Windows exe 运行时：Wine 发现 / 精简模板前缀 / clonefile 克隆 / 前缀裁剪"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

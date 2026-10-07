@@ -1,0 +1,13 @@
+[package]
+name = "mwine-config"
+description = "Device configuration: persistence + runtime hot-apply"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mwine-adb.workspace = true
+thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

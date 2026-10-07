@@ -1,0 +1,70 @@
+syntax = "proto3";
+package android.emulation.control;
+
+service EmulatorController {
+  rpc getScreenshot(ImageFormat) returns (Image);
+  rpc streamScreenshot(ImageFormat) returns (stream Image);
+  rpc sendTouch(TouchEvent) returns (Ok);
+  rpc sendKey(KeyboardEvent) returns (Ok);
+  rpc sendMouse(MouseEvent) returns (Ok);
+  rpc getStatus(Ok) returns (EmulatorStatus);
+  rpc setClipboard(ClipData) returns (Ok);
+  rpc getClipboard(Ok) returns (ClipData);
+}
+
+message Ok {}
+
+message ImageFormat {
+  enum ImgFormat { PNG = 0; RGBA8888 = 1; RGB888 = 2; }
+  ImgFormat format = 1;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 display = 5;
+}
+
+message Image {
+  ImageFormat format = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  bytes image = 4;
+  uint32 seq = 5;
+  uint64 timestampUs = 6;
+}
+
+message TouchEvent {
+  uint32 display = 1;
+  int32 x = 2;
+  int32 y = 3;
+  int32 pressure = 4;
+  enum TouchKind { TOUCH_DOWN = 0; TOUCH_UP = 1; TOUCH_MOVE = 2; }
+  TouchKind kind = 5;
+}
+
+message KeyboardEvent {
+  enum KeyKind { KEYDOWN = 0; KEYUP = 1; KEYPRESS = 2; }
+  KeyKind kind = 1;
+  string code = 2;
+  uint32 modifiers = 3;
+  string text = 4;
+}
+
+message MouseEvent {
+  enum MouseKind { MOUSE_DOWN = 0; MOUSE_UP = 1; MOUSE_MOVE = 2; MOUSE_WHEEL = 3; }
+  MouseKind kind = 1;
+  int32 x = 2;
+  int32 y = 3;
+  int32 buttons = 4;
+  int32 deltaX = 5;
+  int32 deltaY = 6;
+}
+
+message EmulatorStatus {
+  enum VMState { STOPPED = 0; RUNNING = 1; PAUSED = 2; }
+  VMState state = 1;
+  string avdName = 2;
+  int64 uptime = 3;
+}
+
+message ClipData {
+  string text = 1;
+}

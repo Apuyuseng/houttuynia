@@ -1,0 +1,18 @@
+[package]
+name = "mwine-supervisor"
+description = "Android emulator / VM lifecycle management on macOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mwine-adb.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+zstd.workspace = true
+tar.workspace = true
+sha2.workspace = true
+zip.workspace = true

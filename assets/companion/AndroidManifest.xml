@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.mwine.bridge">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 13+ 通知运行时权限；targetSdk 为 legacy 时默认已授予，
+         声明后用户在系统设置中可见、pm grant 也可控 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="mwine bridge"
+        android:icon="@android:drawable/sym_def_app_icon">
+
+        <service
+            android:name=".BridgeService"
+            android:label="mwine notification bridge"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".TestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.mwine.bridge.TEST" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

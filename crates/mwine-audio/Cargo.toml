@@ -1,0 +1,12 @@
+[package]
+name = "mwine-audio"
+description = "Guest audio routing: scrcpy audio (flac) -> ffmpeg decode -> CoreAudio (cpal) output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mwine-scrcpy.workspace = true
+thiserror.workspace = true
+cpal = "0.15"

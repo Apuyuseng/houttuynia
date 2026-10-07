@@ -1,0 +1,9 @@
+[package]
+name = "mwine-keymap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mwine-scrcpy = { path = "../mwine-scrcpy" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

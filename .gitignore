@@ -1,0 +1,33 @@
+# ---- 构建产物 ----
+/target
+/crates/*/target
+.build/
+assets/companion/dist/
+dist/
+*.dmg
+*.h264
+*.mp4
+Cargo.lock.bak
+
+# ---- 本地运行时（体积大，不随源码分发）----
+/runtime/
+
+# ---- 内部开发资料（仅本地，不发布）----
+NOTES.md
+/docs/
+# 未完成的孤立 crate（不随源码发布）
+/crates/mwine-input/
+scripts/ssh_build.sh
+scripts/fetch_aosp_image.sh
+scripts/watch_rebuild_and_fetch.sh
+scripts/build-custom-image.sh
+
+# ---- 本地工具目录 ----
+.v2c/
+.video_agent/
+.zcode/
+.claude/
+.cursor/
+
+# ---- 系统文件 ----
+.DS_Store
