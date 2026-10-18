@@ -1,0 +1,29 @@
+PID:2518, Comm:main, TID:2518, FD:42, Tuple: [::ffff:10.0.2.15]:49874->[::ffff:110.242.68.66]:443
+PID:0, Comm:, TID:0, FD:0, Tuple: [::]:0->[::]:0
+PID:2565, Comm:main, TID:2565, FD:42, Tuple: [::ffff:10.0.2.15]:54916->[::ffff:110.242.68.66]:443
+PID:0, Comm:, TID:0, FD:0, Tuple: [::]:0->[::]:0
+PID:2678, Comm:main, TID:2678, FD:42, Tuple: [::ffff:10.0.2.15]:42418->[::ffff:183.2.172.177]:443
+[2026-10-07 15:36:32.210] PID:2678 TID:2678 Comm:main FD:0 WRITE (103 bytes):
+GET / HTTP/1.1
+Host: www.baidu.com
+User-Agent: mwine-tlsprobe/1.0
+Accept: */*
+Connection: close
+
+[2026-10-07 15:36:32.247] PID:2678 TID:2678 Comm:main FD:0 READ (1179 bytes):
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Cache-Control: no-cache
+Content-Length: 227
+Content-Security-Policy: frame-ancestors 'self' https://chat.baidu.com http://mirror-chat.baidu.com https://fj-chat.baidu.com https://hba-chat.baidu.com https://hbe-chat.baidu.com https://njjs-chat.baidu.com https://nj-chat.baidu.com https://hna-chat.baidu.com https://hnb-chat.baidu.com http://debug.baidu-int.com https://sai.baidu.com https://mcpstore.baidu.com https://mcpserver.baidu.com https://www.mcpworld.com https://platform-openai.now.baidu.com;
+Content-Type: text/html
+Date: Wed, 07 Oct 2026 15:36:32 GMT
+P3p: CP=" OTI DSP COR IVA OUR IND COM "
+P3p: CP=" OTI DSP COR IVA OUR IND COM "
+Pragma: no-cache
+Server: BWS/1.1
+Set-Cookie: BD_NOT_HTTPS=1; path=/; Max-Age=300
+Set-Cookie: BIDUPSID=3E115B79E9BD7C2D16389EF4B7EE954F; expires=Thu, 31-Dec-37 23:55:55 GMT; max-age=2147483647; path=/; domain=.baidu.com
+Set-Cookie: PSTM=1791387392; expires=Thu, 31-Dec-37 23:55:55 GMT; max-age=2147483647; path=/; domain=.baidu.com
+Set-Cookie: BAIDUID=3E115B79E9BD7C2D83B4FB9D3DFFEDED:FG=1; max-age=31536000; expires=Thu, 07-Oct-27 15:36:32 GMT; domain=.baidu.com; path=/; version=1; comme
+PID:0, Comm:, TID:0, FD:0, Tuple: [::]:0->[::]:0

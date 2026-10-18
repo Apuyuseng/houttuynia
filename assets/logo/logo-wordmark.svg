@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" width="1280" height="320">
+  <defs>
+    <linearGradient id="blade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#A9D468"/>
+      <stop offset="0.55" stop-color="#7CB84E"/>
+      <stop offset="1" stop-color="#4E9A3F"/>
+    </linearGradient>
+    <linearGradient id="flush" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#C25B4E" stop-opacity="0"/>
+      <stop offset="0.55" stop-color="#C25B4E" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#B5434E" stop-opacity="0.5"/>
+    </linearGradient>
+    <linearGradient id="petiole" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6FAF4C"/>
+      <stop offset="0.5" stop-color="#9C5A50"/>
+      <stop offset="1" stop-color="#AD4A5E"/>
+    </linearGradient>
+    <clipPath id="leafClip">
+      <path d="M 272,84
+               C 246,110 206,168 166,226
+               C 128,282 112,330 128,368
+               C 140,394 158,412 182,420
+               C 200,426 218,426 232,418
+               C 242,394 250,364 256,336
+               C 264,372 276,398 292,414
+               C 314,428 342,424 362,404
+               C 388,378 398,340 394,300
+               C 386,244 344,158 300,104
+               C 294,96 284,88 272,84 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- 左侧叶标（缩放 0.56，置于 24,48） -->
+  <g transform="translate(24,42) scale(0.56)">
+    <path d="M 257,346 C 260,392 250,442 214,486"
+          fill="none" stroke="url(#petiole)" stroke-width="14" stroke-linecap="round"/>
+    <path d="M 272,84
+             C 246,110 206,168 166,226
+             C 128,282 112,330 128,368
+             C 140,394 158,412 182,420
+             C 200,426 218,426 232,418
+             C 242,394 250,364 256,336
+             C 264,372 276,398 292,414
+             C 314,428 342,424 362,404
+             C 388,378 398,340 394,300
+             C 386,244 344,158 300,104
+             C 294,96 284,88 272,84 Z"
+          fill="url(#blade)"/>
+    <g clip-path="url(#leafClip)">
+      <rect x="96" y="330" width="320" height="110" fill="url(#flush)"/>
+    </g>
+    <g fill="none" stroke="#F4F7E3" stroke-linecap="round">
+      <path d="M 256,336 C 258,260 262,180 271,92" stroke-width="12"/>
+      <path d="M 256,336 C 226,328 190,315 154,302" stroke-width="9"/>
+      <path d="M 256,336 C 290,326 332,310 366,294" stroke-width="9"/>
+      <path d="M 256,336 C 230,352 202,374 176,398" stroke-width="9"/>
+      <path d="M 256,336 C 286,354 316,378 344,400" stroke-width="9"/>
+    </g>
+  </g>
+
+  <!-- 字标 -->
+  <text x="348" y="180" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif"
+        font-size="104" font-weight="600" letter-spacing="2" fill="#2E4A26">Houttuynia</text>
+  <text x="352" y="246" font-family="'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif"
+        font-size="40" font-weight="500" letter-spacing="10" fill="#5F7D54">鱼腥草 · ANDROID ON MACOS</text>
+</svg>

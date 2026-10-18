@@ -4,6 +4,8 @@
 .build/
 assets/companion/dist/
 dist/
+/cpp/build/
+/app/qt/build/
 *.dmg
 *.h264
 *.mp4
@@ -11,6 +13,8 @@ Cargo.lock.bak
 
 # ---- 本地运行时（体积大，不随源码分发）----
 /runtime/
+# AOSP 镜像构建残留（本地解包产物）
+/$R/
 
 # ---- 内部开发资料（仅本地，不发布）----
 NOTES.md

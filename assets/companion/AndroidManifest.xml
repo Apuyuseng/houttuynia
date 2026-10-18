@@ -28,5 +28,18 @@
                 <action android:name="com.mwine.bridge.TEST" />
             </intent-filter>
         </receiver>
+
+        <activity
+            android:name=".UnlockActivity"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:exported="true" />
+
+        <receiver
+            android:name=".WallpaperReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.mwine.bridge.EXPORT_WALLPAPER" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
