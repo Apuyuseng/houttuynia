@@ -25,6 +25,7 @@
 #include <QNetworkRequest>
 #include <QThread>
 #include <QTimer>
+#include <QtEndian>
 #include <algorithm>
 #include <vector>
 

@@ -3,6 +3,9 @@ services:
     build:
       context: ..
       dockerfile: nas/Dockerfile
+      args:
+        # 国内网络构建加速（Debian 包镜像）；海外/直连可删除这两行
+        APT_MIRROR: mirrors.ustc.edu.cn
     image: houttuynia-nas:latest
     container_name: houttuynia-nas
     restart: unless-stopped

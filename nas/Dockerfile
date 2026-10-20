@@ -12,7 +12,14 @@
 # ---------- 构建阶段 ----------
 FROM debian:bookworm AS build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 国内构建建议：--build-arg APT_MIRROR=mirrors.ustc.edu.cn
+# （deb.debian.org 直连在部分网络只有几十 KB/s；置空走默认官方源）
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org|http://${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
         cmake g++ make ninja-build \
         qt6-base-dev qt6-base-dev-tools \
         libzstd-dev libsqlite3-dev libssl-dev zlib1g-dev \
@@ -32,7 +39,12 @@ RUN cmake -S cpp -B cpp/build -G Ninja \
 # ---------- 运行阶段 ----------
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org|http://${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
         libqt6core6 libqt6network6 \
         libzstd1 libsqlite3-0 libssl3 zlib1g \
         ca-certificates curl unzip xz-utils \
