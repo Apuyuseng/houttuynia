@@ -26,8 +26,8 @@ namespace mw::daemon {
 
 namespace {
 
-// ===================== 线协议（浏览器侧 app.js 对齐解析，全大端）=====================
-// 帧头：u16 magic(0x4D57) | u8 type | u8 reserved | u64 pts_us | u32 payload_len
+// ===================== 线协议（浏览器侧 app.js/stream.js 对齐解析，全大端）=====================
+// 帧头 15 字节：u16 magic(0x4D57) | u8 type | u64 pts_us | u32 payload_len
 enum : quint8 {
     kPktConfig = 0, // SPS/PPS（Annex-B）
     kPktDelta = 1,
@@ -51,7 +51,6 @@ struct OutFrame {
         out.append(char(kMagic >> 8));
         out.append(char(kMagic & 0xFF));
         out.append(char(type));
-        out.append(char(0));
         for (int i = 7; i >= 0; --i)
             out.append(char((pts >> (i * 8)) & 0xFF));
         const quint32 len = quint32(data.size());

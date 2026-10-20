@@ -1,6 +1,6 @@
 /* scrcpy Web 投屏播放器：fetch 流式拉取自定义帧包 → WebCodecs 硬解 → canvas 渲染。
- * 帧协议（大端，与 daemon/streamweb.cpp OutFrame 对齐）：
- *   u16 magic(0x4D57) | u8 type(0 config/1 delta/2 key/3 meta/4 end) | u8 reserved
+ * 帧协议（大端，与 daemon/streamweb.cpp OutFrame 对齐，头 15 字节）：
+ *   u16 magic(0x4D57) | u8 type(0 config/1 delta/2 key/3 meta/4 end)
  *   | u64 pts_us | u32 len | payload
  * 输入注入：pointer → /touch，wheel → /scroll，按键 → /key，文本 → /text。
  */
