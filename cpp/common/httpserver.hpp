@@ -15,6 +15,7 @@
 #include <functional>
 
 class QThreadPool;
+class QTcpSocket;
 
 namespace mw {
 
@@ -35,6 +36,12 @@ struct HttpResponse {
     QByteArray contentType = QByteArrayLiteral("application/json");
     QByteArray body;
     QMap<QByteArray, QByteArray> extraHeaders;
+
+    // 流式模式：置位后忽略 body——先写响应头（无 Content-Length，
+    // Connection: close），再在池线程内回调持续写流，直到回调返回
+    // 或对端断开。视频推流等长连接场景用（占一个池线程是预期内）。
+    // 回调返回 false 表示异常终止（连接已被破坏则不再写关闭帧）。
+    std::function<bool(QTcpSocket&)> streamer;
 
     static HttpResponse json(int code, const QByteArray& body)
     {

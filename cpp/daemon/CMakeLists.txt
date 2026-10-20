@@ -12,7 +12,7 @@ target_include_directories(mwine-cored PRIVATE
     ${CMAKE_SOURCE_DIR}/modules/supervisor
     ${CMAKE_SOURCE_DIR}/modules/capture)
 target_link_libraries(mwine-cored PRIVATE
-    mw_common mw_adb mw_config mw_keymap mw_app mw_store mw_supervisor mw_capture)
+    mw_common mw_adb mw_config mw_keymap mw_app mw_store mw_supervisor mw_capture mw_scrcpy)
 
 # 图标抓取子进程：与守护隔离（解析器在守护并发环境下有堆损坏史，
 # 隔离后最坏情况是单个图标缺失，守护本体不受影响）。

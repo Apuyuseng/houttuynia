@@ -14,6 +14,7 @@
 #include "routes.hpp"
 #include "state.hpp"
 #include "store_api.hpp"
+#include "streamweb.hpp"
 
 namespace mw::daemon {
 
@@ -397,7 +398,12 @@ mw::HttpResponse webDispatch(const mw::HttpRequest& req, AppState* state)
     if (!authorized(req, expectedToken()))
         return unauthorized();
 
-    // ---- 扩展路由（二进制/上传；先于 JSON 契约，无 64KB 体上限）----
+    // ---- 扩展路由（二进制/上传/投屏；先于 JSON 契约，无 64KB 体上限）----
+    if (pathOnly.startsWith(QStringLiteral("/api/stream"))) {
+        mw::HttpResponse r;
+        if (streamDispatch(req, state, pathOnly, &r))
+            return r;
+    }
     if (req.method == QStringLiteral("GET") && pathOnly == QStringLiteral("/api/screenshot.png"))
         return screenshotPng(state, req);
     if (req.method == QStringLiteral("GET") && pathOnly == QStringLiteral("/api/apps/icon"))

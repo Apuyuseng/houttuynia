@@ -45,6 +45,7 @@ const S = {
   timers: [],            // 页级轮询定时器
   term: null,            // {id, cursor, alive}
   screen: { live: false, timer: null },
+  player: null,          // ScrcpyWebPlayer 投屏实例
 };
 
 function saveToken(t) {
@@ -113,6 +114,7 @@ function clearPolls() {
   S.timers.forEach(clearInterval);
   S.timers = [];
   stopScreenLive();
+  if (S.player) { const p = S.player; S.player = null; p.stop(); }
 }
 function addPoll(fn, ms) {
   fn();
@@ -163,16 +165,34 @@ setInterval(refreshTopbar, 4000);
 
 // ===================== 概览 =====================
 async function renderOverview(view) {
+  const canStream = window.ScrcpyWebPlayer && ScrcpyWebPlayer.supported();
   view.innerHTML = `
     <div class="overview-grid">
       <div class="card">
         <h3>设备屏幕
           <span class="spacer"></span>
           <button class="btn sm" id="ov-shot">保存截图</button>
-          <button class="btn sm" id="ov-live">实时画面</button>
+          ${canStream
+            ? '<button class="btn sm primary" id="ov-stream">▶ 投屏</button>'
+            : '<button class="btn sm" id="ov-live">实时画面</button>'}
         </h3>
         <div class="screen-box" id="ov-screen">
           <div class="placeholder">虚拟机未运行<br><span class="small muted">启动后此处显示设备画面</span></div>
+        </div>
+        <div id="ov-stream-bar" class="stream-bar hidden">
+          <div class="btn-row">
+            <button class="btn sm" data-key="4">返回</button>
+            <button class="btn sm" data-key="3">主页</button>
+            <button class="btn sm" data-key="187">多任务</button>
+            <button class="btn sm" data-key="26">电源</button>
+            <button class="btn sm" data-key="24">音量+</button>
+            <button class="btn sm" data-key="25">音量−</button>
+          </div>
+          <div class="term-input-row" style="margin-top:8px;">
+            <input class="form-input" id="ov-text" placeholder="输入文本发送到设备（中文请用设备内输入法）">
+            <button class="btn sm" id="ov-text-send">发送</button>
+          </div>
+          <div class="small muted" id="ov-stream-status" style="margin-top:6px;"></div>
         </div>
       </div>
       <div style="display:grid;gap:18px;">
@@ -197,10 +217,79 @@ async function renderOverview(view) {
   $('#ov-start').onclick = () => vmAction('start');
   $('#ov-stop').onclick = () => vmAction('stop');
   $('#ov-shot').onclick = downloadScreenshot;
-  $('#ov-live').onclick = () => S.screen.live ? stopScreenLive() : startScreenLive();
+  const streamBtn = $('#ov-stream');
+  if (streamBtn) streamBtn.onclick = () => S.player ? stopStream() : startStream();
+  const liveBtn = $('#ov-live');
+  if (liveBtn) liveBtn.onclick = () => S.screen.live ? stopScreenLive() : startScreenLive();
+  $$('#ov-stream-bar [data-key]').forEach(btn => {
+    btn.onclick = () => S.player && S.player.key(+btn.dataset.key);
+  });
+  $('#ov-text-send').onclick = () => {
+    const inp = $('#ov-text');
+    if (S.player && inp.value) { S.player.text(inp.value); inp.value = ''; }
+  };
+  $('#ov-text').onkeydown = e => {
+    if (e.key === 'Enter') $('#ov-text-send').click();
+    e.stopPropagation();
+  };
 
   addPoll(updateOverviewStatus, 3000);
   addPoll(updateOverviewPerf, 2500);
+}
+
+// ---- scrcpy Web 投屏 ----
+async function startStream() {
+  if (S.player) return;
+  stopScreenLive();
+  const box = screenBox();
+  if (!box) return;
+  box.innerHTML = '<div class="placeholder"><span class="spin">⏳</span> 正在建立投屏…</div>';
+  const player = new ScrcpyWebPlayer({
+    container: box,
+    apiPost,
+    imgUrl,
+    onStatus: (text, isError) => {
+      const el = $('#ov-stream-status');
+      if (el) {
+        el.textContent = text;
+        el.style.color = isError ? 'var(--red)' : '';
+      }
+    },
+    onEnd: () => {
+      S.player = null;
+      const bar = $('#ov-stream-bar');
+      if (bar) bar.classList.add('hidden');
+      const btn = $('#ov-stream');
+      if (btn) { btn.textContent = '▶ 投屏'; btn.classList.add('primary'); }
+      if (screenBox()) loadScreenshotOnce();
+    },
+  });
+  S.player = player;
+  const bar = $('#ov-stream-bar');
+  if (bar) bar.classList.remove('hidden');
+  const btn = $('#ov-stream');
+  if (btn) { btn.textContent = '■ 停止投屏'; btn.classList.remove('primary'); }
+  try {
+    await player.start();
+  } catch (e) {
+    // 会话建立失败（编码器不可用/设备未运行等）：复位 UI + 提示
+    S.player = null;
+    player._finish();
+    toast('投屏失败：' + e.message, 'err', 5000);
+    const b2 = $('#ov-stream');
+    if (b2) { b2.textContent = '▶ 投屏'; b2.classList.add('primary'); }
+    const bar2 = $('#ov-stream-bar');
+    if (bar2) bar2.classList.add('hidden');
+    if (screenBox()) loadScreenshotOnce();
+  }
+}
+
+async function stopStream() {
+  if (!S.player) return;
+  const p = S.player;
+  S.player = null;
+  await p.stop();
+  if (screenBox()) loadScreenshotOnce();
 }
 
 async function vmAction(act) {
@@ -225,7 +314,7 @@ async function updateOverviewStatus() {
     ? `状态：<b style="color:var(--accent)">运行中</b> · 设备 <span class="mono">${esc(vm.serial || '-')}</span>`
     : '状态：<b>未运行</b>';
   $('#ov-error').textContent = st.error || '';
-  if (vm.running && !S.screen.live) loadScreenshotOnce();
+  if (vm.running && !S.screen.live && !S.player) loadScreenshotOnce();
 }
 
 async function updateOverviewPerf() {

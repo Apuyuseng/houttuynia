@@ -252,6 +252,14 @@ input, select, textarea { font: inherit; }
 .spin { display: inline-block; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---------- 投屏 ---------- */
+.stream-canvas {
+  width: 100%; height: 100%; object-fit: contain; display: block;
+  outline: none; cursor: crosshair; background: #000;
+}
+.stream-bar { margin-top: 10px; }
+.hidden { display: none !important; }
+
 @media (max-width: 760px) {
   #sidebar { width: 64px; }
   #sidebar .brand-name, #sidebar .brand-sub, #nav a:not(.ico), .sidebar-foot .ver, .link-btn { font-size: 0; }

@@ -137,7 +137,8 @@ public:
         QByteArray resp;
         resp += "HTTP/1.1 " + QByteArray::number(r.code) + " " + reasonPhrase(r.code) + "\r\n";
         resp += "Content-Type: " + r.contentType + "\r\n";
-        resp += "Content-Length: " + QByteArray::number(r.body.size()) + "\r\n";
+        if (!r.streamer)
+            resp += "Content-Length: " + QByteArray::number(r.body.size()) + "\r\n";
         resp += "Connection: close\r\n";
         for (auto it = r.extraHeaders.constBegin(); it != r.extraHeaders.constEnd(); ++it) {
             // 响应头注入防护：键值均不允许换行
@@ -147,6 +148,21 @@ public:
             resp += it.key() + ": " + it.value() + "\r\n";
         }
         resp += "\r\n";
+        // 流式模式：只写响应头，然后把 socket 交给回调持续推流
+        if (r.streamer) {
+            qint64 off = 0;
+            while (off < resp.size()) {
+                const qint64 n = sock.write(resp.mid(off, 64 * 1024));
+                if (n < 0)
+                    return;
+                off += n;
+                if (!sock.waitForBytesWritten(10000))
+                    return;
+            }
+            (void)r.streamer(sock);
+            sock.disconnectFromHost();
+            return;
+        }
         resp += r.body;
         // 大响应（截图/静态资源）分块写，避免单次 write 截断
         qint64 off = 0;
