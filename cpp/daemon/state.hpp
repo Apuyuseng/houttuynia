@@ -174,9 +174,12 @@ struct AppState {
     QString vmSerial;     // 空 = 未收养
 
     TaskState imageTask, runtimeTask, storeTask, installTask;
+    // ecapture 组件按需下载（app 不内置；开启流量分析时从 Releases 拉取）
+    TaskState captureBinTask;
     std::shared_ptr<std::atomic_bool> imageCancel = std::make_shared<std::atomic_bool>(false);
     std::shared_ptr<std::atomic_bool> storeCancel = std::make_shared<std::atomic_bool>(false);
     std::shared_ptr<std::atomic_bool> runtimeCancel = std::make_shared<std::atomic_bool>(false);
+    std::shared_ptr<std::atomic_bool> captureBinCancel = std::make_shared<std::atomic_bool>(false);
 
     capture::Session capture;
 
