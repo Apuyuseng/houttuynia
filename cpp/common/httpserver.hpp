@@ -1,6 +1,9 @@
 // 极简 REST 服务器：QTcpServer + 线程池，每连接一线程阻塞处理。
 // 契约对齐 mwine-core 的 daemon.rs：单 handler 接 (method, path, body) 返回 (code, body)。
 // 连接逐请求关闭（Connection: close），localhost UI 轮询场景足够。
+//
+// NAS/Web 模式扩展：HttpResponse 携带 Content-Type 与自定义响应头
+// （静态资源 / PNG 二进制直出），构造时可指定绑定地址（默认 127.0.0.1）。
 #pragma once
 
 #include <QByteArray>
@@ -27,12 +30,33 @@ struct HttpRequest {
     QMap<QString, QString> queryAll() const;
 };
 
-using HttpHandler = std::function<QPair<int, QByteArray>(const HttpRequest&)>;
+struct HttpResponse {
+    int code = 200;
+    QByteArray contentType = QByteArrayLiteral("application/json");
+    QByteArray body;
+    QMap<QByteArray, QByteArray> extraHeaders;
+
+    static HttpResponse json(int code, const QByteArray& body)
+    {
+        HttpResponse r;
+        r.code = code;
+        r.body = body;
+        return r;
+    }
+};
+
+using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
+
+// 旧契约 (code, body) JSON handler 适配器（daemon 的 REST 契约路由继续用）
+HttpHandler adaptJsonHandler(std::function<QPair<int, QByteArray>(const HttpRequest&)> fn);
 
 class HttpServer : public QObject {
     Q_OBJECT
 public:
     explicit HttpServer(HttpHandler handler, quint16 port, QObject* parent = nullptr);
+    // host 形如 "127.0.0.1"（默认）/ "0.0.0.0" / "::" / 具体网卡 IP
+    HttpServer(HttpHandler handler, const QString& host, quint16 port,
+               QObject* parent = nullptr);
 
     // 监听成功返回 true（端口占用返回 false）
     bool start();
@@ -41,6 +65,7 @@ private:
     void onNewConnection();
 
     HttpHandler m_handler;
+    QString m_host;
     quint16 m_port;
     QTcpServer m_server;
     QThreadPool* m_pool = nullptr;

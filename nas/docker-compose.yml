@@ -1,0 +1,30 @@
+services:
+  houttuynia:
+    build:
+      context: ..
+      dockerfile: nas/Dockerfile
+    image: houttuynia-nas:latest
+    container_name: houttuynia-nas
+    restart: unless-stopped
+    ports:
+      - "7788:7788"
+    environment:
+      # 必改：访问令牌（Web 控制台登录凭据；不设置则局域网无防护）
+      MWINE_TOKEN: "please-change-me"
+      # 可选：桥接/端口冲突时改端口（容器内外需一致）
+      # MWINE_PORT: "7788"
+      # 安装模拟器运行时后取消注释（先跑 setup-emulator.sh）：
+      # MWINE_SDK_ROOT: /data/android-sdk
+      # 可选：HTTP 代理（镜像/商店拉取走代理）
+      # https_proxy: "http://192.168.1.2:7890"
+    volumes:
+      - houttuynia-data:/data
+    # KVM 硬件加速（x86_64 主机强烈建议；无 KVM 时纯软解极慢）
+    devices:
+      - "/dev/kvm:/dev/kvm"
+    # 健康检查起算时间放宽（首次启动要做路径初始化）
+    healthcheck:
+      start_period: 20s
+
+volumes:
+  houttuynia-data:

@@ -1689,6 +1689,21 @@ Resp vmStartWindowed(AppState* state, bool forceWindowed)
         // 视觉用官方 -qt-hide-window（启动即有窗但隐藏）实现，帧不受影响
         opts.windowed = true;
         opts.hideWindow = !forceWindowed && (cfg.windowModeAll || cfg.hideEmulatorWindow);
+        // NAS/服务器无头环境：无显示服务器（或显式 MWINE_HEADLESS=1）时
+        // 退 -no-window——此时没有 Qt 窗口可显示，屏幕由 Web 截图通道承担。
+        // 多维显示副屏帧尺寸在无头下的已知畸变只影响独立窗口特性（Web 模式不用）。
+        if (qEnvironmentVariableIsSet("MWINE_HEADLESS")
+            || qEnvironmentVariableIsSet("MWINE_NO_WINDOW")) {
+            opts.windowed = false;
+            opts.hideWindow = false;
+        }
+#ifdef Q_OS_LINUX
+        if (qEnvironmentVariableIsEmpty("DISPLAY")
+            && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
+            opts.windowed = false;
+            opts.hideWindow = false;
+        }
+#endif
         opts.avdHome = avdHomeOverride;
         opts.noSnapshot = cfg.noSnapshot;
         opts.noBootAnim = cfg.noBootAnim;

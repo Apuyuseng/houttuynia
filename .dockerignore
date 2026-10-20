@@ -1,0 +1,12 @@
+# 构建上下文裁剪：本地构建产物 / 运行时 / 分发物不进镜像
+**/build
+dist
+runtime
+.git
+.DS_Store
+**/.DS_Store
+docs
+app
+scripts
+assets
+NOTES.md

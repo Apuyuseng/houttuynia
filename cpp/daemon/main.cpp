@@ -35,8 +35,19 @@
 #include "state.hpp"
 #include "store_api.hpp"
 #include "supervisor.hpp"
+#include "webapi.hpp"
 
 namespace {
+
+// 守护内部回环 HTTP 调用（自愈重启走自己的 REST）：Token 模式需自带头
+QMap<QByteArray, QByteArray> loopbackHeaders()
+{
+    QMap<QByteArray, QByteArray> h;
+    const QString t = qEnvironmentVariable("MWINE_TOKEN").trimmed();
+    if (!t.isEmpty())
+        h.insert("Authorization", "Bearer " + t.toUtf8());
+    return h;
+}
 
 // 把 stdout/stderr 追加到 ~/.mwine/logs/daemon.log（超 4MB 截断重开）。
 // daemon 常以 GUI 子进程（管道 stdio）方式被拉起，GUI 退出后管道断裂，
@@ -226,11 +237,11 @@ void orphanWatchdogLoop(mw::daemon::AppState* state)
                     (void)mw::httpRequest(
                         QStringLiteral("POST"),
                         QUrl(QStringLiteral("http://127.0.0.1:%1/api/vm/stop").arg(port)),
-                        QByteArray{}, {}, 90000);
+                        QByteArray{}, loopbackHeaders(), 90000);
                     (void)mw::httpRequest(
                         QStringLiteral("POST"),
                         QUrl(QStringLiteral("http://127.0.0.1:%1/api/vm/start").arg(port)),
-                        QByteArray{}, {}, 10000);
+                        QByteArray{}, loopbackHeaders(), 10000);
                 } else {
                     healLevel = 0;
                     MW_LOG("orphan",
@@ -282,7 +293,7 @@ void orphanWatchdogLoop(mw::daemon::AppState* state)
                     (void)mw::httpRequest(
                         QStringLiteral("POST"),
                         QUrl(QStringLiteral("http://127.0.0.1:%1/api/vm/start").arg(port)),
-                        QByteArray{}, {}, 10000);
+                        QByteArray{}, loopbackHeaders(), 10000);
                 }
             }
             }  // end else（非任务繁忙才跑 shell 自愈）
@@ -478,13 +489,25 @@ int main(int argc, char* argv[])
     const quint16 port =
         (portOk && envPort > 0 && envPort <= 65535) ? quint16(envPort) : quint16(7788);
 
+    // NAS/Web 模式：MWINE_HOST 指定绑定地址（默认 127.0.0.1 仅本机；
+    // "0.0.0.0"/"::" 对局域网开放）。对外开放时务必设置 MWINE_TOKEN，
+    // 否则局域网内任何人都能操作虚拟机——这里只警告不强制（内网信任场景）。
+    QString host = qEnvironmentVariable("MWINE_HOST").trimmed();
+    if (host.isEmpty())
+        host = QStringLiteral("127.0.0.1");
+    const bool lanExposed = host != QStringLiteral("127.0.0.1")
+        && host.compare(QStringLiteral("localhost"), Qt::CaseInsensitive) != 0;
+    if (lanExposed && qEnvironmentVariable("MWINE_TOKEN").trimmed().isEmpty()) {
+        MW_LOG("core", QStringLiteral("⚠ 守护进程监听 %1 且未设置 MWINE_TOKEN——"
+                                      "局域网内任何设备都可完全控制虚拟机！")
+                           .arg(host));
+    }
+
     mw::HttpServer server(
         [state](const mw::HttpRequest& req) {
-            // 读取请求体上限 64KB（对齐 Rust reader.take(64 * 1024)）
-            const QByteArray body = req.body.left(64 * 1024);
-            return mw::daemon::routeWithBody(req.method, req.path, body, state);
+            return mw::daemon::webDispatch(req, state);
         },
-        port);
+        host, port);
     if (!server.start()) {
         // 升级残留：旧版守护仍占着端口。Qt 前端 spawn 时注入 MWINE_REPLACE_DAEMON=1，
         // 此时替换旧实例（SIGTERM 同名守护，等端口释放后重试绑定一次）。
@@ -514,7 +537,10 @@ int main(int argc, char* argv[])
             return 1;
         }
     }
-    MW_LOG("core", QStringLiteral("✓ MWine Core 就绪: http://127.0.0.1:%1").arg(port));
+    MW_LOG("core", QStringLiteral("✓ MWine Core 就绪: http://%1:%2%3")
+                       .arg(host)
+                       .arg(port)
+                       .arg(lanExposed ? QStringLiteral("（NAS/Web 模式）") : QString()));
 
     return app.exec();
 }
