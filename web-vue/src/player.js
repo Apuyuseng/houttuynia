@@ -9,7 +9,8 @@ export const SCRCPY_KEY = {
 }
 
 export class ScrcpyWebPlayer {
-  constructor({ onStatus, onEnd }) {
+  constructor({ onStatus, onEnd, openQuery = '' }) {
+    this.openQuery = openQuery
     this.onStatus = onStatus || (() => {})
     this.onEnd = onEnd || (() => {})
     this.id = 0
@@ -37,7 +38,7 @@ export class ScrcpyWebPlayer {
 
   async start() {
     this.onStatus('正在建立投屏会话…')
-    const r = await apiPost('/api/stream/open?max_size=1280&bit_rate=4000000&fps=30', {})
+    const r = await apiPost('/api/stream/open?max_size=1280&bit_rate=4000000&fps=30' + this.openQuery, {})
     this.id = r.id
     this.devW = r.width || 0
     this.devH = r.height || 0

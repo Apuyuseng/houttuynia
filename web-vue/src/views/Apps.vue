@@ -33,7 +33,7 @@
       <div v-else class="launcher-grid">
         <el-dropdown v-for="a in filtered" :key="a.package" trigger="contextmenu"
                      @command="(cmd) => onCmd(cmd, a)">
-          <div class="launcher-item" @click="run(a)">
+          <div class="launcher-item" @click="openWindow(a)">
             <div class="launcher-icon">
               <img v-if="iconOk[a.package]" :src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))"
                    @error="iconOk[a.package] = false" alt="">
@@ -43,13 +43,18 @@
           </div>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="run">启动</el-dropdown-item>
+              <el-dropdown-item command="run">主屏启动</el-dropdown-item>
+              <el-dropdown-item command="window">独立窗口打开</el-dropdown-item>
               <el-dropdown-item command="uninstall" divided>卸载（清除数据）</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
       </div>
     </div>
+
+    <!-- 应用独立窗口层（scrcpy 副屏直通） -->
+    <AppWindow v-for="(w, i) in windows" :key="w.key" :app="w.app" :offset="i"
+               :z="w.z" @close="closeWindow(w.key)" @front="bringFront(w.key)" />
   </div>
 </template>
 
@@ -58,6 +63,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { apiGet, apiPost, imgUrl, fmtBytes, authState } from '../api'
 import { inject } from 'vue'
+import AppWindow from './AppWindow.vue'
 
 const { vmRunning } = inject('vmState')
 const running = vmRunning
@@ -122,6 +128,7 @@ async function run(a) {
 
 async function onCmd(cmd, a) {
   if (cmd === 'run') return run(a)
+  if (cmd === 'window') return openWindow(a)
   if (cmd === 'uninstall') {
     try {
       await ElMessageBox.confirm(`确定卸载 ${a.name}（${a.package}）？应用数据将被清除。`, '卸载应用', { type: 'warning', confirmButtonText: '卸载' })
@@ -132,6 +139,28 @@ async function onCmd(cmd, a) {
       else ElMessage.error('卸载失败：' + (r.output || ''))
     } catch (e) { ElMessage.error(e.message) }
   }
+}
+
+// ---- 应用独立窗口（scrcpy 副屏直通，与桌面版「每应用独立窗口」同能力） ----
+const windows = ref([])
+let winSeq = 0
+let zTop = 100
+
+function openWindow(a) {
+  // 同应用已在窗口中 → 提到最前，不重复开
+  const exist = windows.value.find(w => w.app.package === a.package)
+  if (exist) return bringFront(exist.key)
+  winSeq += 1
+  windows.value.push({ key: winSeq, app: a, z: ++zTop })
+}
+
+function closeWindow(key) {
+  windows.value = windows.value.filter(w => w.key !== key)
+}
+
+function bringFront(key) {
+  const w = windows.value.find(w => w.key === key)
+  if (w) w.z = ++zTop
 }
 
 function onFile(e) {

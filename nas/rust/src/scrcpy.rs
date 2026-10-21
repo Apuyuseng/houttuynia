@@ -165,6 +165,11 @@ pub struct StartParams {
     pub max_size: u32,
     pub bit_rate: u32,
     pub fps: u32,
+    /// 创建虚拟副屏（W, H, DPI）：应用独立窗口的基石（与 qemu 窗口模式无关，
+    /// 无头下帧尺寸也正确——桌面版的 qemu multidisplay 在无头模式反而会信箱化）
+    pub new_display: Option<(u32, u32, u32)>,
+    /// 会话建立后在该副屏启动的应用包名
+    pub start_app: Option<String>,
 }
 
 /// 启动完整会话（阻塞；冷启 server + dexopt 可达十秒级）。
@@ -186,13 +191,18 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     adb::forward_abstract(serial, port, &socket_name)?;
 
     // 组装 server 命令行（与 toArgs 逐字段对齐；scid 双发是 fork 的既定怪癖）
-    let args = format!(
+    let mut args = format!(
         "scid={scid:08x} log_level=info video=true audio=false control=true \
          video_codec=h264 video_bit_rate={} max_size={} scid={scid:x} max_fps={} \
          stay_awake=true power_off_on_close=false keep_active=false show_touches=false \
          tunnel_forward=true",
         p.bit_rate, p.max_size, p.fps
     );
+    if let Some((w, h, dpi)) = p.new_display {
+        args.push_str(&format!(
+            " new_display={w}x{h}/{dpi} vd_destroy_content=true vd_system_decorations=true"
+        ));
+    }
     let cmd = format!(
         "CLASSPATH={remote} app_process / {SERVER_CLASS} {SERVER_VERSION} {args}"
     );
@@ -269,6 +279,17 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
         other => return err(format!("未知 codec id: {}", String::from_utf8_lossy(other))),
     }
     .to_string();
+
+    // 副屏会话：建立后即下发 StartApp（应用直接落在该副屏）
+    if let Some(app) = &p.start_app {
+        if let Some(msg) = control::start_app(app) {
+            let mut c = control.try_clone().ok();
+            if let Some(cc) = c.as_mut() {
+                use std::io::Write as _;
+                let _ = cc.write_all(&msg);
+            }
+        }
+    }
 
     Ok(Session {
         serial: serial.to_string(),
@@ -396,5 +417,20 @@ pub mod control {
 
     pub fn reset_video() -> Vec<u8> {
         vec![TYPE_RESET_VIDEO]
+    }
+
+    pub const TYPE_START_APP: u8 = 16;
+
+    /// 在会话副屏上启动应用（包名；上游兼容 "?action=..." 等修饰，这里只用包名）
+    pub fn start_app(name: &str) -> Option<Vec<u8>> {
+        let b = name.as_bytes();
+        if b.is_empty() || b.len() > 255 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(2 + b.len());
+        out.push(TYPE_START_APP);
+        out.push(b.len() as u8);
+        out.extend_from_slice(b);
+        Some(out)
     }
 }

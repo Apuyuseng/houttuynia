@@ -967,7 +967,23 @@ pub async fn stream_open(
     let max_size: u32 = q.get("max_size").and_then(|s| s.parse().ok()).unwrap_or(1280);
     let bit_rate: u32 = q.get("bit_rate").and_then(|s| s.parse().ok()).unwrap_or(4_000_000);
     let fps: u32 = q.get("fps").and_then(|s| s.parse().ok()).unwrap_or(30);
-    let params = scrcpy::StartParams { max_size, bit_rate, fps };
+    // 应用独立窗口：app= 包名 + 可选 w/h/dpi 副屏尺寸（默认 720×1280@320 竖屏手机）
+    let start_app = q.get("app").cloned().filter(|s| !s.is_empty());
+    let new_display = if start_app.is_some() {
+        let w: u32 = q.get("w").and_then(|s| s.parse().ok()).unwrap_or(720);
+        let h: u32 = q.get("h").and_then(|s| s.parse().ok()).unwrap_or(1280);
+        let dpi: u32 = q.get("dpi").and_then(|s| s.parse().ok()).unwrap_or(320);
+        Some((w, h, dpi))
+    } else {
+        None
+    };
+    // 副屏会话的视频流上限取副屏长边（max_size 约束只到视频编码器）
+    let max_size = if let Some((w, h, _)) = new_display {
+        w.max(h)
+    } else {
+        max_size
+    };
+    let params = scrcpy::StartParams { max_size, bit_rate, fps, new_display, start_app };
 
     let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial, &jar, &params)).await;
     let mut session = match r {
