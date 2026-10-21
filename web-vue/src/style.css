@@ -1,0 +1,81 @@
+/* 全局样式：配合 element-plus dark css-vars */
+html, body { margin: 0; height: 100%; }
+body {
+  background: #0f1115;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+#app { height: 100vh; }
+
+/* 深色基调微调（element dark vars 之上的产品色） */
+html.dark {
+  --el-bg-color: #1b2029;
+  --el-bg-color-overlay: #222835;
+  --el-bg-color-page: #0f1115;
+  --el-fill-color-blank: #1b2029;
+  --el-border-color: #2a3140;
+  --el-border-color-light: #2a3140;
+  --el-border-color-lighter: #262c39;
+  --el-color-primary: #4ade80;
+}
+html.dark .el-menu {
+  border-right: none;
+  background: transparent;
+}
+
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.muted { color: var(--el-text-color-secondary); }
+.small { font-size: 12px; }
+
+/* 屏幕/投屏 */
+.screen-box {
+  background: #000; border-radius: 10px; overflow: hidden; position: relative;
+  aspect-ratio: 9/19; max-height: 68vh; margin: 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  width: 100%;
+}
+.screen-box img, .screen-box canvas.stream-canvas {
+  width: 100%; height: 100%; object-fit: contain; display: block;
+}
+.screen-box .placeholder {
+  color: var(--el-text-color-secondary); text-align: center; padding: 30px;
+}
+.stream-canvas { outline: none; cursor: crosshair; background: #000; }
+.screen-live-dot {
+  position: absolute; top: 10px; right: 10px;
+  background: #000a; color: #86efac; font-size: 11px; padding: 3px 9px;
+  border-radius: 99px; z-index: 2; pointer-events: none;
+}
+
+/* 应用网格 */
+.app-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+}
+.app-card {
+  background: var(--el-bg-color-overlay); border: 1px solid var(--el-border-color);
+  border-radius: 11px; padding: 14px 10px; text-align: center;
+  transition: border-color .15s, transform .1s;
+}
+.app-card:hover { border-color: var(--el-text-color-secondary); transform: translateY(-1px); }
+.app-icon {
+  width: 56px; height: 56px; border-radius: 13px; margin: 0 auto 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #334155, #1e293b);
+  font-size: 24px; font-weight: 700; color: #94a3b8; overflow: hidden;
+}
+.app-icon img { width: 100%; height: 100%; object-fit: cover; }
+.app-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-pkg { font-size: 10.5px; color: var(--el-text-color-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 8px; }
+
+/* 终端 */
+.term-box {
+  background: #0a0c10; border: 1px solid var(--el-border-color); border-radius: 10px;
+  padding: 12px 14px; height: 52vh; overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  color: #d1d5db;
+}
+
+/* 概览布局 */
+.overview-grid { display: grid; grid-template-columns: 380px 1fr; gap: 18px; align-items: start; }
+@media (max-width: 1100px) { .overview-grid { grid-template-columns: 1fr; } }
