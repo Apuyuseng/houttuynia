@@ -406,10 +406,11 @@ pub async fn wallpaper_png(State(st): State<SharedState>) -> axum::response::Res
     };
     let r = tokio::task::spawn_blocking(move || crate::icons::wallpaper(&serial)).await;
     match r {
-        Ok(Ok(bytes)) => (
+        Ok(Ok((bytes, source))) => (
             [
                 (axum::http::header::CONTENT_TYPE, "image/png"),
                 (axum::http::header::CACHE_CONTROL, "public, max-age=60"),
+                (axum::http::header::HeaderName::from_static("x-wallpaper-source"), source),
             ],
             bytes,
         )

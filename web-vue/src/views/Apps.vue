@@ -1,14 +1,26 @@
 <template>
   <div style="display:grid;gap:18px;">
-    <el-card shadow="never">
-      <el-space wrap>
-        <el-button type="primary" @click="fileInput.click()">⬆ 上传 APK 安装</el-button>
-        <input ref="fileInput" type="file" accept=".apk" style="display:none" @change="onFile" />
-        <el-button @click="load">刷新列表</el-button>
-        <div style="flex:1"></div>
-        <el-input v-model="filter" placeholder="筛选应用名 / 包名" clearable style="width:240px" />
-      </el-space>
-    </el-card>
+    <!-- macOS 风格窗口栏：红绿灯 + 居中标题 + 右侧操作 -->
+    <div class="macbar">
+      <span class="macbar-dots"><i class="r"></i><i class="y"></i><i class="g"></i></span>
+      <span class="macbar-title">应用库</span>
+      <div class="macbar-actions">
+        <button class="macbar-btn" :class="{ active: searchOn }" title="搜索" @click="toggleSearch">
+          <el-icon><Search /></el-icon>
+        </button>
+        <button class="macbar-btn" title="上传 APK 安装" @click="fileInput.click()">
+          <el-icon><Upload /></el-icon>
+        </button>
+        <button class="macbar-btn" title="刷新列表" @click="load">
+          <el-icon><Refresh /></el-icon>
+        </button>
+      </div>
+      <input ref="fileInput" type="file" accept=".apk" style="display:none" @change="onFile" />
+      <transition name="el-zoom-in-center">
+        <input v-if="searchOn" v-model="filter" class="macbar-search"
+               placeholder="筛选应用名 / 包名" autofocus />
+      </transition>
+    </div>
 
     <el-card v-if="taskVisible" shadow="never">
       <template #header>
@@ -27,6 +39,7 @@
 
     <!-- 启动器桌面：设备壁纸背景 + 图标网格 -->
     <div class="launcher" :style="launcherStyle">
+      <img v-if="wallpaperUrl" class="launcher-bg" :class="{ blur: wallpaperBlur }" :src="wallpaperUrl" alt="">
       <div v-if="loading" class="launcher-msg">读取中…</div>
       <div v-else-if="!running" class="launcher-msg">虚拟机未运行 —— 启动后此处展示设备桌面</div>
       <el-empty v-else-if="!filtered.length" description="暂无应用" style="padding:60px 0" />
@@ -62,6 +75,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { apiGet, apiPost, imgUrl, fmtBytes, authState } from '../api'
+import { Search, Upload, Refresh } from '@element-plus/icons-vue'
 import { inject } from 'vue'
 import AppWindow from './AppWindow.vue'
 
@@ -76,25 +90,24 @@ const iconOk = ref({})
 const task = ref({})
 const taskVisible = ref(false)
 const wallpaperUrl = ref('')
+const wallpaperBlur = ref(false)
+const searchOn = ref(false)
+function toggleSearch() { searchOn.value = !searchOn.value; if (!searchOn.value) filter.value = '' }
 
 const filtered = computed(() => {
   const q = filter.value.trim().toLowerCase()
-  if (!q) return apps.value
-  return apps.value.filter(a =>
-    (a.name || '').toLowerCase().includes(q) || a.package.toLowerCase().includes(q))
+  // 无图标应用不展示（图标 404 = 自适应 XML 等无可提取 PNG；后端已负缓存）
+  let list = apps.value.filter(a => iconOk.value[a.package] !== false)
+  if (q) {
+    list = list.filter(a =>
+      (a.name || '').toLowerCase().includes(q) || a.package.toLowerCase().includes(q))
+  }
+  return list
 })
 
-const launcherStyle = computed(() => {
-  if (wallpaperUrl.value) {
-    return {
-      backgroundImage: `url(${wallpaperUrl.value})`,
-      backgroundSize: 'cover',
-      backgroundPosition: 'center',
-    }
-  }
-  // 无壁纸（非 root 镜像）时的渐变兜底
-  return { background: 'linear-gradient(155deg, #232a3b 0%, #10141c 60%, #0c0f16 100%)' }
-})
+const launcherStyle = computed(() => ({
+  background: 'linear-gradient(155deg, #232a3b 0%, #10141c 60%, #0c0f16 100%)',
+}))
 
 const taskIcon = computed(() => task.value.running ? '⏳' : (task.value.error ? '⚠️' : '✅'))
 const taskPct = computed(() =>
@@ -114,11 +127,16 @@ async function load() {
 }
 
 async function loadWallpaper() {
-  // 壁纸就绪则换真壁纸；404 保持渐变兜底
-  const url = imgUrl('/api/wallpaper.png') + '&t=' + Date.now()
-  const img = new Image()
-  img.onload = () => { wallpaperUrl.value = url }
-  img.src = url
+  // 壁纸就绪则换真壁纸；404 保持渐变兜底。
+  // 来源为截图兜底（screenshot）时高斯模糊——视觉上即氛围壁纸
+  try {
+    const resp = await fetch(imgUrl('/api/wallpaper.png'))
+    if (!resp.ok) return
+    const source = resp.headers.get('x-wallpaper-source') || ''
+    const blob = await resp.blob()
+    wallpaperBlur.value = source === 'screenshot'
+    wallpaperUrl.value = URL.createObjectURL(blob)
+  } catch { /* 保持渐变 */ }
 }
 
 async function run(a) {
@@ -267,5 +285,55 @@ onUnmounted(() => { polling = false })
   font-size: 12px;
   text-shadow: 0 1px 3px #000c;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* macOS 风格窗口栏 */
+.macbar {
+  position: relative;
+  display: flex; align-items: center;
+  height: 46px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #2b303c, #232833);
+  border: 1px solid #3a4152;
+  box-shadow: inset 0 1px 0 #ffffff14, 0 1px 4px #0004;
+  padding: 0 14px 0 12px;
+}
+.macbar-dots { display: flex; gap: 8px; }
+.macbar-dots i {
+  width: 12px; height: 12px; border-radius: 50%; display: block;
+  box-shadow: inset 0 0 1px #0006;
+}
+.macbar-dots .r { background: #ff5f57; }
+.macbar-dots .y { background: #febc2e; }
+.macbar-dots .g { background: #28c840; }
+.macbar-title {
+  position: absolute; left: 0; right: 0; text-align: center;
+  font-size: 13px; font-weight: 600; color: #cbd5e1;
+  pointer-events: none;
+}
+.macbar-actions { margin-left: auto; display: flex; gap: 6px; z-index: 1; }
+.macbar-btn {
+  border: none; background: transparent; color: #9aa3b2;
+  width: 30px; height: 26px; border-radius: 7px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 15px;
+}
+.macbar-btn:hover { background: #ffffff14; color: #e6e9ef; }
+.macbar-btn.active { background: #4ade8033; color: #86efac; }
+.macbar-search {
+  position: absolute; right: 108px; top: 8px;
+  width: 220px; height: 30px;
+  background: #14171e; border: 1px solid #3a4152; border-radius: 8px;
+  color: #e6e9ef; padding: 0 10px; outline: none; font-size: 12.5px;
+}
+.macbar-search:focus { border-color: #4ade80; }
+
+/* 壁纸背景图（截图兜底时模糊化） */
+.launcher-bg {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%; object-fit: cover;
+}
+.launcher-bg.blur {
+  filter: blur(26px) brightness(.6) saturate(1.2);
+  transform: scale(1.12);  /* 模糊边缘出血消除 */
 }
 </style>

@@ -189,6 +189,10 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
             return Ok((bytes, mime));
         }
     }
+    // 负缓存：已确认无可提取图标（自适应 XML 图标等），不再反复拉 APK
+    if dir.join(format!("{pkg}.noicon")).exists() {
+        return err("无可提取图标");
+    }
     // 提取：pm path → base.apk → pull → zip 挑图标
     let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 10000)
         .map_err(|e| adb::AdbError(e.to_string()))?;
@@ -198,8 +202,10 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
         .find_map(|l| l.trim().strip_prefix("package:").map(str::to_string))
         .ok_or_else(|| adb::AdbError(format!("pm path 无输出: {pkg}")))?;
     let apk = adb::pull_file(serial, &apk_path, 200 * 1024 * 1024)?;
-    let (icon, mime) = icon_from_apk(&apk)
-        .ok_or_else(|| adb::AdbError("APK 内未找到可用图标（自适应 XML 图标）".into()))?;
+    let Some((icon, mime)) = icon_from_apk(&apk) else {
+        let _ = std::fs::write(dir.join(format!("{pkg}.noicon")), b"");
+        return err("APK 内未找到可用图标（自适应 XML 图标）");
+    };
     let ext = if mime == "image/png" { "png" } else { "webp" };
     let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
     Ok((icon, mime))
@@ -225,7 +231,7 @@ fn wallpaper_stamp(serial: &str) -> Option<String> {
 
 /// 设备壁纸（带指纹缓存）。多通道：userdebug 直接读系统文件；否则走
 /// companion 桥应用导出（桌面版同协议）；都没有 → Err（前端用渐变兜底）。
-pub fn wallpaper(serial: &str) -> AdbResult<Vec<u8>> {
+pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     let cache = wallpaper_cache();
     let stamp_file = cache.with_extension("stamp");
     let stamp = wallpaper_stamp(serial).unwrap_or_default();
@@ -234,7 +240,7 @@ pub fn wallpaper(serial: &str) -> AdbResult<Vec<u8>> {
             (std::fs::read_to_string(&stamp_file), std::fs::read(&cache))
         {
             if old_stamp == stamp && !bytes.is_empty() {
-                return Ok(bytes);
+                return Ok((bytes, "cache"));
             }
         }
     }
@@ -245,7 +251,7 @@ pub fn wallpaper(serial: &str) -> AdbResult<Vec<u8>> {
         if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
             let _ = std::fs::write(&cache, &bytes);
             let _ = std::fs::write(&stamp_file, &stamp);
-            return Ok(bytes);
+            return Ok((bytes, "direct"));
         }
     }
     // 通道 2：companion 桥导出（对齐 iconfetch --wallpaper 协议）
@@ -266,9 +272,15 @@ pub fn wallpaper(serial: &str) -> AdbResult<Vec<u8>> {
             if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
                 let _ = std::fs::write(&cache, &bytes);
                 let _ = std::fs::write(&stamp_file, &stamp);
-                return Ok(bytes);
+                return Ok((bytes, "bridge"));
             }
         }
     }
-    err("壁纸不可用（非 root 且无 companion 桥）")
+    // 通道 3：主屏截图（前端 CSS 高斯模糊后视觉等同氛围壁纸）
+    if let Ok(bytes) = adb::shell_blocking(serial, "screencap -p", 15000) {
+        if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
+            return Ok((bytes, "screenshot"));
+        }
+    }
+    err("壁纸不可用（非 root、无 companion 桥、截图兜底失败）")
 }
