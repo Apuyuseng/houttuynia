@@ -145,7 +145,127 @@ fn dpi_weight(path: &str) -> u32 {
     0
 }
 
-/// 从 APK 字节里挑启动器图标（PNG/WebP）。
+/// zip 中央目录条目（绝对偏移）
+struct CdEntry {
+    name: String,
+    method: u16,
+    comp_size: u32,
+    local_off: u64,
+}
+
+/// 从中央目录缓冲解析条目（offset 相对 cd 起点）
+fn cd_parse(cd: &[u8]) -> Vec<CdEntry> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p + 46 <= cd.len() && cd[p..p + 4] == [0x50, 0x4b, 0x01, 0x02] {
+        let method = u16::from_le_bytes([cd[p + 10], cd[p + 11]]);
+        let comp_size = u32::from_le_bytes([cd[p + 20], cd[p + 21], cd[p + 22], cd[p + 23]]);
+        let name_len = u16::from_le_bytes([cd[p + 28], cd[p + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([cd[p + 30], cd[p + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([cd[p + 32], cd[p + 33]]) as usize;
+        let local_off =
+            u32::from_le_bytes([cd[p + 42], cd[p + 43], cd[p + 44], cd[p + 45]]) as u64;
+        let name = String::from_utf8_lossy(&cd[p + 46..(p + 46 + name_len).min(cd.len())])
+            .to_string();
+        out.push(CdEntry { name, method, comp_size, local_off });
+        p += 46 + name_len + extra_len + comment_len;
+    }
+    out
+}
+
+/// 区间数据上的 zip 读：给定已拉到的切片（含 local header 起），解出内容
+fn zip_read_slice(slice: &[u8], method: u16, comp_size: u32) -> Option<Vec<u8>> {
+    if slice.len() < 30 || slice[..4] != [0x50, 0x4b, 0x03, 0x04] {
+        return None;
+    }
+    let name_len = u16::from_le_bytes([slice[26], slice[27]]) as usize;
+    let extra_len = u16::from_le_bytes([slice[28], slice[29]]) as usize;
+    let data_off = 30 + name_len + extra_len;
+    let data = slice.get(data_off..data_off + comp_size as usize)?;
+    match method {
+        0 => Some(data.to_vec()),
+        8 => {
+            let mut d = flate2::read::DeflateDecoder::new(data);
+            let mut out = Vec::new();
+            d.read_to_end(&mut out).ok()?;
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// 挑图标条目（中央目录语义筛选；不读内容）
+fn pick_icon_entry(entries: &[CdEntry]) -> Option<&CdEntry> {
+    let mut best: Option<(u32, &CdEntry)> = None;
+    for e in entries {
+        let n = &e.name;
+        if !(n.starts_with("res/") || n.starts_with("assets/")) {
+            continue;
+        }
+        let lower = n.to_lowercase();
+        let is_png = lower.ends_with(".png");
+        let is_webp = lower.ends_with(".webp");
+        if !is_png && !is_webp {
+            continue;
+        }
+        let name_score = if lower.contains("ic_launcher") {
+            100
+        } else if lower.contains("launcher") {
+            60
+        } else if lower.contains("icon") {
+            30
+        } else {
+            continue;
+        };
+        let score = name_score * 100 + dpi_weight(&lower) * 10 + if is_png { 2 } else { 1 };
+        if best.map(|(s, _)| score > s).unwrap_or(true) {
+            best = Some((score, e));
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
+/// 区间读取式图标提取：尾部 EOCD → 中央目录 → 图标切片（三次小读）
+fn icon_from_apk_ranged(serial: &str, path: &str, size: u64) -> Option<(Vec<u8>, &'static str)> {
+    // 尾部 256KB 找 EOCD
+    let tail_len = 256 * 1024u64.min(size);
+    let tail = adb::pull_range(serial, path, size - tail_len, tail_len).ok()?;
+    let mut eocd = None;
+    let mut i = tail.len().saturating_sub(22);
+    loop {
+        if tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] {
+            eocd = Some(i);
+            break;
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    let eocd = eocd?;
+    let cd_size = u32::from_le_bytes([tail[eocd + 12], tail[eocd + 13], tail[eocd + 14], tail[eocd + 15]]) as u64;
+    let cd_off = u32::from_le_bytes([tail[eocd + 16], tail[eocd + 17], tail[eocd + 18], tail[eocd + 19]]) as u64;
+    if cd_size == 0 || cd_size > 4 * 1024 * 1024 || cd_off + cd_size > size {
+        return None;
+    }
+    let cd = adb::pull_range(serial, path, cd_off, cd_size).ok()?;
+    let entries = cd_parse(&cd);
+    let e = pick_icon_entry(&entries)?;
+    // 图标切片：local header(30) + name + extra + 压缩数据；extra 长度在 local header 里，
+    // 先读 512 头再按 comp_size 补读（一次读足 comp_size + 512 通常够）
+    let want = 512 + e.comp_size as u64;
+    let slice = adb::pull_range(serial, path, e.local_off, want).ok()?;
+    let data = zip_read_slice(&slice, e.method, e.comp_size)?;
+    if data.len() > 8 && &data[..4] == b"\x89PNG" {
+        return Some((data, "image/png"));
+    }
+    if data.len() > 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some((data, "image/webp"));
+    }
+    None
+}
+
+/// 从 APK 字节里挑启动器图标（PNG/WebP）——整包路径（兜底）
 fn icon_from_apk(apk: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     let entries = zip_list(apk);
     let mut best: Option<(u32, &ZipEntry)> = None;
@@ -186,17 +306,50 @@ fn icon_from_apk(apk: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     None
 }
 
+/// 提取并发槽（无线真机/繁忙链路上防止图标提取风暴挤占其它请求）
+static ICON_SLOTS: [std::sync::Mutex<()>; 3] = [
+    std::sync::Mutex::new(()),
+    std::sync::Mutex::new(()),
+    std::sync::Mutex::new(()),
+];
+
+/// 同包提取在飞集合（并发重复请求合并到首次结果）
+static ICON_INFLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+struct InflightGuard {
+    pkg: String,
+}
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        ICON_INFLIGHT.lock().unwrap().remove(&self.pkg);
+    }
+}
+
 /// 应用图标（缓存 → 提取 → 缓存）。返回 (字节, MIME)。
 pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     // 桌面缓存命中
     if let Some(bytes) = desktop_icon_hit(pkg) {
         return Ok((bytes, "image/png"));
     }
-    // 本端缓存命中
+    // 本端缓存命中（按月过期：30 天外的缓存视为陈旧，重新提取）
     let dir = rust_icon_cache_dir();
     for ext in ["png", "webp"] {
         let p = dir.join(format!("{pkg}.{ext}"));
         if let Ok(bytes) = std::fs::read(&p) {
+            let stale = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    std::time::SystemTime::now()
+                        .duration_since(t)
+                        .map(|d| d.as_secs() > 30 * 24 * 3600)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            }
             let mime = if ext == "png" { "image/png" } else { "image/webp" };
             return Ok((bytes, mime));
         }
@@ -205,22 +358,69 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     if dir.join(format!("{pkg}.noicon")).exists() {
         return err("无可提取图标");
     }
-    // 提取：pm path → base.apk → pull → zip 挑图标
-    let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 10000)
+    // 同包在飞合并：第二个请求者等前者落缓存后直接读
+    {
+        let mut inflight = ICON_INFLIGHT.lock().unwrap();
+        if inflight.contains(pkg) {
+            drop(inflight);
+            for _ in 0..120 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for ext in ["png", "webp"] {
+                    let p = dir.join(format!("{pkg}.{ext}"));
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        let mime = if ext == "png" { "image/png" } else { "image/webp" };
+                        return Ok((bytes, mime));
+                    }
+                }
+                if dir.join(format!("{pkg}.noicon")).exists() {
+                    return err("无可提取图标");
+                }
+                if !ICON_INFLIGHT.lock().unwrap().contains(pkg) {
+                    break; // 前者异常结束
+                }
+            }
+            return err("图标提取等待超时");
+        }
+        inflight.insert(pkg.to_string());
+    }
+    let _inflight_guard = InflightGuard { pkg: pkg.to_string() };
+
+    // 提取（并发槽限流）：pm path → 尺寸 → 区间读取（三小读）→ 兜底整拉
+    let slot = (pkg.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize))) % ICON_SLOTS.len();
+    let _guard = ICON_SLOTS[slot].lock().unwrap();
+    let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 30000)
         .map_err(|e| adb::AdbError(e.to_string()))?;
     let text = String::from_utf8_lossy(&out);
     let apk_path = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("package:").map(str::to_string))
         .ok_or_else(|| adb::AdbError(format!("pm path 无输出: {pkg}")))?;
-    let apk = adb::pull_file(serial, &apk_path, 200 * 1024 * 1024)?;
-    let Some((icon, mime)) = icon_from_apk(&apk) else {
-        let _ = std::fs::write(dir.join(format!("{pkg}.noicon")), b"");
-        return err("APK 内未找到可用图标（自适应 XML 图标）");
-    };
-    let ext = if mime == "image/png" { "png" } else { "webp" };
-    let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
-    Ok((icon, mime))
+    let size = adb::remote_file_size(serial, &apk_path).unwrap_or(0);
+    if size > 0 {
+        if let Some((icon, mime)) = icon_from_apk_ranged(serial, &apk_path, size) {
+            let ext = if mime == "image/png" { "png" } else { "webp" };
+            let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
+            return Ok((icon, mime));
+        }
+    }
+    // 兜底 A：整包拉取（>120MB 的巨型包跳过——游戏包整拉不现实）
+    if size > 0 && size <= 120 * 1024 * 1024 {
+        if let Ok(apk) = adb::pull_file(serial, &apk_path, 120 * 1024 * 1024) {
+            if let Some((icon, mime)) = icon_from_apk(&apk) {
+                let ext = if mime == "image/png" { "png" } else { "webp" };
+                let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
+                return Ok((icon, mime));
+            }
+        }
+    }
+    // 兜底 B：豌豆荚按包名取图标（设备侧提取全部失败时；服务器出网即可）
+    if let Some((icon, mime)) = icon_from_wandoujia(pkg) {
+        let ext = if mime == "image/png" { "png" } else { "webp" };
+        let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
+        return Ok((icon, mime));
+    }
+    let _ = std::fs::write(dir.join(format!("{pkg}.noicon")), b"");
+    err("APK 提取与豌豆荚均无可用图标")
 }
 
 // ---------------- 应用标签 ----------------
@@ -247,6 +447,14 @@ fn label_store(pkg: &str, label: &str) {
     let mut m = labels_read();
     m.insert(pkg.to_string(), serde_json::Value::String(label.to_string()));
     let _ = std::fs::write(labels_cache_path(), serde_json::to_string(&m).unwrap_or_default());
+}
+
+/// 图标是否已在缓存（本端 + 桌面端 appcache 命中都算；负缓存不算）
+pub fn icon_cached(pkg: &str) -> bool {
+    let dir = rust_icon_cache_dir();
+    dir.join(format!("{pkg}.png")).exists()
+        || dir.join(format!("{pkg}.webp")).exists()
+        || desktop_icon_hit(pkg).is_some()
 }
 
 /// 只读标签缓存（不触发提取）：列表响应用
@@ -277,7 +485,7 @@ pub fn app_label(serial: &str, pkg: &str) -> Option<String> {
         }
     }
     // APK 解析
-    let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 10000).ok()?;
+    let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 30000).ok()?;
     let text = String::from_utf8_lossy(&out);
     let apk_path = text
         .lines()
@@ -323,7 +531,7 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     }
     // 通道 1：userdebug 镜像 root 直读
     if let Ok(bytes) =
-        adb::shell_blocking(serial, "cat /data/system/users/0/wallpaper 2>/dev/null", 10000)
+        adb::shell_blocking(serial, "cat /data/system/users/0/wallpaper 2>/dev/null", 30000)
     {
         if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
             let _ = std::fs::write(&cache, &bytes);
@@ -401,4 +609,53 @@ fn find_bridge_apk() -> Option<String> {
         }
     }
     cands.into_iter().find(|p| std::path::Path::new(p).is_file())
+}
+
+/// 豌豆荚应用详情页按包名取图标（itemprop="image" 的 img src）。
+/// 对齐桌面版 wandoujia 商店的图标来源（android-artworks CDN）。
+pub fn icon_from_wandoujia(pkg: &str) -> Option<(Vec<u8>, &'static str)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .build()
+        .ok()?;
+    let page = client
+        .get(format!("https://www.wandoujia.com/apps/{pkg}"))
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    // 找 itemprop="image" 的 img 的 src
+    let mut idx = 0;
+    let icon_url = loop {
+        let Some(img) = page[idx..].find("<img").map(|o| idx + o) else { return None };
+        let end = page[img..].find('>').map(|e| img + e).unwrap_or(page.len() - 1);
+        let tag = &page[img..end];
+        if tag.contains("itemprop=\"image\"") {
+            if let Some(s0) = tag.find("src=\"") {
+                let rest = &tag[s0 + 5..];
+                if let Some(e0) = rest.find('"') {
+                    let u = &rest[..e0];
+                    let full = if u.starts_with("//") {
+                        format!("https:{u}")
+                    } else {
+                        u.to_string()
+                    };
+                    break full;
+                }
+            }
+        }
+        idx = end + 1;
+        if idx >= page.len() { return None }
+    };
+    let bytes = client.get(&icon_url).send().ok()?.bytes().ok()?.to_vec();
+    if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
+        Some((bytes, "image/png"))
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some((bytes, "image/webp"))
+    } else if bytes.len() > 3 && &bytes[..3] == b"\xff\xd8\xff" {
+        Some((bytes, "image/jpeg"))
+    } else {
+        None
+    }
 }

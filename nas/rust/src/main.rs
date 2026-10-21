@@ -165,16 +165,14 @@ fn resolve_web_dir() -> Option<String> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let cwd = std::env::current_dir().unwrap_or_default();
     let mut cands: Vec<String> = Vec::new();
-    for base in [exe_dir.to_string_lossy().to_string(), cwd.to_string_lossy().to_string()] {
-        cands.push(format!("{base}/web-vue/dist"));
-        cands.push(format!("{base}/web"));
-    }
-    // 仓库开发态：exe 在 nas/rust/target/release/ 下，上溯到仓库根
-    if let Some(repo) = exe_dir.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).and_then(|p| p.parent()) {
-        let r = repo.to_string_lossy().to_string();
-        // nas/rust/target/release → 仓库根 = 再上两级（nas/rust 在 release 之上两层…直接扫两个候选）
-        cands.push(format!("{r}/../web-vue/dist"));
-        cands.push(format!("{r}/../web"));
+    // 逐级上溯（exe 所在目录与 cwd 的全部祖先），任一层出现 web 根即命中
+    for start in [exe_dir, cwd] {
+        let mut d = Some(start.as_path());
+        while let Some(dir) = d {
+            cands.push(format!("{}/web-vue/dist", dir.display()));
+            cands.push(format!("{}/web", dir.display()));
+            d = dir.parent();
+        }
     }
     cands
         .into_iter()
@@ -200,6 +198,8 @@ async fn main() {
     let api = Router::new()
         // 基础
         .route("/status", get(api::status))
+        .route("/events/status", get(api::events_status))
+        .route("/events/apps", get(api::events_apps))
         .route("/vm/start", post(api::vm_start))
         .route("/vm/stop", post(api::vm_stop))
         .route("/perf", get(api::perf))

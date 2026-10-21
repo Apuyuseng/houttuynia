@@ -260,7 +260,7 @@ pub async fn apps(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
             "pm query-activities --brief -a android.intent.action.MAIN \
              -c android.intent.category.LAUNCHER 2>/dev/null | grep '/' | \
              sed 's|.* ||;s|/.*||' | sort -u",
-            10000,
+            30000,
         )
         .map_err(|e| e.to_string())?;
         let text = String::from_utf8_lossy(&out);
@@ -294,7 +294,8 @@ pub async fn apps(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
                     "name": label.unwrap_or_else(|| pkg.rsplit('.').next().unwrap_or(pkg).to_string()),
                     "icon": Value::Null,
                     "running": false,
-                    "mode": "emulator",
+                    "run_on": "main", // 应用运行位置（与全局真机/虚拟机模式无关）
+                    "has_icon": crate::icons::icon_cached(pkg),
                 })
             })
             .collect();
@@ -495,7 +496,7 @@ pub async fn screenshot_png(State(st): State<SharedState>) -> axum::response::Re
                 .into_response()
         }
     };
-    let r = tokio::task::spawn_blocking(move || adb::shell_blocking(&serial, "screencap -p", 15000))
+    let r = tokio::task::spawn_blocking(move || adb::shell_blocking(&serial, "screencap -p", 30000))
         .await;
     match r {
         Ok(Ok(bytes)) if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" => (
@@ -1606,4 +1607,119 @@ pub async fn runtime_download(State(st): State<SharedState>, body: Bytes) -> (St
     } else {
         err(409, r.get("error").and_then(|x| x.as_str()).unwrap_or("无法开始下载"))
     }
+}
+
+// ===================== SSE 事件流（替代轮询） =====================
+
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use std::convert::Infallible;
+
+/// GET /api/events/status —— 状态变化即推（2s 巡检），15s 心跳保活
+pub async fn events_status(
+    State(st): State<SharedState>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(8);
+    tokio::spawn(async move {
+        let mut last = String::new();
+        loop {
+            let body = status(State(st.clone())).await.0.to_string();
+            if body != last {
+                last = body.clone();
+                if tx.send(Ok(SseEvent::default().data(body))).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+/// GET /api/events/apps —— 应用列表：首次全量 + 缓存（标签/图标）变化即推；
+/// 设备侧包集合每 30s 慢速复查（真机 Wi-Fi 上不为列表狂刷 pm）
+pub async fn events_apps(
+    State(st): State<SharedState>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(8);
+    tokio::spawn(async move {
+        tracing::info!("events_apps: 任务启动");
+        let mut last_body = String::new();
+        let mut last_device_check = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let mut last_cache_stamp = String::new();
+        loop {
+            let need_device = last_device_check.elapsed() > std::time::Duration::from_secs(30);
+            let body = if need_device || last_body.is_empty() {
+                last_device_check = std::time::Instant::now();
+                match apps(State(st.clone())).await {
+                    (_, Json(v)) => v.to_string(),
+                }
+            } else {
+                // 只复查本地缓存（标签/图标落盘后列表内容变化）
+                let stamp = cache_stamp();
+                if stamp != last_cache_stamp {
+                    // 缓存变了但设备没查：用缓存标签重组上一次的包集合
+                    if let Ok(mut v) = serde_json::from_str::<Value>(&last_body) {
+                        if let Some(arr) = v.get_mut("apps").and_then(|a| a.as_array_mut()) {
+                            for a in arr.iter_mut() {
+                                let pkg = a
+                                    .get("package")
+                                    .and_then(|p| p.as_str())
+                                    .map(String::from);
+                                if let Some(pkg) = pkg {
+                                    let label = crate::icons::app_label_cached_only(&pkg);
+                                    let has_icon = crate::icons::icon_cached(&pkg);
+                                    if let Some(o) = a.as_object_mut() {
+                                        if let Some(l) = label {
+                                            o.insert("name".into(), json!(l));
+                                        }
+                                        o.insert("has_icon".into(), json!(has_icon));
+                                    }
+                                }
+                            }
+                        }
+                        v.to_string()
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        continue;
+                    }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+            last_cache_stamp = cache_stamp();
+            if body != last_body {
+                tracing::info!("events_apps: 推送 {} 字节", body.len());
+                last_body = body.clone();
+                if tx.send(Ok(SseEvent::default().data(body))).await.is_err() {
+                    return;
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    });
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+/// 本地标签/图标缓存戳（labels.json mtime + icons 目录最大 mtime）
+fn cache_stamp() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let base = format!("{home}/.mwine/appcache/rust");
+    let mut stamp = String::new();
+    for p in [format!("{base}/labels.json")] {
+        if let Ok(m) = std::fs::metadata(&p).and_then(|m| m.modified()) {
+            stamp += &format!("{:?};", m);
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(format!("{base}/icons")) {
+        for e in rd.flatten() {
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                stamp += &format!("{:?},", t);
+            }
+        }
+    }
+    stamp
 }

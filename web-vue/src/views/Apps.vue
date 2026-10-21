@@ -30,7 +30,7 @@
             <el-icon><Upload /></el-icon>
           </button>
           <button class="macbar-btn" title="刷新列表" @click="load">
-            <el-icon><Refresh /></el-icon>
+            <el-icon :class="{ 'is-spin': refreshing }"><Refresh /></el-icon>
           </button>
         </div>
         <input ref="fileInput" type="file" accept=".apk" style="display:none" @change="onFile" />
@@ -40,14 +40,14 @@
         </transition>
       </div>
       <div v-if="loading" class="launcher-msg">读取中…</div>
-      <div v-else-if="!running" class="launcher-msg">虚拟机未运行 —— 启动后此处展示设备桌面</div>
+      <div v-else-if="!running" class="launcher-msg">{{ mode === 'device' ? '真机未连接 —— 到「真机」页连接后此处展示手机桌面' : '虚拟机未运行 —— 启动后此处展示设备桌面' }}</div>
       <el-empty v-else-if="!filtered.length" description="暂无应用" style="padding:60px 0" />
       <div v-else class="launcher-grid">
         <el-dropdown v-for="a in filtered" :key="a.package" trigger="contextmenu"
                      @command="(cmd) => onCmd(cmd, a)">
           <div class="launcher-item" @click="openWindow(a)">
-            <div class="launcher-icon">
-              <img v-if="iconOk[a.package]" :src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))"
+            <div class="launcher-icon" :data-pkg="a.package">
+              <img v-if="iconOk[a.package]" :data-src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))"
                    @error="iconOk[a.package] = false" alt="">
               <template v-else>{{ (a.name || a.package).slice(0, 1).toUpperCase() }}</template>
             </div>
@@ -78,11 +78,13 @@ import { Search, Upload, Refresh } from '@element-plus/icons-vue'
 import { inject } from 'vue'
 import AppWindow from './AppWindow.vue'
 
-const { vmRunning } = inject('vmState')
-const running = vmRunning
+const { vmRunning, mode, deviceSerial } = inject('vmState')
+// 真机模式：目标在线与否看真机连接；虚拟机模式看 VM
+const running = computed(() => mode.value === 'device' ? !!deviceSerial.value : vmRunning.value)
 
 const apps = ref([])
-const loading = ref(true)
+const loading = ref(true)      // 仅首载（无内容时）显占位
+const refreshing = ref(false)  // 后台刷新标识（不清空现有内容）
 const filter = ref('')
 const fileInput = ref(null)
 const iconOk = ref({})
@@ -95,8 +97,9 @@ function toggleSearch() { searchOn.value = !searchOn.value; if (!searchOn.value)
 
 const filtered = computed(() => {
   const q = filter.value.trim().toLowerCase()
-  // 无图标应用不展示（图标 404 = 自适应 XML 等无可提取 PNG；后端已负缓存）
-  let list = apps.value.filter(a => iconOk.value[a.package] !== false)
+  // 无图标应用不展示：判据 = 服务端缓存态 has_icon（负缓存已确认无图标）；
+  // 图标请求失败/在途不再误隐藏
+  let list = apps.value.filter(a => a.has_icon !== false)
   if (q) {
     list = list.filter(a =>
       (a.name || '').toLowerCase().includes(q) || a.package.toLowerCase().includes(q))
@@ -112,17 +115,45 @@ const taskIcon = computed(() => task.value.running ? '⏳' : (task.value.error ?
 const taskPct = computed(() =>
   task.value.progress_total ? Math.round(task.value.progress * 100 / task.value.progress_total) : 0)
 
+function applyList(d) {
+  // 等 API 出结果再替换；只读成功响应。无图标判据用服务端缓存态（has_icon），
+  // 提取途中不再误判隐藏
+  const list = d.apps || []
+  apps.value = list
+  list.forEach(a => { iconOk.value[a.package] = a.has_icon !== false })
+}
+
 async function load() {
-  loading.value = true
+  // 有内容时转后台刷新标识，绝不清空
+  if (apps.value.length) refreshing.value = true
+  else loading.value = true
   try {
     const d = await apiGet('/api/apps')
-    apps.value = d.apps || []
-    apps.value.forEach(a => { iconOk.value[a.package] = true })
+    applyList(d)
   } catch (e) {
-    ElMessage.error(e.message)
+    ElMessage.error('应用列表读取失败：' + e.message + '（已保留现有内容）')
   }
   loading.value = false
+  refreshing.value = false
   loadWallpaper()
+  setTimeout(observeIcons, 50)
+}
+
+// SSE 应用流：标签/图标落缓存后服务端主动推新列表，免轮询
+let appsEs = null
+function startAppsStream() {
+  try {
+    appsEs = new EventSource('/api/events/apps?token=' + encodeURIComponent(authState.token))
+    appsEs.onmessage = (e) => {
+      try {
+        applyList(JSON.parse(e.data))
+        loading.value = false
+        refreshing.value = false
+        setTimeout(observeIcons, 50)
+      } catch {}
+    }
+    appsEs.onerror = () => { /* 网络抖动由浏览器自动重连 */ }
+  } catch {}
 }
 
 async function loadWallpaper() {
@@ -227,12 +258,39 @@ async function pollTask() {
 }
 
 // 标签后台补抓：首次加载后延迟再拉两次，名称自动变真名
+// 图标懒加载：进入视口才请求（无线真机上防止百余图标并发请求挤占连接）
+let iconObserver = null
+function setupIconObserver() {
+  iconObserver = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue
+      const img = e.target.querySelector("img[data-src]")
+      if (img && !img.src) {
+        img.src = img.dataset.src
+      }
+      iconObserver.unobserve(e.target)
+    }
+  }, { rootMargin: "200px" })
+}
+function observeIcons() {
+  if (!iconObserver) return
+  document.querySelectorAll(".launcher-icon[data-pkg]").forEach(el => {
+    const img = el.querySelector("img[data-src]")
+    if (img && !img.src) iconObserver.observe(el)
+  })
+}
+
 onMounted(() => {
+  setupIconObserver()
   load()
   setTimeout(load, 6000)
   setTimeout(load, 16000)
 })
-onUnmounted(() => { polling = false })
+onUnmounted(() => {
+  polling = false
+  if (iconObserver) iconObserver.disconnect()
+  if (appsEs) appsEs.close()
+})
 </script>
 
 <style scoped>
@@ -340,4 +398,6 @@ onUnmounted(() => { polling = false })
 .apps-page > .el-card { margin: 18px 24px 0; }
 /* launcher 吃满剩余高度 */
 .apps-page > .launcher { flex: 1; }
+.is-spin { animation: mwspin 1s linear infinite; }
+@keyframes mwspin { to { transform: rotate(360deg); } }
 </style>

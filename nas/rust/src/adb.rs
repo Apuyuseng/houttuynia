@@ -589,3 +589,26 @@ pub fn mdns_services() -> Vec<MdnsService> {
     }
     list
 }
+
+/// 远程文件区间读取（dd 分块）：无线真机上图标提取只读尾部目录+图标切片，
+/// 避免整包拉取（APK 动辄几十 MB，Wi-Fi 繁忙时整拉是灾难）。
+pub fn pull_range(serial: &str, path: &str, offset: u64, len: u64) -> AdbResult<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    const BS: u64 = 4096;
+    let skip = offset / BS;
+    let end = offset + len;
+    let count = (end + BS - 1) / BS - skip;
+    let out = shell_blocking(
+        serial,
+        &format!("dd if='{path}' bs={BS} skip={skip} count={count} 2>/dev/null"),
+        60000,
+    )?;
+    let start = (offset - skip * BS) as usize;
+    let want = len as usize;
+    if out.len() < start + want {
+        return err(format!("dd 区间读取不足: {} < {}", out.len(), start + want));
+    }
+    Ok(out[start..start + want].to_vec())
+}

@@ -106,14 +106,42 @@ async function refresh() {
   }
 }
 
-let timer
+let es = null
+let fallbackTimer = null
+function startStatusStream() {
+  // SSE 状态流：变化即推（服务端 2s 巡检）；失败回退 4s 轮询
+  try {
+    es = new EventSource('/api/events/status?token=' + encodeURIComponent(authState.token))
+    es.onmessage = (e) => {
+      try {
+        const st = JSON.parse(e.data)
+        connected.value = true
+        vmRunning.value = !!st.vm?.running
+        serial.value = st.vm?.serial || ''
+        mode.value = st.mode || 'vm'
+        deviceSerial.value = st.device_serial || ''
+        version.value = (st.version ? 'v' + st.version : '') + (st.backend === 'rust' ? ' · Rust' : '')
+      } catch {}
+    }
+    es.onerror = () => {
+      es && es.close()
+      es = null
+      connected.value = false
+      if (!fallbackTimer) fallbackTimer = setInterval(refresh, 4000)
+    }
+  } catch {
+    fallbackTimer = setInterval(refresh, 4000)
+  }
+}
 onMounted(async () => {
   try { await apiGet('/health'); authState.needLogin = false }
   catch (e) { authState.needLogin = e.message === '未授权' }
-  refresh()
-  timer = setInterval(refresh, 4000)
+  startStatusStream()
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => {
+  if (es) es.close()
+  if (fallbackTimer) clearInterval(fallbackTimer)
+})
 </script>
 
 <style scoped>
