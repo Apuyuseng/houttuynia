@@ -38,7 +38,9 @@ const emit = defineEmits(['close', 'front'])
 const pos = ref({ x: 120 + (props.offset || 0) * 36, y: 40 + (props.offset || 0) * 30 })
 // 初始高度不超出视口（标题栏 + 导航栏约 76px + 边距）
 const initH = Math.min(640, Math.max(420, window.innerHeight - 160))
-const size = ref({ w: Math.round(initH * 0.59), h: initH })
+// 窗口体比例与副屏内容精确一致（720×1280），不留 pillarbox 黑边
+const CONTENT_W = 720, CONTENT_H = 1280
+const size = ref({ w: Math.round(initH * CONTENT_W / CONTENT_H), h: initH })
 const status = ref('')
 const liveOn = ref(false)
 const ready = ref(false)
@@ -54,7 +56,19 @@ onMounted(() => {
   player = new ScrcpyWebPlayer({
     openQuery: `&app=${encodeURIComponent(pkg)}&w=720&h=1280&dpi=320`,
     onStatus: (t) => { status.value = t },
-    onFirstFrame: () => { ready.value = true; liveOn.value = true },
+    onFirstFrame: () => {
+      ready.value = true
+      liveOn.value = true
+      // 内容实际比例与窗口体不一致时（旋转/服务端约束）自适应贴合
+      const cw = player.canvas.width, ch = player.canvas.height
+      if (cw > 0 && ch > 0) {
+        const contentRatio = cw / ch
+        const bodyRatio = size.value.w / size.value.h
+        if (Math.abs(contentRatio - bodyRatio) / bodyRatio > 0.02) {
+          size.value = { w: Math.round(size.value.h * contentRatio), h: size.value.h }
+        }
+      }
+    },
     onEnd: () => { liveOn.value = false },
   })
   // 找到即挂载 canvas
