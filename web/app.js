@@ -176,8 +176,14 @@ async function renderOverview(view) {
             ? '<button class="btn sm primary" id="ov-stream">▶ 投屏</button>'
             : '<button class="btn sm" id="ov-live">实时画面</button>'}
         </h3>
-        <div class="screen-box" id="ov-screen">
-          <div class="placeholder">虚拟机未运行<br><span class="small muted">启动后此处显示设备画面</span></div>
+        <div class="phone-frame">
+          <span class="phone-btn phone-btn-vol"></span>
+          <span class="phone-btn phone-btn-power"></span>
+          <div class="phone-panel">
+            <div class="screen-box" id="ov-screen">
+              <div class="placeholder">虚拟机未运行<br><span class="small muted">启动后此处显示设备画面</span></div>
+            </div>
+          </div>
         </div>
         <div id="ov-stream-bar" class="stream-bar hidden">
           <div class="btn-row">

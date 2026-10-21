@@ -111,6 +111,28 @@ input, select, textarea { font: inherit; }
   aspect-ratio: 9/19; max-height: 70vh; margin: 0 auto;
   display: flex; align-items: center; justify-content: center;
 }
+
+/* 白面板手机边框（与 web-vue 同款）：白面板 + 上下对称边框 + 侧边键，无打孔/刘海 */
+.phone-frame { position: relative; width: 100%; margin: 0 auto; padding: 0 3px; }
+.phone-panel {
+  position: relative;
+  background: linear-gradient(160deg, #f8f9fb 0%, #eceef2 55%, #e2e4e9 100%);
+  border-radius: 34px;
+  padding: 14px 9px;
+  box-shadow:
+    inset 0 0 0 1.5px #ffffff,
+    inset 0 -3px 6px #d4d7dd,
+    0 2px 6px #0004,
+    0 14px 34px #0006;
+}
+.phone-panel .screen-box { border-radius: 22px; max-height: 62vh; }
+.phone-btn {
+  position: absolute; width: 3px;
+  background: linear-gradient(90deg, #d8dadf, #b7bac2);
+  border-radius: 2px;
+}
+.phone-btn-power { right: 0; top: 22%; height: 64px; }
+.phone-btn-vol   { left: 0;  top: 15%; height: 96px; }
 .screen-box img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .screen-box .placeholder { color: var(--text-dim); text-align: center; padding: 30px; }
 .screen-live-dot {

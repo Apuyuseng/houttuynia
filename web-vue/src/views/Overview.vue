@@ -14,12 +14,18 @@
           </el-button>
         </div>
       </template>
-      <div class="screen-box" ref="screenBox">
-        <div class="placeholder" v-if="!imgShown">
-          虚拟机{{ running ? '运行中' : '未运行' }}<br>
-          <span class="small muted">{{ running ? '点击投屏查看实时画面' : '启动后此处显示设备画面' }}</span>
+      <div class="phone-frame">
+        <span class="phone-btn phone-btn-vol"></span>
+        <span class="phone-btn phone-btn-power"></span>
+        <div class="phone-panel">
+          <div class="screen-box" ref="screenBox">
+            <div class="placeholder" v-if="!imgShown">
+              虚拟机{{ running ? '运行中' : '未运行' }}<br>
+              <span class="small muted">{{ running ? '点击投屏查看实时画面' : '启动后此处显示设备画面' }}</span>
+            </div>
+            <img v-if="imgUrlNow && !streaming" :src="imgUrlNow" @load="imgShown = true" alt="">
+          </div>
         </div>
-        <img v-if="imgUrlNow && !streaming" :src="imgUrlNow" @load="imgShown = true" alt="">
       </div>
       <div v-if="streaming" style="margin-top:10px;">
         <el-space wrap>
