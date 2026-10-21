@@ -226,7 +226,12 @@ async function pollTask() {
   } catch { polling = false }
 }
 
-onMounted(load)
+// 标签后台补抓：首次加载后延迟再拉两次，名称自动变真名
+onMounted(() => {
+  load()
+  setTimeout(load, 6000)
+  setTimeout(load, 16000)
+})
 onUnmounted(() => { polling = false })
 </script>
 

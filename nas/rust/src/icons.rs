@@ -95,6 +95,18 @@ fn zip_list(apk: &[u8]) -> Vec<ZipEntry> {
     out
 }
 
+/// 读 zip 内指定路径条目（供 meta.rs 取 AndroidManifest.xml / resources.arsc）
+pub fn apk_file_entry(apk: &[u8], name: &str) -> Option<Vec<u8>> {
+    let entries = zip_list(apk);
+    let e = entries.iter().find(|e| e.name == name)?;
+    zip_read(apk, e)
+}
+
+/// 同义别名（语义清晰用）
+pub fn apk_file_bytes(apk: &[u8], name: &str) -> Option<Vec<u8>> {
+    apk_file_entry(apk, name)
+}
+
 fn zip_read(apk: &[u8], e: &ZipEntry) -> Option<Vec<u8>> {
     let p = e.local_off as usize;
     if p + 30 > apk.len() || apk[p..p + 4] != [0x50, 0x4b, 0x03, 0x04] {
@@ -209,6 +221,71 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     let ext = if mime == "image/png" { "png" } else { "webp" };
     let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
     Ok((icon, mime))
+}
+
+// ---------------- 应用标签 ----------------
+
+fn labels_cache_path() -> PathBuf {
+    let dir = PathBuf::from(format!("{}/.mwine/appcache/rust", home()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("labels.json")
+}
+
+fn labels_read() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(labels_cache_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn label_cached(pkg: &str) -> Option<String> {
+    labels_read().get(pkg)?.as_str().map(String::from)
+}
+
+fn label_store(pkg: &str, label: &str) {
+    let mut m = labels_read();
+    m.insert(pkg.to_string(), serde_json::Value::String(label.to_string()));
+    let _ = std::fs::write(labels_cache_path(), serde_json::to_string(&m).unwrap_or_default());
+}
+
+/// 只读标签缓存（不触发提取）：列表响应用
+pub fn app_label_cached_only(pkg: &str) -> Option<String> {
+    label_cached(pkg)
+}
+
+/// 应用真实标签：缓存（含桌面版 apps.json 的 label）→ APK 元信息解析。
+pub fn app_label(serial: &str, pkg: &str) -> Option<String> {
+    if let Some(l) = label_cached(pkg) {
+        return Some(l);
+    }
+    // 桌面缓存 apps.json（appcache/<avd>/apps.json 的 {pkg:{label}}）
+    let base = format!("{}/.mwine/appcache", home());
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for e in rd.flatten() {
+            let p = e.path().join("apps.json");
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(l) = v.get(pkg).and_then(|e| e.get("label")).and_then(|l| l.as_str()) {
+                        if !l.is_empty() {
+                            label_store(pkg, l);
+                            return Some(l.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // APK 解析
+    let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 10000).ok()?;
+    let text = String::from_utf8_lossy(&out);
+    let apk_path = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("package:").map(str::to_string))?;
+    let apk = adb::pull_file(serial, &apk_path, 200 * 1024 * 1024).ok()?;
+    let label = crate::meta::app_label_from_apk(&apk)?;
+    label_store(pkg, &label);
+    Some(label)
 }
 
 // ---------------- 壁纸 ----------------

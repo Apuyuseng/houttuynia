@@ -11,6 +11,7 @@ mod adb;
 mod api;
 mod console;
 mod icons;
+mod meta;
 mod scrcpy;
 mod state;
 

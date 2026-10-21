@@ -251,14 +251,34 @@ pub async fn apps(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
         )
         .map_err(|e| e.to_string())?;
         let text = String::from_utf8_lossy(&out);
-        let apps: Vec<Value> = text
+        let pkgs: Vec<&str> = text
             .lines()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .collect();
+        let serial_bg = serial.clone();
+        // 标签缺失的后台补抓（拉 APK + AXML/arsc 解析较慢，不阻塞列表响应）
+        {
+            let missing: Vec<String> = pkgs
+                .iter()
+                .map(|p| p.to_string())
+                .filter(|p| crate::icons::app_label_cached_only(p).is_none())
+                .collect();
+            if !missing.is_empty() {
+                std::thread::spawn(move || {
+                    for pkg in missing {
+                        let _ = crate::icons::app_label(&serial_bg, &pkg);
+                    }
+                });
+            }
+        }
+        let apps: Vec<Value> = pkgs
+            .iter()
             .map(|pkg| {
+                let label = crate::icons::app_label_cached_only(pkg);
                 json!({
                     "package": pkg,
-                    "name": pkg.rsplit('.').next().unwrap_or(pkg),
+                    "name": label.unwrap_or_else(|| pkg.rsplit('.').next().unwrap_or(pkg).to_string()),
                     "icon": Value::Null,
                     "running": false,
                     "mode": "emulator",
