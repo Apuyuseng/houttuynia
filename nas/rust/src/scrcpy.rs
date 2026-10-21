@@ -195,7 +195,7 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
         "scid={scid:08x} log_level=info video=true audio=false control=true \
          video_codec=h264 video_bit_rate={} max_size={} scid={scid:x} max_fps={} \
          stay_awake=true power_off_on_close=false keep_active=false show_touches=false \
-         tunnel_forward=true",
+         tunnel_forward=true clipboard_autosync=true",
         p.bit_rate, p.max_size, p.fps
     );
     if let Some((w, h, dpi)) = p.new_display {
@@ -420,6 +420,22 @@ pub mod control {
     }
 
     pub const TYPE_START_APP: u8 = 16;
+    pub const TYPE_SET_CLIPBOARD: u8 = 9;
+
+    /// 设置设备剪贴板（sequence 回执用随机值；paste=false 仅同步不触发粘贴动作）
+    pub fn set_clipboard(sequence: u64, paste: bool, text: &str) -> Option<Vec<u8>> {
+        let utf8 = text.as_bytes();
+        if utf8.len() > 1_000_000 {
+            return None;
+        }
+        let mut b = Vec::with_capacity(14 + utf8.len());
+        b.push(TYPE_SET_CLIPBOARD);
+        push_u64be(&mut b, sequence);
+        b.push(if paste { 1 } else { 0 });
+        push_u32be(&mut b, utf8.len() as u32);
+        b.extend_from_slice(utf8);
+        Some(b)
+    }
 
     /// 在会话副屏上启动应用（包名；上游兼容 "?action=..." 等修饰，这里只用包名）
     pub fn start_app(name: &str) -> Option<Vec<u8>> {

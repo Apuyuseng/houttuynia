@@ -84,6 +84,8 @@ pub struct StreamSession {
     pub attached: AtomicBool,
     /// 会话存活守卫：析构清理（stop 由持有方共享调用）
     pub stop_fn: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// 设备剪贴板最新内容（控制通道设备消息读取线程更新）
+    pub clipboard: Mutex<String>,
 }
 
 impl StreamSession {

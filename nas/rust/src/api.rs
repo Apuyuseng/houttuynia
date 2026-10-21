@@ -1014,6 +1014,7 @@ pub async fn stream_open(
         err: Mutex::new(String::new()),
         frame_rx: Mutex::new(Some(rx)),
         attached: std::sync::atomic::AtomicBool::new(false),
+        clipboard: Mutex::new(String::new()),
         stop_fn: Mutex::new(Some(Box::new(move || {
             if let Some(c) = &control_for_stop {
                 let _ = c.lock().unwrap().shutdown(std::net::Shutdown::Both);
@@ -1021,6 +1022,37 @@ pub async fn stream_open(
             let _ = adb::remove_forward(&serial_for_stop, fwd_port);
         }))),
     });
+    // 设备消息读取线程：clipboard_autosync 的剪贴板推送经控制通道上行
+    if let Some(ctrl) = &stream.control {
+        if let Ok(mut rd) = ctrl.lock().unwrap().try_clone() {
+            let s3 = stream.clone();
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                loop {
+                    let mut t = [0u8; 1];
+                    if rd.read_exact(&mut t).is_err() { break; }
+                    if t[0] == 0 {
+                        // CLIPBOARD：lp32 字符串
+                        let mut l4 = [0u8; 4];
+                        if rd.read_exact(&mut l4).is_err() { break; }
+                        let n = u32::from_be_bytes(l4) as usize;
+                        let mut payload = vec![0u8; n.min(1_000_000)];
+                        if n > 0 && rd.read_exact(&mut payload).is_err() { break; }
+                        *s3.clipboard.lock().unwrap() = String::from_utf8_lossy(&payload).to_string();
+                    } else {
+                        // 其余消息（ack/uhid）本用例不关心——但无法预知长度，
+                        // 协议上 ack 是 8 字节序列号，跳过；未知类型终止读取
+                        if t[0] == 1 {
+                            let mut skip = [0u8; 8];
+                            if rd.read_exact(&mut skip).is_err() { break; }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
     let s2 = stream.clone();
     let st2 = st.clone();
     std::thread::spawn(move || {
@@ -1168,8 +1200,20 @@ pub async fn stream_text(
     if text.is_empty() || text.len() > 300 {
         return err(400, "text 为空或超长");
     }
-    let Some(bytes) = scrcpy::control::inject_text(text) else {
-        return err(400, "文本超长");
+    // 与桌面版 injectTextSmart 同策略：ASCII 走 INJECT_TEXT；非 ASCII
+    //（CJK 等无按键映射字符会被 server 静默丢弃）走 SET_CLIPBOARD(paste=true)
+    //——server 置剪贴板后立即触发 KEYCODE_PASTE，焦点字段即得全文。
+    let ascii = text.bytes().all(|b| (32..=127).contains(&b));
+    let bytes = if ascii {
+        match scrcpy::control::inject_text(text) {
+            Some(b) => b,
+            None => return err(400, "文本超长"),
+        }
+    } else {
+        match scrcpy::control::set_clipboard(0, true, text) {
+            Some(b) => b,
+            None => return err(400, "文本超长"),
+        }
     };
     match stream_control_send(&s, &bytes) {
         Ok(()) => ok(json!({ "ok": true })),
@@ -1212,4 +1256,31 @@ pub async fn stream_close(State(st): State<SharedState>, Path(id): Path<u64>) ->
         s.stop();
     }
     Json(json!({ "ok": true }))
+}
+
+// GET /api/stream/<id>/clipboard —— 读设备剪贴板（autosync 推送的最新值）
+pub async fn stream_clipboard_get(
+    State(st): State<SharedState>,
+    Path(id): Path<u64>,
+) -> (StatusCode, Json<Value>) {
+    let s = match stream_get(&st, id) { Ok(s) => s, Err(e) => return e };
+    ok(json!({ "text": s.clipboard.lock().unwrap().clone() }))
+}
+
+// POST /api/stream/<id>/clipboard {text} —— 宿主剪贴板同步进设备（不触发粘贴）
+pub async fn stream_clipboard_set(
+    State(st): State<SharedState>,
+    Path(id): Path<u64>,
+    Json(v): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let s = match stream_get(&st, id) { Ok(s) => s, Err(e) => return e };
+    let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+    let paste = v.get("paste").and_then(|x| x.as_bool()).unwrap_or(false);
+    let Some(bytes) = scrcpy::control::set_clipboard(0, paste, text) else {
+        return err(400, "剪贴板内容超长");
+    };
+    match stream_control_send(&s, &bytes) {
+        Ok(()) => ok(json!({ "ok": true })),
+        Err(e) => e,
+    }
 }

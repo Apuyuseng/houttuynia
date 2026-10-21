@@ -10,14 +10,17 @@
     </div>
     <div class="win-body" :style="{ width: size.w + 'px', height: size.h + 'px' }" ref="bodyRef">
       <div class="win-placeholder muted" v-if="!ready">⏳ 正在启动应用…</div>
+      <input ref="imeRef" class="win-ime" autocomplete="off" autocapitalize="off"
+             autocorrect="off" spellcheck="false" aria-label="输入法捕获">
+      <div class="win-preedit" v-if="preedit">{{ preedit }}</div>
     </div>
     <!-- 底部导航栏：虚拟副屏无系统导航栏，窗口自带（注入该会话的控制通道） -->
     <div class="win-navbar">
-      <button class="nav-btn" @click="key(4)" title="返回">◀</button>
-      <button class="nav-btn" @click="key(3)" title="主页">●</button>
-      <button class="nav-btn" @click="key(187)" title="多任务">■</button>
+      <button class="nav-btn" @pointerdown.prevent @click="key(4)" title="返回">◀</button>
+      <button class="nav-btn" @pointerdown.prevent @click="key(3)" title="主页">●</button>
+      <button class="nav-btn" @pointerdown.prevent @click="key(187)" title="多任务">■</button>
       <div style="flex:1"></div>
-      <button class="nav-btn" @click="key(26)" title="电源">⏻</button>
+      <button class="nav-btn" @pointerdown.prevent @click="key(26)" title="电源">⏻</button>
     </div>
     <span class="win-resize" @pointerdown="startResize"></span>
   </div>
@@ -43,6 +46,8 @@ const CONTENT_W = 720, CONTENT_H = 1280
 const size = ref({ w: Math.round(initH * CONTENT_W / CONTENT_H), h: initH })
 const status = ref('')
 const liveOn = ref(false)
+const preedit = ref('')
+const imeRef = ref(null)
 const ready = ref(false)
 const bodyRef = ref(null)
 
@@ -75,15 +80,42 @@ onMounted(() => {
   canvas = player.canvas
   const box = bodyRef.value
   box.appendChild(canvas)
+  // 宿主输入法捕获（隐藏输入框承载 IME 组合）
+  player.attachIme(imeRef.value, { onPreedit: (t) => { preedit.value = t } })
+  startClipboardSync()
   // 不 await：start() 会阻塞到流结束；失败由 catch 处理
   player.start().catch((e) => {
     ElMessage.error(`${title}：投屏失败 ${e.message}`)
     emit('close')
   })
 })
-onUnmounted(() => { if (player) { const p = player; player = null; p.stop() } })
+onUnmounted(() => {
+  stopClipboardSync()
+  if (player) { const p = player; player = null; p.stop() }
+})
 
 function key(k) { player && player.key(k) }
+
+// ---- 剪贴板双向共享 ----
+// 设备 → 宿主：3s 轮询设备剪贴板，变化即写入宿主剪贴板（浏览器权限内尽力而为）
+// 宿主 → 设备：窗口内粘贴事件已由 player 注入文本；这里另同步 setClipboard
+let clipTimer = null
+let lastClip = ''
+function startClipboardSync() {
+  clipTimer = setInterval(async () => {
+    if (!player || !player.running) return
+    try {
+      const t = await player.getClipboard()
+      if (t && t !== lastClip) {
+        lastClip = t
+        try { await navigator.clipboard.writeText(t) } catch { /* 权限/焦点限制忽略 */ }
+      }
+    } catch {}
+  }, 3000)
+}
+function stopClipboardSync() {
+  if (clipTimer) { clearInterval(clipTimer); clipTimer = null }
+}
 
 function close() {
   emit('close')
@@ -172,6 +204,20 @@ function startResize(e) {
   display: flex; align-items: center; justify-content: center;
 }
 .win-placeholder { position: absolute; }
+/* IME 捕获输入框：不可见但可聚焦（display:none 会杀掉 IME） */
+.win-ime {
+  position: absolute; left: 2px; bottom: 2px;
+  width: 2px; height: 2px; opacity: 0.01;
+  border: none; background: transparent; color: transparent;
+  caret-color: transparent; pointer-events: none;
+}
+/* 宿主 IME 组词浮层 */
+.win-preedit {
+  position: absolute; left: 12px; bottom: 12px;
+  background: #1c212bee; border: 1px solid #3a4152; border-radius: 8px;
+  color: #e6e9ef; padding: 4px 10px; font-size: 13px; z-index: 3;
+  pointer-events: none;
+}
 /* 底部导航栏 */
 .win-navbar {
   display: flex; align-items: center; gap: 4px;

@@ -256,6 +256,7 @@ async fn main() {
         .route("/stream/{id}/scroll", post(api::stream_scroll))
         .route("/stream/{id}/reset", post(api::stream_reset))
         .route("/stream/{id}/close", post(api::stream_close))
+        .route("/stream/{id}/clipboard", get(api::stream_clipboard_get).post(api::stream_clipboard_set))
         // 商店 / 抓包 / 其余 → 501
         .route("/store/sources", get(api::not_impl_store))
         .route("/store/search", get(api::not_impl_store))

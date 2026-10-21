@@ -219,7 +219,7 @@ export class ScrcpyWebPlayer {
     c.addEventListener('contextmenu', (e) => e.preventDefault())
     c.addEventListener('pointerdown', (e) => {
       if (!this.running) return
-      c.focus()
+      this.focusIme()
       e.preventDefault()
       if (e.button === 2) { this.key(SCRCPY_KEY.BACK); return }
       if (e.button === 1) { this.key(SCRCPY_KEY.HOME); return }
@@ -276,6 +276,80 @@ export class ScrcpyWebPlayer {
   key(keycode, action = 'tap') {
     if (!this.running) return
     apiPost(`/api/stream/${this.id}/key`, { keycode, action }).catch(() => {})
+  }
+
+  // ---- 宿主输入法接入（组合文本注入设备）----
+  // hidden input 捕获宿主 IME 的 composition 事件；preedit 经 onPreedit 上浮显示
+  attachIme(inputEl, { onPreedit } = {}) {
+    this.imeEl = inputEl
+    this._imeValue = ''
+    let composing = false
+    inputEl.addEventListener('compositionstart', () => {
+      composing = true
+      onPreedit && onPreedit(inputEl.value)
+    })
+    inputEl.addEventListener('compositionupdate', () => {
+      onPreedit && onPreedit(inputEl.value)
+    })
+    inputEl.addEventListener('compositionend', () => {
+      composing = false
+      const text = inputEl.value
+      inputEl.value = ''
+      this._imeValue = ''
+      onPreedit && onPreedit('')
+      if (text) this.text(text)
+    })
+    // 非 IME 输入（英文/数字直接键入）：按差量注入
+    inputEl.addEventListener('input', (e) => {
+      if (composing || e.isComposing) return
+      const now = inputEl.value
+      const prev = this._imeValue
+      if (now.length > prev.length && now.startsWith(prev)) {
+        const delta = now.slice(prev.length)
+        if (delta) this.text(delta)
+      }
+      this._imeValue = now
+      // 防无限增长：失焦风险的清零留给 compositionend/change 后空闲时
+      if (now.length > 64) { inputEl.value = ''; this._imeValue = '' }
+    })
+    // 控制键：Enter/Backspace/Escape/方向 → 设备按键（可打印字符不进这里，
+    // 交由 input/composition 通道，避免双重注入）
+    inputEl.addEventListener('keydown', (e) => {
+      const map = {
+        Enter: SCRCPY_KEY.ENTER, Backspace: SCRCPY_KEY.DEL,
+        ArrowUp: SCRCPY_KEY.UP, ArrowDown: SCRCPY_KEY.DOWN,
+        ArrowLeft: SCRCPY_KEY.LEFT, ArrowRight: SCRCPY_KEY.RIGHT,
+        Escape: SCRCPY_KEY.BACK,
+      }
+      if (map[e.key] !== undefined) {
+        e.preventDefault()
+        this.key(map[e.key])
+      }
+    })
+    // 粘贴进设备：SET_CLIPBOARD(paste=true)——server 置剪贴板并对焦点字段
+    // 触发 KEYCODE_PASTE（与桌面版 ⌘V 语义一致；CJK/ASCII 通吃）
+    inputEl.addEventListener('paste', (e) => {
+      e.preventDefault()
+      const text = e.clipboardData?.getData('text') || ''
+      if (text) this.pasteClipboard(text)
+    })
+  }
+
+  focusIme() {
+    if (this.imeEl) this.imeEl.focus()
+    else this.canvas.focus()
+  }
+
+  // ---- 剪贴板 ----
+  async getClipboard() {
+    const r = await apiGet(`/api/stream/${this.id}/clipboard`)
+    return r.text || ''
+  }
+  async setClipboard(text) {
+    try { await apiPost(`/api/stream/${this.id}/clipboard`, { text }) } catch {}
+  }
+  async pasteClipboard(text) {
+    try { await apiPost(`/api/stream/${this.id}/clipboard`, { text, paste: true }) } catch {}
   }
 
   text(text) {
