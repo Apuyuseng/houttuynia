@@ -1,26 +1,7 @@
 <template>
   <div style="display:grid;gap:18px;">
-    <!-- macOS 风格窗口栏：红绿灯 + 居中标题 + 右侧操作 -->
-    <div class="macbar">
-      <span class="macbar-dots"><i class="r"></i><i class="y"></i><i class="g"></i></span>
-      <span class="macbar-title">应用库</span>
-      <div class="macbar-actions">
-        <button class="macbar-btn" :class="{ active: searchOn }" title="搜索" @click="toggleSearch">
-          <el-icon><Search /></el-icon>
-        </button>
-        <button class="macbar-btn" title="上传 APK 安装" @click="fileInput.click()">
-          <el-icon><Upload /></el-icon>
-        </button>
-        <button class="macbar-btn" title="刷新列表" @click="load">
-          <el-icon><Refresh /></el-icon>
-        </button>
-      </div>
-      <input ref="fileInput" type="file" accept=".apk" style="display:none" @change="onFile" />
-      <transition name="el-zoom-in-center">
-        <input v-if="searchOn" v-model="filter" class="macbar-search"
-               placeholder="筛选应用名 / 包名" autofocus />
-      </transition>
-    </div>
+    <!-- 桌面上沿工具栏（贴合面板左右上三边）：搜索/上传/刷新 -->
+    <!-- 结构移进 .launcher 内顶部 -->
 
     <el-card v-if="taskVisible" shadow="never">
       <template #header>
@@ -40,6 +21,24 @@
     <!-- 启动器桌面：设备壁纸背景 + 图标网格 -->
     <div class="launcher" :style="launcherStyle">
       <img v-if="wallpaperUrl" class="launcher-bg" :class="{ blur: wallpaperBlur }" :src="wallpaperUrl" alt="">
+      <div class="macbar">
+        <div class="macbar-actions">
+          <button class="macbar-btn" :class="{ active: searchOn }" title="搜索" @click="toggleSearch">
+            <el-icon><Search /></el-icon>
+          </button>
+          <button class="macbar-btn" title="上传 APK 安装" @click="fileInput.click()">
+            <el-icon><Upload /></el-icon>
+          </button>
+          <button class="macbar-btn" title="刷新列表" @click="load">
+            <el-icon><Refresh /></el-icon>
+          </button>
+        </div>
+        <input ref="fileInput" type="file" accept=".apk" style="display:none" @change="onFile" />
+        <transition name="el-zoom-in-center">
+          <input v-if="searchOn" v-model="filter" class="macbar-search"
+                 placeholder="筛选应用名 / 包名" autofocus />
+        </transition>
+      </div>
       <div v-if="loading" class="launcher-msg">读取中…</div>
       <div v-else-if="!running" class="launcher-msg">虚拟机未运行 —— 启动后此处展示设备桌面</div>
       <el-empty v-else-if="!filtered.length" description="暂无应用" style="padding:60px 0" />
@@ -286,31 +285,19 @@ onUnmounted(() => { polling = false })
   text-shadow: 0 1px 3px #000c;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* macOS 风格窗口栏 */
+/* 桌面上沿工具栏：与 launcher 面板左右上三边贴合（负 margin 吃掉内边距） */
 .macbar {
   position: relative;
-  display: flex; align-items: center;
+  display: flex; align-items: center; justify-content: flex-end;
   height: 46px;
-  border-radius: 12px;
-  background: linear-gradient(180deg, #2b303c, #232833);
-  border: 1px solid #3a4152;
-  box-shadow: inset 0 1px 0 #ffffff14, 0 1px 4px #0004;
-  padding: 0 14px 0 12px;
+  margin: -26px -30px 22px;   /* 贴合面板顶/左/右，下缘与内容留 22px */
+  background: #14171ecc;      /* 半透明压壁纸，毛玻璃感 */
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid #ffffff18;
+  padding: 0 12px;
 }
-.macbar-dots { display: flex; gap: 8px; }
-.macbar-dots i {
-  width: 12px; height: 12px; border-radius: 50%; display: block;
-  box-shadow: inset 0 0 1px #0006;
-}
-.macbar-dots .r { background: #ff5f57; }
-.macbar-dots .y { background: #febc2e; }
-.macbar-dots .g { background: #28c840; }
-.macbar-title {
-  position: absolute; left: 0; right: 0; text-align: center;
-  font-size: 13px; font-weight: 600; color: #cbd5e1;
-  pointer-events: none;
-}
-.macbar-actions { margin-left: auto; display: flex; gap: 6px; z-index: 1; }
+.macbar-actions { display: flex; gap: 6px; z-index: 1; }
 .macbar-btn {
   border: none; background: transparent; color: #9aa3b2;
   width: 30px; height: 26px; border-radius: 7px; cursor: pointer;
@@ -321,6 +308,7 @@ onUnmounted(() => { polling = false })
 .macbar-btn.active { background: #4ade8033; color: #86efac; }
 .macbar-search {
   position: absolute; right: 108px; top: 8px;
+  z-index: 2;
   width: 220px; height: 30px;
   background: #14171e; border: 1px solid #3a4152; border-radius: 8px;
   color: #e6e9ef; padding: 0 10px; outline: none; font-size: 12.5px;
