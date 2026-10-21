@@ -1305,3 +1305,129 @@ pub async fn stream_clipboard_set(
         Err(e) => e,
     }
 }
+
+// ===================== WebSocket 终端（真实 pty 桥） =====================
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use futures_util::{SinkExt, StreamExt};
+
+/// GET /api/term/ws?cols=&rows= —— 升级为 WS，桥接设备 pty
+pub async fn term_ws(
+    State(st): State<SharedState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    let cols: u16 = q.get("cols").and_then(|s| s.parse().ok()).unwrap_or(80);
+    let rows: u16 = q.get("rows").and_then(|s| s.parse().ok()).unwrap_or(24);
+    ws.on_upgrade(move |socket| term_ws_loop(socket, st, cols, rows))
+}
+
+async fn term_ws_loop(mut socket: WebSocket, st: SharedState, cols: u16, rows: u16) {
+    let Some(serial) = st.current_serial() else {
+        let _ = socket
+            .send(Message::Text("\x1b[31mAndroid 未运行\x1b[0m\r\n".into()))
+            .await;
+        return;
+    };
+    let opened = tokio::task::spawn_blocking(move || adb::shell_pty_full(&serial)).await;
+    let (proc, pty) = match opened {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let _ = socket
+                .send(Message::Text(format!("\x1b[31m终端开启失败: {e}\x1b[0m\r\n").into()))
+                .await;
+            return;
+        }
+        Err(_) => return,
+    };
+    let mut dev_read = match proc.stream.try_clone() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut dev_write = proc.stream;
+
+    // v2 pty：先同步窗口尺寸
+    if pty {
+        let _ = std::io::Write::write_all(&mut dev_write, &adb::v2_winsz(cols, rows));
+    }
+
+    // 设备 → WS：读线程去帧后入 mpsc
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        if pty {
+            loop {
+                match adb::v2_read_frame(&mut dev_read) {
+                    Ok(Some((id, payload))) => {
+                        if id == adb::V2_EXIT {
+                            break;
+                        }
+                        if id == adb::V2_STDOUT || id == adb::V2_STDERR {
+                            if tx.blocking_send(payload).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        } else {
+            let mut buf = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut dev_read, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    // WS → 设备 + 设备 → WS 双工
+    loop {
+        tokio::select! {
+            out = rx.recv() => {
+                match out {
+                    Some(data) => {
+                        if socket.send(Message::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break, // 设备侧结束
+                }
+            }
+            msg = socket.next() => {
+                match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        // 控制消息：{"resize":[cols,rows]}
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            if let Some(arr) = v.get("resize").and_then(|a| a.as_array()) {
+                                let c = arr.first().and_then(|x| x.as_u64()).unwrap_or(80) as u16;
+                                let r = arr.get(1).and_then(|x| x.as_u64()).unwrap_or(24) as u16;
+                                if pty {
+                                    let _ = std::io::Write::write_all(
+                                        &mut dev_write, &adb::v2_winsz(c, r));
+                                }
+                                continue;
+                            }
+                        }
+                        let bytes = t.as_bytes();
+                        let w = if pty { adb::v2_frame(adb::V2_STDIN, bytes) } else { bytes.to_vec() };
+                        if std::io::Write::write_all(&mut dev_write, &w).is_err() { break; }
+                    }
+                    Some(Ok(Message::Binary(b))) => {
+                        let w = if pty { adb::v2_frame(adb::V2_STDIN, &b) } else { b.to_vec() };
+                        if std::io::Write::write_all(&mut dev_write, &w).is_err() { break; }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let _ = dev_write.shutdown(std::net::Shutdown::Both);
+    let _ = socket.close().await;
+}

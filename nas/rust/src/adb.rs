@@ -458,3 +458,67 @@ pub fn pull_file(serial: &str, remote: &str, max_bytes: usize) -> AdbResult<Vec<
     }
     Ok(out)
 }
+
+// ===================== shell v2 双工（WS 桥用） =====================
+
+/// shell v2 帧 id
+pub const V2_STDIN: u8 = 0;
+pub const V2_STDOUT: u8 = 1;
+pub const V2_STDERR: u8 = 2;
+pub const V2_EXIT: u8 = 3;
+pub const V2_CLOSE_STDIN: u8 = 4;
+pub const V2_WINSZ: u8 = 5;
+
+/// 编码一帧：id u8 + len u32 LE + payload
+pub fn v2_frame(id: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(id);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 窗口尺寸变化帧（"rows:cols" 文本载荷）
+pub fn v2_winsz(cols: u16, rows: u16) -> Vec<u8> {
+    v2_frame(V2_WINSZ, format!("{rows}:{cols}").as_bytes())
+}
+
+/// pty 会话（v2 优先）：返回 (流, 是否 v2-pty)。v1 交互回落为 raw 流。
+pub fn shell_pty_full(serial: &str) -> AdbResult<(ShellProcess, bool)> {
+    shell_pty(serial)
+}
+
+/// 从 v2 流读一帧：(id, payload)；EOF → Ok(None)
+pub fn v2_read_frame(s: &mut TcpStream) -> AdbResult<Option<(u8, Vec<u8>)>> {
+    let mut hdr = [0u8; 5];
+    match read_frame_exact(s, &mut hdr) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let id = hdr[0];
+    let len = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    let mut payload = vec![0u8; len];
+    match read_frame_exact(s, &mut payload) {
+        Ok(true) => Ok(Some((id, payload))),
+        Ok(false) => err("v2 帧载荷 EOF"),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_frame_exact(s: &mut TcpStream, buf: &mut [u8]) -> AdbResult<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match s.read(&mut buf[filled..]) {
+            Ok(0) => {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return err("eof in the middle of frame");
+            }
+            Ok(k) => filled += k,
+            Err(e) => return err(format!("read: {e}")),
+        }
+    }
+    Ok(true)
+}

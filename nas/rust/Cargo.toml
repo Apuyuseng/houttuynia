@@ -5,13 +5,14 @@ edition = "2021"
 description = "Houttuynia NAS gateway — Rust backend serving the Web console"
 
 [dependencies]
-axum = { version = "0.8", features = ["http2", "query"] }
+axum = { version = "0.8", features = ["http2", "query", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower-http = { version = "0.6", features = ["fs"] }
 bytes = "1"
+futures-util = "0.3"
 flate2 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

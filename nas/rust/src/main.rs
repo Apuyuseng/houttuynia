@@ -233,6 +233,7 @@ async fn main() {
         .route("/runtime/cancel", post(api::not_impl_runtime_dl))
         // 终端
         .route("/term/open", post(api::term_open))
+        .route("/term/ws", get(api::term_ws))
         .route("/term/{id}/read", get(api::term_read))
         .route("/term/{id}/write", post(api::term_write))
         .route("/term/{id}/close", post(api::term_close))
