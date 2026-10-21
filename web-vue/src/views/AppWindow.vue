@@ -2,10 +2,10 @@
   <div class="app-window" :style="{ left: pos.x + 'px', top: pos.y + 'px', zIndex: z }"
        @pointerdown="bringFront">
     <div class="win-titlebar" @pointerdown="startDrag">
+      <span class="win-live" :class="{ on: liveOn }" :title="status"></span>
       <span class="win-title">{{ title }}</span>
       <span class="win-pkg muted">{{ pkg }}</span>
       <div style="flex:1"></div>
-      <span class="win-status muted">{{ status }}</span>
       <button class="win-close" @pointerdown.stop @click="close" title="关闭（销毁副屏）">✕</button>
     </div>
     <div class="win-body" :style="{ width: size.w + 'px', height: size.h + 'px' }" ref="bodyRef">
@@ -40,6 +40,7 @@ const pos = ref({ x: 120 + (props.offset || 0) * 36, y: 40 + (props.offset || 0)
 const initH = Math.min(640, Math.max(420, window.innerHeight - 160))
 const size = ref({ w: Math.round(initH * 0.59), h: initH })
 const status = ref('')
+const liveOn = ref(false)
 const ready = ref(false)
 const bodyRef = ref(null)
 
@@ -53,8 +54,8 @@ onMounted(() => {
   player = new ScrcpyWebPlayer({
     openQuery: `&app=${encodeURIComponent(pkg)}&w=720&h=1280&dpi=320`,
     onStatus: (t) => { status.value = t },
-    onFirstFrame: () => { ready.value = true },
-    onEnd: () => {},
+    onFirstFrame: () => { ready.value = true; liveOn.value = true },
+    onEnd: () => { liveOn.value = false },
   })
   // 找到即挂载 canvas
   canvas = player.canvas
@@ -129,16 +130,23 @@ function startResize(e) {
 }
 .win-titlebar {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px;
+  padding: 0 12px;
+  height: 34px;                    /* 固定单行高度：fps 等状态文本不再引起抖动 */
+  white-space: nowrap; overflow: hidden;
   background: #1c212b;
   border-bottom: 1px solid #2a3140;
   cursor: move;
   user-select: none;
   touch-action: none;
 }
-.win-title { font-weight: 600; font-size: 13px; }
-.win-pkg { font-size: 11px; }
-.win-status { font-size: 11px; }
+/* 直播状态点（悬停看状态文本），不随内容变形 */
+.win-live {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #4a5265; flex-shrink: 0;
+}
+.win-live.on { background: #4ade80; box-shadow: 0 0 6px #4ade8088; }
+.win-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.win-pkg { font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .win-close {
   background: none; border: none; color: #9aa3b2; cursor: pointer;
   font-size: 14px; padding: 2px 6px; border-radius: 6px;
