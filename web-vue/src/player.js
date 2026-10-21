@@ -9,8 +9,10 @@ export const SCRCPY_KEY = {
 }
 
 export class ScrcpyWebPlayer {
-  constructor({ onStatus, onEnd, openQuery = '' }) {
+  constructor({ onStatus, onEnd, onFirstFrame, openQuery = '' }) {
     this.openQuery = openQuery
+    this.onFirstFrame = onFirstFrame || (() => {})
+    this._firstFrameFired = false
     this.onStatus = onStatus || (() => {})
     this.onEnd = onEnd || (() => {})
     this.id = 0
@@ -22,6 +24,12 @@ export class ScrcpyWebPlayer {
     this.canvas = document.createElement('canvas')
     this.canvas.className = 'stream-canvas'
     this.canvas.tabIndex = 0
+    // 内联尺寸样式：Vue scoped CSS 作用不到动态创建的元素（曾导致窗口内
+    // 画布按原始分辨率展示被裁掉）。contain 保持比例，不足处留黑。
+    this.canvas.style.width = '100%'
+    this.canvas.style.height = '100%'
+    this.canvas.style.objectFit = 'contain'
+    this.canvas.style.display = 'block'
     this.devW = 0
     this.devH = 0
     this.fps = 0
@@ -173,6 +181,10 @@ export class ScrcpyWebPlayer {
     this.canvas.getContext('2d').drawImage(frame, 0, 0)
     frame.close()
     this._frames++
+    if (!this._firstFrameFired) {
+      this._firstFrameFired = true
+      this.onFirstFrame()
+    }
     if (this.decoder && this.decoder.decodeQueueSize > 8) {
       try { this.decoder.reset() } catch {}
       this.needsKey = true
