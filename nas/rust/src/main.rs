@@ -10,6 +10,7 @@
 mod adb;
 mod api;
 mod console;
+mod icons;
 mod scrcpy;
 mod state;
 
@@ -206,6 +207,7 @@ async fn main() {
         .route("/apps/install-upload", post(api::install_upload))
         .route("/apps/install/task", get(api::install_task))
         .route("/apps/icon", get(api::app_icon))
+        .route("/wallpaper.png", get(api::wallpaper_png))
         // 截图 / 配置 / 快照
         .route("/screenshot.png", get(api::screenshot_png))
         .route("/screenshot", post(api::screenshot_png)) // 兼容桌面版语义差异：直接回 PNG

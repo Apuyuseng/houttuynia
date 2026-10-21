@@ -25,34 +25,42 @@
       <el-alert v-if="task.error" :title="task.error" type="error" :closable="false" style="margin-top:8px;" />
     </el-card>
 
-    <el-card shadow="never">
-      <template #header>已安装应用（{{ filtered.length }}）</template>
-      <div v-if="loading" class="muted small">读取中…</div>
-      <el-empty v-else-if="!filtered.length" description="暂无应用 —— 上传 APK 安装" />
-      <div v-else class="app-grid">
-        <div v-for="a in filtered" :key="a.package" class="app-card">
-          <div class="app-icon">
-            <img v-if="iconOk[a.package]" :src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))" @error="iconOk[a.package] = false" alt="">
-            <template v-else>{{ (a.name || a.package).slice(0, 1).toUpperCase() }}</template>
+    <!-- 启动器桌面：设备壁纸背景 + 图标网格 -->
+    <div class="launcher" :style="launcherStyle">
+      <div v-if="loading" class="launcher-msg">读取中…</div>
+      <div v-else-if="!running" class="launcher-msg">虚拟机未运行 —— 启动后此处展示设备桌面</div>
+      <el-empty v-else-if="!filtered.length" description="暂无应用" style="padding:60px 0" />
+      <div v-else class="launcher-grid">
+        <el-dropdown v-for="a in filtered" :key="a.package" trigger="contextmenu"
+                     @command="(cmd) => onCmd(cmd, a)">
+          <div class="launcher-item" @click="run(a)">
+            <div class="launcher-icon">
+              <img v-if="iconOk[a.package]" :src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))"
+                   @error="iconOk[a.package] = false" alt="">
+              <template v-else>{{ (a.name || a.package).slice(0, 1).toUpperCase() }}</template>
+            </div>
+            <div class="launcher-name">{{ a.name }}</div>
           </div>
-          <div class="app-name" :title="a.name">{{ a.name }}</div>
-          <div class="app-pkg" :title="a.package">{{ a.package }}</div>
-          <el-space>
-            <el-button size="small" type="primary" @click="run(a)">启动</el-button>
-            <el-popconfirm title="确定卸载？应用数据将被清除" @confirm="uninstall(a)">
-              <template #reference><el-button size="small" text type="danger">卸载</el-button></template>
-            </el-popconfirm>
-          </el-space>
-        </div>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="run">启动</el-dropdown-item>
+              <el-dropdown-item command="uninstall" divided>卸载（清除数据）</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
-    </el-card>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { apiGet, apiPost, imgUrl, fmtBytes, authState } from '../api'
+import { inject } from 'vue'
+
+const { vmRunning } = inject('vmState')
+const running = vmRunning
 
 const apps = ref([])
 const loading = ref(true)
@@ -61,12 +69,25 @@ const fileInput = ref(null)
 const iconOk = ref({})
 const task = ref({})
 const taskVisible = ref(false)
+const wallpaperUrl = ref('')
 
 const filtered = computed(() => {
   const q = filter.value.trim().toLowerCase()
   if (!q) return apps.value
   return apps.value.filter(a =>
     (a.name || '').toLowerCase().includes(q) || a.package.toLowerCase().includes(q))
+})
+
+const launcherStyle = computed(() => {
+  if (wallpaperUrl.value) {
+    return {
+      backgroundImage: `url(${wallpaperUrl.value})`,
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+    }
+  }
+  // 无壁纸（非 root 镜像）时的渐变兜底
+  return { background: 'linear-gradient(155deg, #232a3b 0%, #10141c 60%, #0c0f16 100%)' }
 })
 
 const taskIcon = computed(() => task.value.running ? '⏳' : (task.value.error ? '⚠️' : '✅'))
@@ -83,6 +104,15 @@ async function load() {
     ElMessage.error(e.message)
   }
   loading.value = false
+  loadWallpaper()
+}
+
+async function loadWallpaper() {
+  // 壁纸就绪则换真壁纸；404 保持渐变兜底
+  const url = imgUrl('/api/wallpaper.png') + '&t=' + Date.now()
+  const img = new Image()
+  img.onload = () => { wallpaperUrl.value = url }
+  img.src = url
 }
 
 async function run(a) {
@@ -90,12 +120,18 @@ async function run(a) {
   catch (e) { ElMessage.error(e.message) }
 }
 
-async function uninstall(a) {
-  try {
-    const r = await apiPost(`/api/apps/${encodeURIComponent(a.package)}/uninstall`)
-    if (r.ok) { ElMessage.success('已卸载'); setTimeout(load, 1200) }
-    else ElMessage.error('卸载失败：' + (r.output || ''))
-  } catch (e) { ElMessage.error(e.message) }
+async function onCmd(cmd, a) {
+  if (cmd === 'run') return run(a)
+  if (cmd === 'uninstall') {
+    try {
+      await ElMessageBox.confirm(`确定卸载 ${a.name}（${a.package}）？应用数据将被清除。`, '卸载应用', { type: 'warning', confirmButtonText: '卸载' })
+    } catch { return }
+    try {
+      const r = await apiPost(`/api/apps/${encodeURIComponent(a.package)}/uninstall`)
+      if (r.ok) { ElMessage.success('已卸载'); setTimeout(load, 1200) }
+      else ElMessage.error('卸载失败：' + (r.output || ''))
+    } catch (e) { ElMessage.error(e.message) }
+  }
 }
 
 function onFile(e) {
@@ -147,3 +183,60 @@ async function pollTask() {
 onMounted(load)
 onUnmounted(() => { polling = false })
 </script>
+
+<style scoped>
+.launcher {
+  border-radius: 14px;
+  border: 1px solid var(--el-border-color);
+  min-height: 56vh;
+  padding: 26px 30px;
+  position: relative;
+  overflow: hidden;
+}
+.launcher::before {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, #0002, #0004);  /* 压暗壁纸，图标可读 */
+  pointer-events: none;
+}
+.launcher-msg {
+  position: relative;
+  color: #fff;
+  text-align: center;
+  padding: 80px 0;
+  text-shadow: 0 1px 4px #000a;
+}
+.launcher-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 20px 12px;
+  align-items: start;
+}
+.launcher-item {
+  text-align: center;
+  cursor: pointer;
+  border-radius: 12px;
+  padding: 8px 2px;
+  transition: background .15s, transform .1s;
+}
+.launcher-item:hover {
+  background: #ffffff24;
+  transform: translateY(-2px);
+}
+.launcher-icon {
+  width: 56px; height: 56px; border-radius: 14px; margin: 0 auto 6px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #f8fafc, #cbd5e1);
+  font-size: 24px; font-weight: 700; color: #475569;
+  overflow: hidden;
+  box-shadow: 0 2px 8px #0006;
+}
+.launcher-icon img { width: 100%; height: 100%; object-fit: cover; }
+.launcher-name {
+  color: #fff;
+  font-size: 12px;
+  text-shadow: 0 1px 3px #000c;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+</style>

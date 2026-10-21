@@ -411,3 +411,50 @@ pub fn remote_file_size(serial: &str, path: &str) -> Option<u64> {
     // ls -l: "-rw-rw-rw- root root 733706 2026-10-20 17:17 path"
     t.split_whitespace().nth(4)?.parse::<u64>().ok()
 }
+
+/// 从设备拉取文件（sync: 服务 + STAT 尺寸 + RECV 分块）。
+pub fn pull_file(serial: &str, remote: &str, max_bytes: usize) -> AdbResult<Vec<u8>> {
+    let mut c = SmartConn::connect(5000)?;
+    c.transport(serial)?;
+    c.service("sync:")?;
+    // STAT 取尺寸
+    let mut hdr = Vec::with_capacity(8 + remote.len());
+    hdr.extend_from_slice(b"STAT");
+    hdr.extend_from_slice(&(remote.len() as u32).to_le_bytes());
+    c.write_all(&hdr)?;
+    c.write_all(remote.as_bytes())?;
+    let st = c.read_exact_timeout(4, 10000)?;
+    if &st[..] != b"STAT" {
+        return err(format!("STAT 应答异常: {}", String::from_utf8_lossy(&st)));
+    }
+    let stbuf = c.read_exact_timeout(12, 10000)?;
+    let size = u32::from_le_bytes([stbuf[4], stbuf[5], stbuf[6], stbuf[7]]) as usize;
+    if size == 0 || size > max_bytes {
+        return err(format!("文件尺寸异常: {size}"));
+    }
+    // RECV 循环
+    let mut rq = Vec::with_capacity(8 + remote.len());
+    rq.extend_from_slice(b"RECV");
+    rq.extend_from_slice(&(remote.len() as u32).to_le_bytes());
+    c.write_all(&rq)?;
+    c.write_all(remote.as_bytes())?;
+    let mut out = Vec::with_capacity(size);
+    loop {
+        let id = c.read_exact_timeout(4, 30000)?;
+        let lenb = c.read_exact_timeout(4, 10000)?;
+        let len = u32::from_le_bytes([lenb[0], lenb[1], lenb[2], lenb[3]]) as usize;
+        match &id[..] {
+            b"DATA" => {
+                let chunk = c.read_exact_timeout(len, 60000)?;
+                out.extend_from_slice(&chunk);
+            }
+            b"DONE" => break,
+            b"FAIL" => {
+                let msg = c.read_exact_timeout(len.min(4096), 10000)?;
+                return err(format!("pull FAIL: {}", String::from_utf8_lossy(&msg).trim()));
+            }
+            other => return err(format!("sync RECV 异常: {}", String::from_utf8_lossy(other))),
+        }
+    }
+    Ok(out)
+}

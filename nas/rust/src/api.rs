@@ -398,8 +398,53 @@ pub async fn install_task(State(st): State<SharedState>) -> Json<Value> {
     Json(st.install_task.to_json())
 }
 
-pub async fn app_icon() -> (StatusCode, Json<Value>) {
-    err(404, "Rust 网关暂未实现图标抓取（前端显示字母块）")
+pub async fn wallpaper_png(State(st): State<SharedState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let serial = match st.current_serial() {
+        Some(s) => s,
+        None => return err(503, "Android 未运行").into_response(),
+    };
+    let r = tokio::task::spawn_blocking(move || crate::icons::wallpaper(&serial)).await;
+    match r {
+        Ok(Ok(bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "image/png"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=60"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => err(404, e.to_string()).into_response(),
+        Err(e) => err(500, format!("壁纸任务失败: {e}")).into_response(),
+    }
+}
+
+pub async fn app_icon(
+    State(st): State<SharedState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let serial = match st.current_serial() {
+        Some(s) => s,
+        None => return err(503, "Android 未运行").into_response(),
+    };
+    let pkg = q.get("pkg").cloned().unwrap_or_default();
+    if pkg.is_empty() || !pkg.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_') {
+        return err(400, "包名非法").into_response();
+    }
+    let r = tokio::task::spawn_blocking(move || crate::icons::app_icon(&serial, &pkg)).await;
+    match r {
+        Ok(Ok((bytes, mime))) => (
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=300"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => err(404, e.to_string()).into_response(),
+        Err(e) => err(500, format!("图标任务失败: {e}")).into_response(),
+    }
 }
 
 // ===================== 截图 =====================
