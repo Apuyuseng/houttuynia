@@ -232,8 +232,9 @@ onUnmounted(() => { polling = false })
 
 <style scoped>
 .launcher {
-  border-radius: 14px;
-  border: 1px solid var(--el-border-color);
+  /* 整页贴合主区，直角无边框 */
+  border-radius: 0;
+  border: none;
   min-height: 56vh;
   padding: 26px 30px;
   position: relative;
@@ -289,27 +290,27 @@ onUnmounted(() => { polling = false })
 .macbar {
   position: relative;
   display: flex; align-items: center; justify-content: flex-end;
-  height: 46px;
-  margin: -26px -30px 22px;   /* 贴合面板顶/左/右，下缘与内容留 22px */
-  background: #14171ecc;      /* 半透明压壁纸，毛玻璃感 */
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border-bottom: 1px solid #ffffff18;
-  padding: 0 12px;
+  height: 34px;
+  margin: -26px -30px 18px;   /* 贴合面板顶/左/右，下缘与内容留 18px */
+  background: rgba(20, 23, 30, 0.45);   /* 更高透明度，壁纸透出来 */
+  backdrop-filter: blur(18px) saturate(1.3);
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  border-bottom: 1px solid #ffffff10;
+  padding: 0 10px;
 }
 .macbar-actions { display: flex; gap: 6px; z-index: 1; }
 .macbar-btn {
   border: none; background: transparent; color: #9aa3b2;
-  width: 30px; height: 26px; border-radius: 7px; cursor: pointer;
+  width: 28px; height: 22px; border-radius: 6px; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
-  font-size: 15px;
+  font-size: 13px;
 }
 .macbar-btn:hover { background: #ffffff14; color: #e6e9ef; }
 .macbar-btn.active { background: #4ade8033; color: #86efac; }
 .macbar-search {
-  position: absolute; right: 108px; top: 8px;
+  position: absolute; right: 100px; top: 4px;
   z-index: 2;
-  width: 220px; height: 30px;
+  width: 220px; height: 26px;
   background: #14171e; border: 1px solid #3a4152; border-radius: 8px;
   color: #e6e9ef; padding: 0 10px; outline: none; font-size: 12.5px;
 }
