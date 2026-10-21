@@ -29,15 +29,14 @@ html.dark .el-menu {
 /* 屏幕/投屏 */
 .screen-box {
   background: #000; border-radius: 10px; overflow: hidden; position: relative;
-  aspect-ratio: 9/19; max-height: 68vh; margin: 0 auto;
-  display: flex; align-items: center; justify-content: center;
-  width: 100%;
+  margin: 0 auto; width: fit-content; max-width: 100%;
+  /* 宽度随内容固有比例收缩——边框与画面贴合，不留黑边 */
 }
 
 /* 白面板手机边框：白色前面板 + 上下对称边框 + 侧边电源/音量键 */
 .phone-frame {
   position: relative;
-  width: 100%;
+  width: fit-content;              /* 整机宽度随屏幕内容收缩贴合 */
   margin: 0 auto;
   /* 侧边键凸出占位 */
   padding: 0 3px;
@@ -55,7 +54,6 @@ html.dark .el-menu {
 }
 .phone-panel .screen-box {
   border-radius: 22px;              /* 屏幕圆角随面板 */
-  max-height: 62vh;
 }
 /* 侧边键：右电源（长）+ 左音量（短），微凸出机身（面板在其后绘制，天然压在下方） */
 .phone-btn {
@@ -67,10 +65,15 @@ html.dark .el-menu {
 .phone-btn-power { right: 0; top: 22%; height: 64px; }
 .phone-btn-vol   { left: 0;  top: 15%; height: 96px; }
 .screen-box img, .screen-box canvas.stream-canvas {
-  width: 100%; height: 100%; object-fit: contain; display: block;
+  display: block; margin: 0 auto;
+  max-width: 100%; max-height: 62vh;   /* 整机不超出视口 */
+  width: auto; height: auto;
 }
 .screen-box .placeholder {
-  color: var(--el-text-color-secondary); text-align: center; padding: 30px;
+  color: var(--el-text-color-secondary); text-align: center;
+  width: min(300px, 70vw); aspect-ratio: 9/19;   /* 空载时保持手机形态 */
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px;
 }
 .stream-canvas { outline: none; cursor: crosshair; background: #000; }
 .screen-live-dot {
