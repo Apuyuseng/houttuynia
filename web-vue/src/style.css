@@ -66,7 +66,7 @@ html.dark .el-menu {
 .phone-btn-vol   { left: 0;  top: 15%; height: 96px; }
 .screen-box img, .screen-box canvas.stream-canvas {
   display: block; margin: 0 auto;
-  max-width: 100%; max-height: 62vh;   /* 整机不超出视口 */
+  max-width: 75vw; max-height: 62vh;   /* 整机不超出视口（vw 上限防横屏内容循环尺寸塌陷） */
   width: auto; height: auto;
 }
 .screen-box .placeholder {

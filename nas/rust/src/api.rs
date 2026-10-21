@@ -42,17 +42,27 @@ fn require_vm(state: &AppState) -> Result<String, (StatusCode, Json<Value>)> {
 // ===================== 基础 =====================
 
 pub async fn status(State(st): State<SharedState>) -> Json<Value> {
+    let mode = state::run_mode();
+    let vm_online = crate::adb::online_emulator();
+    let device = state::online_real_device();
     let serial = st.current_serial();
     Json(json!({
-        "vm": { "running": serial.is_some(), "serial": serial },
+        "vm": { "running": vm_online.is_some(), "serial": vm_online },
         "error": "",
         "version": "0.1.0-rust",
         "backend": "rust",
+        "mode": mode,
+        "device_serial": device,
+        "target_serial": serial,
+        "runtime_present": crate::runtime::runtime_present(),
     }))
 }
 
 pub async fn vm_start(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
-    if st.current_serial().is_some() {
+    if state::run_mode() == "device" {
+        return err(409, "当前为真机模式（设置页可切换到虚拟机模式）");
+    }
+    if st.vm_running() {
         return ok(json!({ "ok": true, "already": true }));
     }
     let r = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -125,7 +135,10 @@ pub async fn vm_start(State(st): State<SharedState>) -> (StatusCode, Json<Value>
 }
 
 pub async fn vm_stop(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
-    let serial = match st.current_serial() {
+    if state::run_mode() == "device" {
+        return err(409, "当前为真机模式");
+    }
+    let serial = match crate::adb::online_emulator() {
         Some(s) => s,
         None => return ok(json!({ "ok": true, "already": false, "note": "未在运行" })),
     };
@@ -1430,4 +1443,167 @@ async fn term_ws_loop(mut socket: WebSocket, st: SharedState, cols: u16, rows: u
     }
     let _ = dev_write.shutdown(std::net::Shutdown::Both);
     let _ = socket.close().await;
+}
+
+// ===================== 运行模式 =====================
+
+/// GET /api/runmode → {mode, runtime_present, vm_online, device_serial}
+pub async fn runmode_get(State(st): State<SharedState>) -> Json<Value> {
+    let mode = state::run_mode();
+    let device = state::online_real_device();
+    Json(json!({
+        "mode": mode,
+        "runtime_present": crate::runtime::runtime_present(),
+        "vm_online": st.vm_running(),
+        "device_serial": device,
+    }))
+}
+
+/// POST /api/runmode {mode}：切虚拟机模式且无运行时 → 自动触发下载
+pub async fn runmode_set(State(st): State<SharedState>, Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("");
+    if mode != "device" && mode != "vm" {
+        return err(400, "mode 须为 device 或 vm");
+    }
+    state::set_run_mode(mode);
+    let mut downloading = false;
+    if mode == "vm" && !crate::runtime::runtime_present() {
+        let r = crate::runtime::start_download(&st, None);
+        downloading = r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    }
+    ok(json!({
+        "ok": true,
+        "mode": mode,
+        "downloading": downloading,
+    }))
+}
+
+// ===================== 真机连接 =====================
+
+pub async fn devices_list() -> (StatusCode, Json<Value>) {
+    match tokio::task::spawn_blocking(adb::devices).await {
+        Ok(Ok(ds)) => {
+            let arr: Vec<Value> = ds
+                .iter()
+                .map(|d| {
+                    json!({
+                        "serial": d.serial,
+                        "state": d.state,
+                        "kind": if d.serial.starts_with("emulator-") { "emulator" }
+                                else if d.serial.contains(':') { "wifi" } else { "usb" },
+                    })
+                })
+                .collect();
+            ok(json!({ "devices": arr }))
+        }
+        Ok(Err(e)) => err(500, e.to_string()),
+        Err(e) => err(500, format!("设备列表失败: {e}")),
+    }
+}
+
+/// POST /api/devices/pair {host, port, code, connect_port?}
+pub async fn devices_pair(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let host = v.get("host").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+    let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let connect_port = v.get("connect_port").and_then(|x| x.as_u64()).map(|p| p as u16);
+    if host.is_empty() || port == 0 || code.is_empty() {
+        return err(400, "缺少 host/port/code");
+    }
+    let r = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let pair_addr = format!("{host}:{port}");
+        adb::adb_pair(&pair_addr, &code).map_err(|e| e.to_string())?;
+        // 连接：显式 connect_port > mDNS 同 IP 发现 > 同 IP:5555
+        let target = if let Some(cp) = connect_port {
+            format!("{host}:{cp}")
+        } else {
+            let found = adb::mdns_services()
+                .into_iter()
+                .find(|s| {
+                    s.svc_type.starts_with("_adb._tcp")
+                        && s.addr.split(':').next() == Some(host.as_str())
+                })
+                .map(|s| s.addr);
+            found.unwrap_or_else(|| format!("{host}:5555"))
+        };
+        adb::adb_connect(&target).map_err(|e| e.to_string())?;
+        Ok(target)
+    })
+    .await;
+    match r {
+        Ok(Ok(target)) => ok(json!({ "ok": true, "device": target })),
+        Ok(Err(e)) => err(500, e),
+        Err(e) => err(500, format!("配对任务失败: {e}")),
+    }
+}
+
+/// POST /api/devices/connect {addr: "192.168.1.5:5555"}
+pub async fn devices_connect(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let addr = v.get("addr").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if addr.is_empty() || !addr.contains(':') {
+        return err(400, "addr 须为 IP:端口");
+    }
+    let r = tokio::task::spawn_blocking(move || adb::adb_connect(&addr)).await;
+    match r {
+        Ok(Ok(_)) => ok(json!({ "ok": true })),
+        Ok(Err(e)) => err(500, e.to_string()),
+        Err(e) => err(500, format!("连接失败: {e}")),
+    }
+}
+
+/// POST /api/devices/disconnect {serial}
+pub async fn devices_disconnect(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let serial = v.get("serial").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if serial.is_empty() {
+        return err(400, "缺少 serial");
+    }
+    let r = tokio::task::spawn_blocking(move || adb::adb_disconnect(&serial)).await;
+    match r {
+        Ok(Ok(_)) => ok(json!({ "ok": true })),
+        Ok(Err(e)) => err(500, e.to_string()),
+        Err(e) => err(500, format!("断开失败: {e}")),
+    }
+}
+
+/// GET /api/devices/discovered → mDNS 发现的服务列表
+pub async fn devices_discovered() -> (StatusCode, Json<Value>) {
+    let r = tokio::task::spawn_blocking(adb::mdns_services).await;
+    match r {
+        Ok(list) => ok(json!({
+            "services": list.iter().map(|s| json!({
+                "name": s.name, "type": s.svc_type, "addr": s.addr,
+            })).collect::<Vec<_>>()
+        })),
+        Err(e) => err(500, format!("发现失败: {e}")),
+    }
+}
+
+pub async fn hostpair_begin(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
+    match crate::devices::hostpair_begin(&st.hostpair, 180_000) {
+        Ok(st) => ok(st),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+pub async fn hostpair_get(State(st): State<SharedState>) -> Json<Value> {
+    Json(crate::devices::hostpair_status(&st.hostpair))
+}
+
+pub async fn hostpair_cancel(State(st): State<SharedState>) -> Json<Value> {
+    Json(json!({ "ok": crate::devices::hostpair_cancel(&st.hostpair) }))
+}
+
+// ===================== 运行时下载 =====================
+
+/// POST /api/runtime/download {url?}
+pub async fn runtime_download(State(st): State<SharedState>, body: Bytes) -> (StatusCode, Json<Value>) {
+    let url = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("url").and_then(|x| x.as_str()).map(String::from));
+    let r = crate::runtime::start_download(&st, url);
+    if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        ok(r)
+    } else {
+        err(409, r.get("error").and_then(|x| x.as_str()).unwrap_or("无法开始下载"))
+    }
 }

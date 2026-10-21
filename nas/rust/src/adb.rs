@@ -392,6 +392,7 @@ pub fn find_adb_binary() -> Option<String> {
         cands.push(format!("{home}/Android/Sdk/platform-tools/adb"));
         cands.push("/opt/android-sdk/platform-tools/adb".into());
     }
+    cands.push("/data/android-sdk/platform-tools/adb".into()); // NAS Docker 卷路径
     cands.into_iter().find(|p| std::path::Path::new(p).exists())
 }
 
@@ -521,4 +522,70 @@ fn read_frame_exact(s: &mut TcpStream, buf: &mut [u8]) -> AdbResult<bool> {
         }
     }
     Ok(true)
+}
+
+// ===================== adb 二进制子进程（配对/连接/mDNS 发现） =====================
+
+/// 运行 adb 子进程收 stdout（超时 30s）
+pub fn run_adb(args: &[&str]) -> AdbResult<String> {
+    let bin = find_adb_binary().ok_or_else(|| AdbError("adb 二进制未找到".into()))?;
+    let out = std::process::Command::new(bin)
+        .args(args)
+        .output()
+        .map_err(|e| AdbError(format!("adb 执行失败: {e}")))?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+    Ok(text)
+}
+
+/// 配对（手机端"配对码"流程的服务端在手机上）
+pub fn adb_pair(addr: &str, code: &str) -> AdbResult<String> {
+    let out = run_adb(&["pair", addr, code])?;
+    if out.contains("Successfully paired") || out.contains("已成功") {
+        return Ok(out);
+    }
+    err(format!("配对失败: {}", out.trim()))
+}
+
+pub fn adb_connect(addr: &str) -> AdbResult<String> {
+    let out = run_adb(&["connect", addr])?;
+    if out.contains("connected") && !out.contains("failed") && !out.contains("cannot") {
+        return Ok(out);
+    }
+    err(format!("连接失败: {}", out.trim()))
+}
+
+pub fn adb_disconnect(serial: &str) -> AdbResult<String> {
+    run_adb(&["disconnect", serial])
+}
+
+/// mDNS 发现的 _adb._tcp / _adb-tls-pairing._tcp 服务（adb mdns services 输出）
+#[derive(Debug, Clone)]
+pub struct MdnsService {
+    pub name: String,
+    pub svc_type: String,
+    pub addr: String,
+}
+
+pub fn mdns_services() -> Vec<MdnsService> {
+    let out = match run_adb(&["mdns", "services"]) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let mut list = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("List of") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            list.push(MdnsService {
+                name: parts[0].to_string(),
+                svc_type: parts[1].to_string(),
+                addr: parts[2].to_string(),
+            });
+        }
+    }
+    list
 }

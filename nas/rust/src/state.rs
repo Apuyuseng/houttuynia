@@ -107,6 +107,58 @@ pub struct TermSession {
     pub writer: Mutex<TcpStream>,
 }
 
+// ===================== 网关配置（~/.mwine/nas.json，与桌面 config.json 分离） =====================
+
+pub fn gwcfg_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/.mwine/nas.json")
+}
+
+pub fn gwcfg_load() -> Value {
+    std::fs::read_to_string(gwcfg_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+pub fn gwcfg_save(v: &Value) -> std::io::Result<()> {
+    let path = gwcfg_path();
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(v)?)
+}
+
+/// 运行模式：device（真机，默认）| vm（虚拟机）
+pub fn run_mode() -> String {
+    gwcfg_load()
+        .get("run_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("device")
+        .to_string()
+}
+
+pub fn set_run_mode(mode: &str) {
+    let mut v = gwcfg_load();
+    v.as_object_mut()
+        .map(|o| o.insert("run_mode".into(), json!(mode)));
+    let _ = gwcfg_save(&v);
+}
+
+/// 当前在线真机（非模拟器；唯一在线时取之）
+pub fn online_real_device() -> Option<String> {
+    let ds = crate::adb::devices().ok()?;
+    let mut reals: Vec<&crate::adb::Device> = ds
+        .iter()
+        .filter(|d| d.state == "device" && !d.serial.starts_with("emulator-"))
+        .collect();
+    // USB 设备 serial 形如 "582QUGHG2277L"；无线 "192.168.x.x:5555"
+    if reals.len() == 1 {
+        return Some(reals.remove(0).serial.clone());
+    }
+    None
+}
+
 pub struct AppState {
     pub streams: Mutex<HashMap<u64, Arc<StreamSession>>>,
     pub terminals: Mutex<HashMap<u64, Arc<TermSession>>>,
@@ -117,6 +169,8 @@ pub struct AppState {
     pub runtime_task: TaskState,
     /// perf 差分采样（guest /proc/stat）
     pub perf_last: Mutex<Option<(u64, u64)>>,
+    /// 扫码配对会话
+    pub hostpair: crate::devices::HostPairManager,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -132,6 +186,7 @@ impl AppState {
             image_task: TaskState::default(),
             runtime_task: TaskState::default(),
             perf_last: Mutex::new(None),
+            hostpair: crate::devices::HostPairManager::new(),
         })
     }
 
@@ -139,12 +194,17 @@ impl AppState {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// 按运行模式取管理目标：真机模式 → 唯一在线真机；虚拟机模式 → 在线模拟器
     pub fn current_serial(&self) -> Option<String> {
-        crate::adb::online_emulator()
+        if run_mode() == "device" {
+            online_real_device()
+        } else {
+            crate::adb::online_emulator()
+        }
     }
 
     pub fn vm_running(&self) -> bool {
-        self.current_serial().is_some()
+        crate::adb::online_emulator().is_some()
     }
 }
 

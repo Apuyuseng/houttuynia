@@ -10,7 +10,9 @@
 mod adb;
 mod api;
 mod console;
+mod devices;
 mod icons;
+mod runtime;
 mod meta;
 mod scrcpy;
 mod state;
@@ -228,7 +230,7 @@ async fn main() {
         .route("/image/cancel", post(api::not_impl_image_pull))
         .route("/runtime/status", get(api::runtime_status))
         .route("/runtime/task", get(api::runtime_task))
-        .route("/runtime/download", post(api::not_impl_runtime_dl))
+        .route("/runtime/download", post(api::runtime_download))
         .route("/runtime/import", post(api::not_impl_runtime_dl))
         .route("/runtime/cancel", post(api::not_impl_runtime_dl))
         // 终端
@@ -238,17 +240,17 @@ async fn main() {
         .route("/term/{id}/write", post(api::term_write))
         .route("/term/{id}/close", post(api::term_close))
         // 设备
-        .route("/devices", get(api::devices))
-        .route("/devices/discovered", get(api::not_impl_pair))
-        .route("/devices/pair", post(api::not_impl_pair))
-        .route("/devices/hostpair/begin", post(api::not_impl_pair))
-        .route("/devices/hostpair", get(api::not_impl_pair))
-        .route("/devices/hostpair/cancel", post(api::not_impl_pair))
-        .route("/devices/connect", post(api::not_impl_pair))
-        .route("/devices/disconnect", post(api::not_impl_pair))
-        .route("/devices/forget", post(api::not_impl_pair))
-        .route("/devices/tcpip", post(api::not_impl_pair))
-        .route("/devices/mirror", post(api::not_impl_pair))
+        .route("/devices", get(api::devices_list))
+        .route("/devices/discovered", get(api::devices_discovered))
+        .route("/devices/pair", post(api::devices_pair))
+        .route("/devices/hostpair/begin", post(api::hostpair_begin))
+        .route("/devices/hostpair", get(api::hostpair_get))
+        .route("/devices/hostpair/cancel", post(api::hostpair_cancel))
+        .route("/devices/connect", post(api::devices_connect))
+        .route("/devices/disconnect", post(api::devices_disconnect))
+        .route("/devices/forget", post(api::devices_disconnect))
+        // 运行模式
+        .route("/runmode", get(api::runmode_get).post(api::runmode_set))
         // 投屏
         .route("/stream/open", post(api::stream_open))
         .route("/stream/{id}/video", get(api::stream_video))

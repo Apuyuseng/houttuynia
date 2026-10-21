@@ -11,6 +11,7 @@ const routes = [
   { path: '/', redirect: '/overview' },
   { path: '/overview', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '概览' } },
   { path: '/apps', name: 'apps', component: () => import('./views/Apps.vue'), meta: { title: '应用库' } },
+  { path: '/devices', name: 'devices', component: () => import('./views/Devices.vue'), meta: { title: '真机连接' } },
   { path: '/store', name: 'store', component: () => import('./views/Store.vue'), meta: { title: '在线商店' } },
   { path: '/images', name: 'images', component: () => import('./views/Images.vue'), meta: { title: '镜像与运行时' } },
   { path: '/terminal', name: 'terminal', component: () => import('./views/Terminal.vue'), meta: { title: 'ADB 终端' } },

@@ -32,7 +32,9 @@ import { ElMessage } from 'element-plus'
 import { ScrcpyWebPlayer } from '../player'
 
 const props = defineProps({
-  app: Object,        // {package, name}
+  app: Object,        // {package, name}（应用独立窗口）
+  deviceSerial: String, // 真机主屏镜像投屏
+  titleText: String,  // 自定义标题（真机投屏用）
   offset: Number,     // 级联偏移（多窗错开）
   z: Number,
 })
@@ -51,15 +53,18 @@ const imeRef = ref(null)
 const ready = ref(false)
 const bodyRef = ref(null)
 
-const title = props.app?.name || props.app?.package || ''
+const title = props.titleText || props.app?.name || props.app?.package || ''
 const pkg = props.app?.package || ''
 
 let player = null
 let canvas = null
 
 onMounted(() => {
+  const openQuery = props.deviceSerial
+    ? `&serial=${encodeURIComponent(props.deviceSerial)}`
+    : `&app=${encodeURIComponent(pkg)}&w=720&h=1280&dpi=320`
   player = new ScrcpyWebPlayer({
-    openQuery: `&app=${encodeURIComponent(pkg)}&w=720&h=1280&dpi=320`,
+    openQuery,
     onStatus: (t) => { status.value = t },
     onFirstFrame: () => {
       ready.value = true

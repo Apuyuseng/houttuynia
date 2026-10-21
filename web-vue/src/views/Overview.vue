@@ -20,10 +20,10 @@
         <div class="phone-panel">
           <div class="screen-box" ref="screenBox">
             <div class="placeholder" v-if="!imgShown">
-              虚拟机{{ running ? '运行中' : '未运行' }}<br>
-              <span class="small muted">{{ running ? '点击投屏查看实时画面' : '启动后此处显示设备画面' }}</span>
+              {{ mode === 'device' ? (deviceSerial ? '真机已连接' : '真机未连接') : (running ? '虚拟机运行中' : '虚拟机未运行') }}<br>
+              <span class="small muted">{{ running ? '点击投屏查看实时画面' : (mode === 'device' ? '到「真机」页连接手机后此处显示画面' : '启动后此处显示设备画面') }}</span>
             </div>
-            <img v-if="imgUrlNow && !streaming" :src="imgUrlNow" @load="imgShown = true" alt="">
+            <img v-if="imgUrlNow && !streaming" :src="imgUrlNow" @load="imgShown = true" @error="imgShown = false; imgUrlNow = ''" alt="">
           </div>
         </div>
       </div>
@@ -46,12 +46,19 @@
 
     <div style="display:grid;gap:18px;">
       <el-card shadow="never">
-        <template #header>虚拟机</template>
+        <template #header>{{ mode === 'device' ? '真机' : '虚拟机' }}</template>
         <div class="muted small">
-          状态：<b :style="{color: running ? 'var(--el-color-success)' : 'inherit'}">{{ running ? '运行中' : '未运行' }}</b>
-          <template v-if="serial"> · 设备 <span class="mono">{{ serial }}</span></template>
+          <template v-if="mode === 'device'">
+            模式：<b>真机模式</b> · 
+            <template v-if="deviceSerial">设备 <span class="mono">{{ deviceSerial }}</span></template>
+            <template v-else>未连接（到「真机」页连接手机）</template>
+          </template>
+          <template v-else>
+            状态：<b :style="{color: running ? 'var(--el-color-success)' : 'inherit'}">{{ running ? '运行中' : '未运行' }}</b>
+            <template v-if="serial"> · 设备 <span class="mono">{{ serial }}</span></template>
+          </template>
         </div>
-        <el-space style="margin-top:14px;">
+        <el-space style="margin-top:14px;" v-if="mode !== 'device'">
           <el-button type="primary" :loading="busy === 'start'" @click="vmAction('start')">▶ 启动</el-button>
           <el-button :loading="busy === 'stop'" @click="vmAction('stop')">■ 停止（自动存档）</el-button>
         </el-space>
@@ -89,8 +96,9 @@ import { ElMessage } from 'element-plus'
 import { apiGet, apiPost, imgUrl, fmtMb, fmtUptime } from '../api'
 import { ScrcpyWebPlayer } from '../player'
 
-const { vmRunning, serial } = inject('vmState')
-const running = vmRunning
+const { vmRunning, serial, mode, deviceSerial } = inject('vmState')
+const running = computed(() => mode.value === 'device' ? !!deviceSerial.value : vmRunning.value)
+const targetSerial = computed(() => mode.value === 'device' ? deviceSerial.value : serial.value)
 
 const screenBox = ref(null)
 const busy = ref('')
@@ -127,15 +135,13 @@ async function refreshPerf() {
   try {
     const st = await apiGet('/api/status')
     vmError.value = st.error || ''
-    if (st.vm?.running && !live.value && !streaming.value) loadShotOnce()
+    if ((st.vm?.running || st.target_serial) && !live.value && !streaming.value) loadShotOnce()
   } catch {}
 }
 
 async function loadShotOnce() {
-  const url = imgUrl('/api/screenshot.png') + '&t=' + Date.now()
-  const img = new Image()
-  img.onload = () => { imgUrlNow.value = url; imgShown.value = true }
-  img.src = url
+  // 直接换 src：@load 隐 imgShown（双探测加载会导致占位符滞留）
+  imgUrlNow.value = imgUrl('/api/screenshot.png') + '&t=' + Date.now()
 }
 
 let liveTimer = null

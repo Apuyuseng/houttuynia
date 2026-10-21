@@ -1,6 +1,18 @@
 <template>
   <div style="display:grid;gap:18px;">
     <el-card shadow="never">
+      <template #header>运行模式</template>
+      <el-radio-group v-model="runMode" @change="switchMode" :disabled="switching">
+        <el-radio-button value="device">📱 真机模式</el-radio-button>
+        <el-radio-button value="vm">🖥 虚拟机模式</el-radio-button>
+      </el-radio-group>
+      <div class="small muted" style="margin-top:10px;">
+        真机模式：管理局域网/USB 连接的 Android 手机（「真机」页连接）。<br>
+        虚拟机模式：使用内置 Android 模拟器。<span v-if="!runtimePresent" style="color:var(--el-color-warning)">首次切换将自动下载模拟器运行时（约 330MB，可在「镜像」页查看进度）。</span>
+      </div>
+    </el-card>
+
+    <el-card shadow="never">
       <template #header>虚拟机配置</template>
       <el-form :model="cfg" label-width="200px" label-position="left">
         <el-form-item label="设备形态">
@@ -109,6 +121,9 @@ import { apiGet, apiPost } from '../api'
 
 const cfg = ref({})
 const saving = ref(false)
+const runMode = ref('vm')
+const runtimePresent = ref(true)
+const switching = ref(false)
 const snaps = ref([])
 const snapName = ref('')
 
@@ -181,5 +196,30 @@ async function resetVm() {
   } catch (e) { ElMessage.error(e.message) }
 }
 
-onMounted(() => { loadCfg(); loadSnaps() })
+async function loadMode() {
+  try {
+    const d = await apiGet('/api/runmode')
+    runMode.value = d.mode || 'vm'
+    runtimePresent.value = !!d.runtime_present
+  } catch {}
+}
+
+async function switchMode(mode) {
+  switching.value = true
+  try {
+    const r = await apiPost('/api/runmode', { mode })
+    if (r.downloading) {
+      ElMessage.success('已切换到虚拟机模式，运行时下载已开始（见「镜像」页进度）')
+      runtimePresent.value = false
+    } else {
+      ElMessage.success(mode === 'device' ? '已切换到真机模式' : '已切换到虚拟机模式')
+    }
+  } catch (e) {
+    ElMessage.error(e.message)
+    loadMode() // 回滚显示
+  }
+  switching.value = false
+}
+
+onMounted(() => { loadCfg(); loadSnaps(); loadMode() })
 </script>
