@@ -254,27 +254,51 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
             return Ok((bytes, "direct"));
         }
     }
-    // 通道 2：companion 桥导出（对齐 iconfetch --wallpaper 协议）
+    // 通道 2：companion 桥导出（对齐 iconfetch --wallpaper 协议）；
+    // 桥缺失时按需自动装配（桌面版同样在首用时装桥）
     let bridge = adb::shell_blocking(serial, "pm list packages com.mwine.bridge", 8000)
         .map(|o| String::from_utf8_lossy(&o).contains("com.mwine.bridge"))
         .unwrap_or(false);
-    if bridge {
-        let _ = adb::shell_blocking(
-            serial,
-            "am broadcast -a com.mwine.bridge.EXPORT_WALLPAPER --es out wallpaper.png",
-            8000,
-        );
-        if let Ok(bytes) = adb::pull_file(
-            serial,
-            "/sdcard/Android/data/com.mwine.bridge/files/wallpaper.png",
-            32 * 1024 * 1024,
-        ) {
-            if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
-                let _ = std::fs::write(&cache, &bytes);
-                let _ = std::fs::write(&stamp_file, &stamp);
-                return Ok((bytes, "bridge"));
+    if !bridge {
+        if let Some(apk) = find_bridge_apk() {
+            if let Ok(bytes) = std::fs::read(&apk) {
+                let remote = "/data/local/tmp/mwine-bridge.apk";
+                if adb::push_bytes(serial, &bytes, remote).is_ok() {
+                    let _ = adb::shell_blocking(serial, &format!("pm install -r '{remote}'"), 120000);
+                    let _ = adb::shell_blocking(serial, &format!("rm -f '{remote}'"), 10000);
+                }
             }
         }
+    }
+    let bridge = bridge || adb::shell_blocking(serial, "pm list packages com.mwine.bridge", 8000)
+        .map(|o| String::from_utf8_lossy(&o).contains("com.mwine.bridge"))
+        .unwrap_or(false);
+    if bridge {
+        // 对齐 iconfetch fetchViaBridge：先解冻（新装应用 stopped 态收不到
+        // 广播）+ 显式组件广播（隐式会被系统拦）+ 等文件出现
+        let dev_path = "/sdcard/Android/data/com.mwine.bridge/files/wallpaper.png";
+        let _ = adb::shell_blocking(
+            serial,
+            &format!(
+                "am start -n com.mwine.bridge/.UnlockActivity; \
+                 rm -f '{dev_path}'; \
+                 am broadcast -n com.mwine.bridge/.WallpaperReceiver \
+                 -a com.mwine.bridge.EXPORT_WALLPAPER --es out wallpaper.png --ei maxDim 1080"
+            ),
+            15000,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        for _ in 0..5 {
+            if let Ok(bytes) = adb::pull_file(serial, dev_path, 32 * 1024 * 1024) {
+                if bytes.len() > 1024 && &bytes[..4] == b"\x89PNG" {
+                    let _ = std::fs::write(&cache, &bytes);
+                    let _ = std::fs::write(&stamp_file, &stamp);
+                    return Ok((bytes, "bridge"));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let _ = adb::shell_blocking(serial, &format!("rm -f '{dev_path}'"), 5000);
     }
     // 通道 3：主屏截图（前端 CSS 高斯模糊后视觉等同氛围壁纸）
     if let Ok(bytes) = adb::shell_blocking(serial, "screencap -p", 15000) {
@@ -283,4 +307,21 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
         }
     }
     err("壁纸不可用（非 root、无 companion 桥、截图兜底失败）")
+}
+
+/// companion 桥 APK 查找（bundle bin / ~/.mwine/bin / 开发树 assets）
+fn find_bridge_apk() -> Option<String> {
+    let home = home();
+    let mut cands = vec![
+        "/opt/mwine/bin/mwine-bridge.apk".to_string(), // Docker 镜像内置
+        format!("{home}/.mwine/bin/mwine-bridge.apk"),
+        format!("{home}/Downloads/aiproject/mwine/assets/companion/dist/mwine-bridge.apk"),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            cands.push(format!("{}/../Resources/bin/mwine-bridge.apk", d.display()));
+            cands.push(format!("{}/mwine-bridge.apk", d.display()));
+        }
+    }
+    cands.into_iter().find(|p| std::path::Path::new(p).is_file())
 }

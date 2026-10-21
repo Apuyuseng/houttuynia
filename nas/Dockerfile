@@ -43,6 +43,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 COPY --from=build /src/target/release/mwine-nas /usr/local/bin/mwine-nas
 COPY web-vue/dist/ /opt/mwine/web/
 COPY nas/setup-emulator.sh /opt/mwine/setup-emulator.sh
+COPY assets/companion/dist/mwine-bridge.apk /opt/mwine/bin/mwine-bridge.apk
 RUN chmod +x /opt/mwine/setup-emulator.sh
 
 # HOME=/data：~/.mwine（配置/日志/上传）、~/.android（AVD）全部落在持久卷
