@@ -1,5 +1,5 @@
 <template>
-  <div style="display:grid;gap:18px;">
+  <div class="apps-page">
     <!-- 桌面上沿工具栏（贴合面板左右上三边）：搜索/上传/刷新 -->
     <!-- 结构移进 .launcher 内顶部 -->
 
@@ -324,4 +324,14 @@ onUnmounted(() => { polling = false })
   filter: blur(26px) brightness(.6) saturate(1.2);
   transform: scale(1.12);  /* 模糊边缘出血消除 */
 }
+/* 应用库整页贴合 el-main（抵消其内边距，仅本页生效） */
+.apps-page {
+  display: flex; flex-direction: column; gap: 18px;
+  margin: -18px -24px -60px;
+  min-height: calc(100vh - 60px - 60px); /* el-header 60px + el-main 原下边距 */
+}
+/* 任务卡在整页贴合下保持呼吸感 */
+.apps-page > .el-card { margin: 18px 24px 0; }
+/* launcher 吃满剩余高度 */
+.apps-page > .launcher { flex: 1; }
 </style>
