@@ -526,37 +526,30 @@ fn read_frame_exact(s: &mut TcpStream, buf: &mut [u8]) -> AdbResult<bool> {
 
 // ===================== adb 二进制子进程（配对/连接/mDNS 发现） =====================
 
-/// 运行 adb 子进程收 stdout（超时 30s）
-pub fn run_adb(args: &[&str]) -> AdbResult<String> {
-    let bin = find_adb_binary().ok_or_else(|| AdbError("adb 二进制未找到".into()))?;
-    let out = std::process::Command::new(bin)
-        .args(args)
-        .output()
-        .map_err(|e| AdbError(format!("adb 执行失败: {e}")))?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string()
-        + &String::from_utf8_lossy(&out.stderr);
-    Ok(text)
-}
+// ===== 自研 adb server 会话命令（pair/connect/disconnect —— 不再依赖外部 adb 二进制）=====
 
-/// 配对（手机端"配对码"流程的服务端在手机上）
+/// host:pair:<addr>:<code> —— 无线 TLS 配对（手机端「配对码」的服务端在手机上）
 pub fn adb_pair(addr: &str, code: &str) -> AdbResult<String> {
-    let out = run_adb(&["pair", addr, code])?;
-    if out.contains("Successfully paired") || out.contains("已成功") {
-        return Ok(out);
-    }
-    err(format!("配对失败: {}", out.trim()))
+    let mut c = SmartConn::connect(5000)?;
+    c.service(&format!("host:pair:{addr}:{code}"))
+        .map_err(|e| AdbError(format!("配对失败: {}", e.to_string().replace("adb service request failed: ", ""))))?;
+    Ok("paired".into())
 }
 
+/// host:connect:<addr>
 pub fn adb_connect(addr: &str) -> AdbResult<String> {
-    let out = run_adb(&["connect", addr])?;
-    if out.contains("connected") && !out.contains("failed") && !out.contains("cannot") {
-        return Ok(out);
-    }
-    err(format!("连接失败: {}", out.trim()))
+    let mut c = SmartConn::connect(5000)?;
+    c.service(&format!("host:connect:{addr}"))
+        .map_err(|e| AdbError(format!("连接失败: {}", e.to_string().replace("adb service request failed: ", ""))))?;
+    Ok("connected".into())
 }
 
+/// host:disconnect:<serial>
 pub fn adb_disconnect(serial: &str) -> AdbResult<String> {
-    run_adb(&["disconnect", serial])
+    let mut c = SmartConn::connect(5000)?;
+    c.service(&format!("host:disconnect:{serial}"))
+        .map_err(|e| AdbError(format!("断开失败: {}", e.to_string().replace("adb service request failed: ", ""))))?;
+    Ok("disconnected".into())
 }
 
 /// mDNS 发现的 _adb._tcp / _adb-tls-pairing._tcp 服务（adb mdns services 输出）
@@ -568,26 +561,206 @@ pub struct MdnsService {
 }
 
 pub fn mdns_services() -> Vec<MdnsService> {
-    let out = match run_adb(&["mdns", "services"]) {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    let mut list = Vec::new();
-    for line in out.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("List of") {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
+    // 组播 + 广播双通道（多接口主机上组播常因默认路由黑洞）
+    let mut list = mdns_services_broadcast();
+    for (svc_fqdn, kind) in [
+        ("_adb._tcp.local", "_adb._tcp"),
+        ("_adb-tls-pairing._tcp.local", "_adb-tls-pairing._tcp"),
+        ("_adb-tls-connect._tcp.local", "_adb-tls-connect._tcp"),
+    ] {
+        for (name, host, port) in mdns_discover(svc_fqdn) {
+            let ip = mdns_resolve_a(&host).unwrap_or_else(|| host.clone());
             list.push(MdnsService {
-                name: parts[0].to_string(),
-                svc_type: parts[1].to_string(),
-                addr: parts[2].to_string(),
+                name,
+                svc_type: kind.to_string(),
+                addr: format!("{ip}:{port}"),
             });
         }
     }
     list
+}
+
+/// DNS-SD 发现：组播 224.0.0.251:5353 PTR 查询，收 SRV 记录拿主机名+端口。
+fn mdns_discover(service: &str) -> Vec<(String, String, u16)> {
+    use std::net::UdpSocket;
+    use std::time::{Duration, Instant};
+    let mut out = Vec::new();
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    sock.set_read_timeout(Some(Duration::from_millis(1200))).ok();
+    // 组播 TTL=255（DNS-SD 规范）+ 回环（本机手机也在发）
+    let s2 = socket2::SockRef::from(&sock);
+    let _ = s2.set_ttl(255);
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        let on: libc::c_int = 1;
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_LOOP,
+            &on as *const libc::c_int as *const libc::c_void,
+            4,
+        );
+    }
+    let qname = dns_encode_name(service);
+    let mut query = Vec::with_capacity(12 + qname.len() + 4);
+    query.extend_from_slice(&0x1234u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&qname);
+    query.extend_from_slice(&0x000Cu16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    let _ = sock.send_to(&query, ("224.0.0.251", 5353));
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut buf = [0u8; 9000];
+    let mut srv_seen: Vec<(String, u16)> = Vec::new();
+    while Instant::now() < deadline {
+        let (n, _) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if n < 12 { continue; }
+        let pkt = &buf[..n];
+        let qd = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+        let mut off = 12;
+        for _ in 0..qd {
+            off = dns_skip_name(pkt, off);
+            off += 4;
+        }
+        let total_rr = u16::from_be_bytes([pkt[6], pkt[7]]) as usize
+            + u16::from_be_bytes([pkt[8], pkt[9]]) as usize
+            + u16::from_be_bytes([pkt[10], pkt[11]]) as usize;
+        for _ in 0..total_rr {
+            if off + 10 > n { break; }
+            let (name_end, _) = dns_read_name(pkt, off);
+            off = name_end;
+            let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+            let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
+            let rdata_off = off + 10;
+            if rtype == 33 && rdata_off + 6 <= n {
+                let port = u16::from_be_bytes([pkt[rdata_off + 4], pkt[rdata_off + 5]]);
+                let (_, target) = dns_read_name(pkt, rdata_off + 6);
+                srv_seen.push((target, port));
+            }
+            off = rdata_off + rdlen;
+        }
+    }
+    for (target, port) in srv_seen {
+        let ip = mdns_resolve_a(&target)
+            .or_else(|| target.trim_end_matches(".local").parse::<std::net::Ipv4Addr>().ok().map(|i| i.to_string()));
+        if let Some(ip) = ip {
+            let inst = target
+                .trim_end_matches(service)
+                .trim_end_matches('.')
+                .to_string();
+            out.push((inst, format!("{ip}"), port));
+        }
+    }
+    out
+}
+
+fn mdns_resolve_a(host: &str) -> Option<String> {
+    use std::net::UdpSocket;
+    use std::time::{Duration, Instant};
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    let qname = dns_encode_name(host);
+    let mut q = Vec::with_capacity(12 + qname.len() + 4);
+    q.extend_from_slice(&0x4321u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&qname);
+    q.extend_from_slice(&1u16.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes());
+    sock.send_to(&q, ("224.0.0.251", 5353)).ok()?;
+    let deadline = Instant::now() + Duration::from_millis(900);
+    let mut buf = [0u8; 4096];
+    while Instant::now() < deadline {
+        let (n, _) = sock.recv_from(&mut buf).ok()?;
+        if n < 12 { continue; }
+        let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+        let mut off = 12;
+        for _ in 0..qd {
+            off = dns_skip_name(&buf, off);
+            off += 4;
+        }
+        let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+        for _ in 0..an {
+            if off + 10 > n { break; }
+            let (ne, _) = dns_read_name(&buf, off);
+            off = ne;
+            let rtype = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let rdlen = u16::from_be_bytes([buf[off + 8], buf[off + 9]]) as usize;
+            let rdata_off = off + 10;
+            if rtype == 1 && rdlen == 4 && rdata_off + 4 <= n {
+                return Some(format!("{}.{}.{}.{}",
+                    buf[rdata_off], buf[rdata_off + 1], buf[rdata_off + 2], buf[rdata_off + 3]));
+            }
+            off = rdata_off + rdlen;
+        }
+    }
+    None
+}
+
+fn dns_encode_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in name.split('.') {
+        out.push(part.len() as u8);
+        out.extend_from_slice(part.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+fn dns_skip_name(pkt: &[u8], mut off: usize) -> usize {
+    loop {
+        if off >= pkt.len() { return off; }
+        let len = pkt[off] as usize;
+        if len == 0 { return off + 1; }
+        if len & 0xC0 == 0xC0 { return off + 2; }
+        off += 1 + len;
+    }
+}
+
+fn dns_read_name(pkt: &[u8], mut off: usize) -> (usize, String) {
+    let mut name = String::new();
+    let mut jumped = false;
+    let mut end_off = off;
+    let mut hops = 0;
+    loop {
+        if off >= pkt.len() || hops > 20 { break; }
+        let len = pkt[off] as usize;
+        if len == 0 {
+            if !jumped { end_off = off + 1; }
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            if off + 1 >= pkt.len() { break; }
+            let ptr = ((len & 0x3F) << 8) | pkt[off + 1] as usize;
+            if !jumped { end_off = off + 2; }
+            jumped = true;
+            off = ptr;
+            hops += 1;
+            continue;
+        }
+        off += 1;
+        if off + len > pkt.len() { break; }
+        if !name.is_empty() { name.push('.'); }
+        name.push_str(&String::from_utf8_lossy(&pkt[off..off + len]));
+        off += len;
+        if !jumped { end_off = off; }
+    }
+    (end_off, name)
 }
 
 /// 远程文件区间读取（dd 分块）：无线真机上图标提取只读尾部目录+图标切片，
@@ -611,4 +784,111 @@ pub fn pull_range(serial: &str, path: &str, offset: u64, len: u64) -> AdbResult<
         return err(format!("dd 区间读取不足: {} < {}", out.len(), start + want));
     }
     Ok(out[start..start + want].to_vec())
+}
+
+/// 组播发现：用广播 255.255.255.255 + 常见网段定向，补偿多接口默认路由下
+/// 224.0.0.251 出不出的问题。同样收 SRV。
+pub fn mdns_services_broadcast() -> Vec<MdnsService> {
+    let mut list = Vec::new();
+    for (svc_fqdn, kind) in [
+        ("_adb._tcp.local", "_adb._tcp"),
+        ("_adb-tls-pairing._tcp.local", "_adb-tls-pairing._tcp"),
+        ("_adb-tls-connect._tcp.local", "_adb-tls-connect._tcp"),
+    ] {
+        for (name, host, port) in mdns_broadcast_query(svc_fqdn) {
+            let ip = mdns_resolve_a(&host)
+                .or_else(|| host.trim_end_matches(".local").parse::<std::net::Ipv4Addr>().ok().map(|i| i.to_string()))
+                .unwrap_or(host.clone());
+            list.push(MdnsService {
+                name,
+                svc_type: kind.to_string(),
+                addr: format!("{ip}:{port}"),
+            });
+        }
+    }
+    list
+}
+
+fn mdns_broadcast_query(service: &str) -> Vec<(String, String, u16)> {
+    use std::net::UdpSocket;
+    use std::time::{Duration, Instant};
+    let mut out = Vec::new();
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    sock.set_read_timeout(Some(Duration::from_millis(1200))).ok();
+    sock.set_broadcast(true).ok();
+    let qname = dns_encode_name(service);
+    let mut query = Vec::with_capacity(12 + qname.len() + 4);
+    query.extend_from_slice(&0x5678u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&qname);
+    query.extend_from_slice(&0x000Cu16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    // 广播到 5353 与本网段广播
+    let _ = sock.send_to(&query, ("255.255.255.255", 5353));
+    if let Ok(ip) = local_ip() {
+        if let Some(bcast) = broadcast_of(&ip) {
+            let _ = sock.send_to(&query, (bcast.as_str(), 5353));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut buf = [0u8; 9000];
+    let mut seen: Vec<(String, u16)> = Vec::new();
+    while Instant::now() < deadline {
+        let (n, _) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if n < 12 { continue; }
+        let pkt = &buf[..n];
+        let qd = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+        let mut off = 12;
+        for _ in 0..qd {
+            off = dns_skip_name(pkt, off);
+            off += 4;
+        }
+        let total_rr = u16::from_be_bytes([pkt[6], pkt[7]]) as usize
+            + u16::from_be_bytes([pkt[8], pkt[9]]) as usize
+            + u16::from_be_bytes([pkt[10], pkt[11]]) as usize;
+        for _ in 0..total_rr {
+            if off + 10 > n { break; }
+            let (ne, _) = dns_read_name(pkt, off);
+            off = ne;
+            let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+            let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
+            let rdata_off = off + 10;
+            if rtype == 33 && rdata_off + 6 <= n {
+                let port = u16::from_be_bytes([pkt[rdata_off + 4], pkt[rdata_off + 5]]);
+                let (_, target) = dns_read_name(pkt, rdata_off + 6);
+                seen.push((target, port));
+            }
+            off = rdata_off + rdlen;
+        }
+    }
+    for (target, port) in seen {
+        let ip = mdns_resolve_a(&target)
+            .or_else(|| target.trim_end_matches(".local").parse::<std::net::Ipv4Addr>().ok().map(|i| i.to_string()));
+        if let Some(ip) = ip {
+            let inst = target.trim_end_matches(service).trim_end_matches('.').to_string();
+            out.push((inst, format!("{ip}"), port));
+        }
+    }
+    out
+}
+
+fn local_ip() -> std::io::Result<String> {
+    // UDP 连接一个公网地址让内核选出本机出口 IP（不实际发包）
+    let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    s.connect(("8.8.8.8", 80))?;
+    Ok(s.local_addr()?.ip().to_string())
+}
+
+fn broadcast_of(ip: &str) -> Option<String> {
+    ip.rsplitn(2, '.').nth(1).map(|p| format!("{p}.255"))
 }
