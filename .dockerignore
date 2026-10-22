@@ -9,5 +9,5 @@ runtime
 docs
 app
 scripts
-assets
+!assets/companion/dist/mwine-bridge.apk
 NOTES.md

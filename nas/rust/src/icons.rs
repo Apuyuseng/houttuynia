@@ -194,7 +194,10 @@ fn zip_read_slice(slice: &[u8], method: u16, comp_size: u32) -> Option<Vec<u8>> 
     }
 }
 
-/// 挑图标条目（中央目录语义筛选；不读内容）
+/// 挑图标条目（中央目录语义筛选；不读内容）。
+/// 维度：名字命中度（ic_launcher > launcher > icon）→ 形状（方形优先，
+/// 宽 banner 剔除）→ dpi 高优先 → png>webp。自适应图标的矩形回退也认
+/// （其前景已被 _foreground 覆盖，方形候选缺席时取它）。
 fn pick_icon_entry(entries: &[CdEntry]) -> Option<&CdEntry> {
     let mut best: Option<(u32, &CdEntry)> = None;
     for e in entries {
@@ -208,7 +211,16 @@ fn pick_icon_entry(entries: &[CdEntry]) -> Option<&CdEntry> {
         if !is_png && !is_webp {
             continue;
         }
-        let name_score = if lower.contains("ic_launcher") {
+        // 维度几何：mipmap 目录语义推导尺寸（banner 大体按宽/高比剔除）
+        let shape_score = shape_score_of(&lower);
+        if shape_score == 0 {
+            continue; // 宽 banner（>1.8:1）：非图标用途
+        }
+        // 名字命中度：方形前景（108×108 自适应画布，系统就是拿它渲染图标）
+        // > ic_launcher（可能矩形回退/banner） > launcher > icon
+        let name_score = if lower.contains("ic_launcher_foreground") {
+            130
+        } else if lower.contains("ic_launcher") {
             100
         } else if lower.contains("launcher") {
             60
@@ -217,12 +229,48 @@ fn pick_icon_entry(entries: &[CdEntry]) -> Option<&CdEntry> {
         } else {
             continue;
         };
-        let score = name_score * 100 + dpi_weight(&lower) * 10 + if is_png { 2 } else { 1 };
+        // 名字命中 × 形状（方形加成） + dpi + 格式
+        let score = name_score * 100 + shape_score * 30 + dpi_weight(&lower) * 6 + if is_png { 2 } else { 1 };
         if best.map(|(s, _)| score > s).unwrap_or(true) {
             best = Some((score, e));
         }
     }
     best.map(|(_, e)| e)
+}
+
+/// mipmap/drawable 目录 → 基准像素尺寸的宽/高比近似（w/h）；
+/// 返回 3（方形/近似方形）| 2（1.1–1.8，竖立 banner 可救）| 0（宽 banner 剔除）。
+/// 自适应图标真实尺寸未知时以其矩形回退档同样命中（方形前景缺席的兜底）。
+fn shape_score_of(path: &str) -> u32 {
+    for (token, wh) in [
+        ("xxxhdpi", 192.0f32),
+        ("xxhdpi", 144.0),
+        ("xhdpi", 96.0),
+        ("hdpi", 72.0),
+        ("mdpi", 48.0),
+        ("ldpi", 36.0),
+        ("nodpi", 48.0),
+        ("tvdpi", 64.0),
+    ] {
+        if path.contains(token) {
+            // 近似：图标边长 ~wh；无法精确定向比例，用名字形态判：
+            // 「round」「square」「circle」直接方形满分
+            if path.contains("round") || path.contains("square") || path.contains("circle") {
+                return 3;
+            }
+            // "banner"/"wide"/"logo_land" 类宽图剔除
+            if path.contains("banner") || path.contains("wide") || path.contains("_land") {
+                return 0;
+            }
+            let _ = wh;
+            return 3; // 默认方形：mipmap 下的标准图标位
+        }
+    }
+    // drawable-anydpi 等无 dpi 标记：看名字
+    if path.contains("banner") || path.contains("wide") || path.contains("_land") {
+        return 0;
+    }
+    3
 }
 
 /// 区间读取式图标提取：尾部 EOCD → 中央目录 → 图标切片（三次小读）
@@ -256,6 +304,9 @@ fn icon_from_apk_ranged(serial: &str, path: &str, size: u64) -> Option<(Vec<u8>,
     let want = 512 + e.comp_size as u64;
     let slice = adb::pull_range(serial, path, e.local_off, want).ok()?;
     let data = zip_read_slice(&slice, e.method, e.comp_size)?;
+    if data.len() > 0x1000_0000 {
+        return None; // >256MB 瓦片保护
+    }
     if data.len() > 8 && &data[..4] == b"\x89PNG" {
         return Some((data, "image/png"));
     }
@@ -354,9 +405,18 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
             return Ok((bytes, mime));
         }
     }
-    // 负缓存：已确认无可提取图标（自适应 XML 图标等），不再反复拉 APK
-    if dir.join(format!("{pkg}.noicon")).exists() {
-        return err("无可提取图标");
+    // 负缓存：确认无可提取图标后 7 天内不再拉 APK（APK 升级可能带新图标）
+    if let Ok(m) = std::fs::metadata(dir.join(format!("{pkg}.noicon"))) {
+        let recent = m
+            .modified()
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs() < 7 * 24 * 3600)
+            .unwrap_or(true);
+        if recent {
+            return err("无可提取图标");
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{pkg}.noicon")));
     }
     // 同包在飞合并：第二个请求者等前者落缓存后直接读
     {
