@@ -218,6 +218,175 @@ fn parse_start_element_label(chunk: &[u8], strings: &[String], res_map: &[u32]) 
 
 // ===================== resources.arsc =====================
 
+/// 从 AXML 取 <application android:icon / logo / banner> 资源引用 id。
+/// 返回按优先级排序（icon > logo > banner）；字面值（非引用）跳过。
+/// 用途：资源名被 AndResGuard 混淆（res/-2.png）的 APK 只能靠 manifest
+/// 引用 + arsc 解析定位真实图标文件。
+pub fn axml_app_icon_refs(axml: &[u8]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new(); // [icon, logo, banner] 按优先级
+    if axml.len() < 8 || u16le(axml, 0) != 0x0003 {
+        return out;
+    }
+    let mut off = 8usize;
+    let mut strings: Vec<String> = Vec::new();
+    let mut icon = None;
+    let mut logo = None;
+    let mut banner = None;
+    while off + 8 <= axml.len() {
+        let ctype = u16le(axml, off);
+        let csize = u32le(axml, off + 4) as usize;
+        if csize < 8 || off + csize > axml.len() {
+            break;
+        }
+        let chunk = &axml[off..off + csize];
+        if ctype == 0x0001 {
+            strings = parse_string_pool(chunk);
+        } else if ctype == 0x0102 && !strings.is_empty() {
+            let name_idx = u32le(chunk, 20) as usize;
+            let elem = strings.get(name_idx).map(String::as_str).unwrap_or("");
+            if elem == "application" {
+                let attr_start = 16 + u16le(chunk, 24) as usize;
+                let attr_size = u16le(chunk, 26) as usize;
+                let attr_count = u16le(chunk, 28) as usize;
+                for i in 0..attr_count {
+                    let base = attr_start + i * attr_size;
+                    if base + 20 > chunk.len() {
+                        break;
+                    }
+                    let aname_idx = u32le(chunk, base + 4) as usize;
+                    let aname = strings.get(aname_idx).map(String::as_str).unwrap_or("");
+                    let vtype = chunk[base + 15];
+                    let vdata = u32le(chunk, base + 16);
+                    if vtype != 0x01 {
+                        continue; // 只要 TYPE_REFERENCE
+                    }
+                    match aname {
+                        "icon" if icon.is_none() => icon = Some(vdata),
+                        "logo" if logo.is_none() => logo = Some(vdata),
+                        "banner" if banner.is_none() => banner = Some(vdata),
+                        _ => {}
+                    }
+                }
+                break; // application 元素只需处理一次
+            }
+        }
+        off += csize;
+    }
+    for v in [icon, logo, banner] {
+        if let Some(id) = v {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// arsc 按资源 id 收集全部配置下的字符串值（drawable/mipmap 的路径串）。
+/// 与 arsc_resolve_string 的 locale 偏好不同，这里收集所有配置（各 dpi 档
+/// 对应不同路径），调用方按 dpi/格式打分挑最优。
+pub fn arsc_collect_paths(arsc: &[u8], res_id: u32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if arsc.len() < 12 || u16le(arsc, 0) != 0x0002 {
+        return out;
+    }
+    let want_pkg = res_id >> 24;
+    let want_type = ((res_id >> 16) & 0xff) as u32;
+    let want_entry = (res_id & 0xffff) as usize;
+    let mut off = u16le(arsc, 2) as usize;
+    let mut values: Vec<String> = Vec::new();
+    while off + 12 <= arsc.len() {
+        let ctype = u16le(arsc, off);
+        let csize = u32le(arsc, off + 4) as usize;
+        if csize < 8 || off + csize > arsc.len() {
+            break;
+        }
+        let chunk = &arsc[off..off + csize];
+        match ctype {
+            0x0001 => values = parse_string_pool(chunk),
+            0x0200 => {
+                let pkg_id = u32le(chunk, 8);
+                if pkg_id == want_pkg {
+                    collect_in_package(chunk, &values, want_type, want_entry, &mut out);
+                }
+            }
+            _ => {}
+        }
+        off += csize;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 从 ResTableType chunk 取目标 entry 的 (vtype, vdata)。
+/// 偏移表两种编码自适应：经典 u32 优先；落点校验失败时试 AAPT2 compact16。
+/// 校验 = 落点处 Res_value 头合理（size==8、type ≤ 0x12）。
+/// （旧启发式只看 0 号 entry 的偏移特征，0 号 NO_ENTRY 时必误判——实测
+/// 极空间 TV 版 17 个配置块后才出现的有效块就是这么丢的。）
+fn entry_value(t: &[u8], entry: usize) -> Option<(u8, u32)> {
+    let hdr_size = u16le(t, 2) as usize;
+    let entry_count = u32le(t, 12) as usize;
+    let entries_start = u32le(t, 16) as usize;
+    if entry >= entry_count {
+        return None;
+    }
+    let type_sane = |v: u8| v <= 0x12;
+    // 经典：u32 偏移表；条目 = 8 字节头 + Res_value(size@+8==8, type@+11, data@+12)
+    let eoff32 = u32le(t, hdr_size + entry * 4) as usize;
+    if eoff32 != 0xFFFF_FFFF {
+        let epos = entries_start + eoff32;
+        if epos + 16 <= t.len() && u16le(t, epos + 8) == 8 && type_sane(t[epos + 11]) {
+            let flags = u16le(t, epos + 2);
+            if flags & 0x0001 == 0 {
+                return Some((t[epos + 11], u32le(t, epos + 12)));
+            }
+        }
+    }
+    // compact16：u16 偏移表（左移 2）；条目 = 裸 Res_value(size@+0==8, type@+3, data@+4)
+    let raw16 = u16le(t, hdr_size + entry * 2);
+    if raw16 != 0xFFFF {
+        let epos = entries_start + ((raw16 as usize) << 2);
+        if epos + 8 <= t.len() && u16le(t, epos) == 8 && t[epos + 2] == 0 && type_sane(t[epos + 3])
+        {
+            return Some((t[epos + 3], u32le(t, epos + 4)));
+        }
+    }
+    None
+}
+
+/// 包内收集某 entry 全部配置的字符串值（结构与 resolve_in_package 平行）。
+fn collect_in_package(
+    pkg: &[u8],
+    values: &[String],
+    want_type: u32,
+    want_entry: usize,
+    out: &mut Vec<String>,
+) {
+    let mut off = u16le(pkg, 2) as usize;
+    while off + 12 <= pkg.len() {
+        let ctype = u16le(pkg, off);
+        let csize = u32le(pkg, off + 4) as usize;
+        if csize < 8 || off + csize > pkg.len() {
+            break;
+        }
+        if ctype == 0x0201 {
+            let t = &pkg[off..off + csize];
+            let tid = t[8] as u32;
+            if tid == want_type {
+                if let Some((vtype, vdata)) = entry_value(t, want_entry) {
+                    if vtype == 0x03 {
+                        let s = values.get(vdata as usize).cloned().unwrap_or_default();
+                        if !s.is_empty() {
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        off += csize;
+    }
+}
+
+
 /// 按资源 id 解析为本地化字符串（zh* 优先，默认配置兜底）。
 pub fn arsc_resolve_string(arsc: &[u8], res_id: u32) -> Option<String> {
     if arsc.len() < 12 || u16le(arsc, 0) != 0x0002 {
@@ -266,7 +435,6 @@ fn resolve_in_package(
     best_default: &mut Option<String>,
     zh_any: &mut Option<String>,
 ) -> Option<String> {
-    let type_strings_off = u32le(pkg, 16) as usize; // typeStrings 池偏移（包内绝对）
     // 包内子 chunk 从 headerSize 起
     let mut off = u16le(pkg, 2) as usize;
     while off + 12 <= pkg.len() {
@@ -284,9 +452,7 @@ fn resolve_in_package(
             if tid == want_type {
                 // ResTable_type: id(1) res0(1) res1(2) entryCount(4) entriesStart(4)
                 // configSize(4) config(...)
-                let hdr_size = u16le(t, 2) as usize;
                 let entry_count = u32le(t, 12) as usize;
-                let entries_start = u32le(t, 16) as usize;
                 // config 紧跟 +20，自带 size（u16）；locale 语言码在 config 内偏移随
                 // AOSP 版本/构建变体漂移（本镜像实测 +8；spec 名义 +6）——在 6..12
                 // 内找第一对小写 ASCII 字母，都没有 = 默认配置
@@ -306,65 +472,24 @@ fn resolve_in_package(
                     String::new()
                 };
                 if want_entry < entry_count {
-                    #[cfg(test)] {
-                        let raw32 = u32le(t, hdr_size) as usize;
-                        let data_len = csize.saturating_sub(entries_start);
-                        let c16 = !(raw32 % 8 == 0 && raw32 <= data_len);
-                        let eo = if c16 { (u16le(t, hdr_size + want_entry * 2) as usize) << 2 } else { u32le(t, hdr_size + want_entry * 4) as usize };
-                        println!("    resolve: type={} hdr={} data_len={} raw32={:#x} compact16={} eoff={:#x}", want_type, hdr_size, data_len, raw32, c16, eo);
-                        let ep = entries_start + eo;
-                        println!("    entry bytes: {}", t[ep..ep+16].iter().map(|b| format!("{b:02x}")).collect::<String>());
-                    }
-                    // 条目偏移数组在 hdrSize 处（config 之后）。
-                    // 两种格式自适应：经典 u32 偏移（8 的倍数且不超数据区）；
-                    // AAPT2 compact16：u16 偏移左移 2（--enable-compact-entries 产物）。
-                    let data_len = csize.saturating_sub(entries_start);
-                    let raw32 = u32le(t, hdr_size) as usize;
-                    let compact16 = !(raw32 % 8 == 0 && raw32 <= data_len);
-                    let eoff = if compact16 {
-                        (u16le(t, hdr_size + want_entry * 2) as usize) << 2
-                    } else {
-                        u32le(t, hdr_size + want_entry * 4) as usize
-                    };
-                    if eoff != 0xFFFF_FFFF && !(compact16 && u16le(t, hdr_size + want_entry * 2) == 0xFFFF) {
-                        let epos = entries_start + eoff;
-                        if epos + 16 <= t.len() {
-                            // compact16 条目裸存 Res_value（省掉 8 字节条目前缀）；
-                            // 经典格式 = ResTable_entry 头 8 字节 + Res_value
-                            let (vtype, vdata) = if compact16 {
-                                (t[epos + 3], u32le(t, epos + 4))
-                            } else {
-                                let flags = u16le(t, epos + 2);
-                                if flags & 0x0001 != 0 {
-                                    (0u8, 0u32) // complex 条目不是字符串
-                                } else {
-                                    (t[epos + 11], u32le(t, epos + 12))
-                                }
-                            };
-                            if vtype == 0x03 {
-                                let s = values.get(vdata as usize).cloned().unwrap_or_default();
-                                #[cfg(test)]
-                                {
-                                    println!("    vdata={:#x} s={:?} lang={:?}", vdata, s, lang);
-                                    if s == "連絡先" || s == "Contacts" {
-                                        println!("      config hex: {}", t[20..84].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    // 条目取值走统一自适应入口（经典 u32 / compact16，落点校验）
+                    if let Some((vtype, vdata)) = entry_value(t, want_entry) {
+                        if vtype == 0x03 {
+                            let s = values.get(vdata as usize).cloned().unwrap_or_default();
+                            if !s.is_empty() {
+                                if lang.starts_with("zh") {
+                                    // zh 变体里优先简体中文（读后续 region 字节）
+                                    let r0 = t.get(20 + 10).copied().unwrap_or(0) as char;
+                                    let r1 = t.get(20 + 11).copied().unwrap_or(0) as char;
+                                    let region = format!("{r0}{r1}").to_uppercase();
+                                    if region.contains("CN") {
+                                        return Some(s);
                                     }
-                                }
-                                if !s.is_empty() {
-                                    if lang.starts_with("zh") {
-                                        // zh 变体里优先简体中文（读后续 region 字节）
-                                        let r0 = t.get(20 + 10).copied().unwrap_or(0) as char;
-                                        let r1 = t.get(20 + 11).copied().unwrap_or(0) as char;
-                                        let region = format!("{r0}{r1}").to_uppercase();
-                                        if region.contains("CN") {
-                                            return Some(s);
-                                        }
-                                        if zh_any.is_none() {
-                                            *zh_any = Some(s);
-                                        }
-                                    } else if lang.is_empty() && best_default.is_none() {
-                                        *best_default = Some(s);
+                                    if zh_any.is_none() {
+                                        *zh_any = Some(s);
                                     }
+                                } else if lang.is_empty() && best_default.is_none() {
+                                    *best_default = Some(s);
                                 }
                             }
                         }

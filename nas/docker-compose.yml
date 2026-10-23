@@ -9,22 +9,21 @@ services:
     image: houttuynia-nas:latest
     container_name: houttuynia-nas
     restart: unless-stopped
-    ports:
-      - "7788:7788"
+    # 真机发现 / 扫码配对（mDNS 组播）不过 Docker 桥接：要用真机功能必须 host 网络，
+    # 此时 ports 映射失效，端口由 MWINE_PORT 直接落在宿主机
+    network_mode: host
     environment:
       # 必改：访问令牌（Web 控制台登录凭据；不设置则局域网无防护）
       MWINE_TOKEN: "please-change-me"
-      # 可选：桥接/端口冲突时改端口（容器内外需一致）
+      # host 网络下容器端口即宿主机端口。TLS-only 部署：只设 MWINE_TLS_PORT
+      # （不绑 HTTP；WebCodecs 投屏需要 https 安全上下文）。本机开发/调试
+      # 才用 MWINE_PORT（HTTP）
+      MWINE_TLS_PORT: "18443"
       # MWINE_PORT: "7788"
-      # 安装模拟器运行时后取消注释（先跑 setup-emulator.sh）：
-      # MWINE_SDK_ROOT: /data/android-sdk
       # 可选：HTTP 代理（镜像/商店拉取走代理）
       # https_proxy: "http://192.168.1.2:7890"
     volumes:
       - houttuynia-data:/data
-    # KVM 硬件加速（x86_64 主机强烈建议；无 KVM 时纯软解极慢）
-    devices:
-      - "/dev/kvm:/dev/kvm"
     # 健康检查起算时间放宽（首次启动要做路径初始化）
     healthcheck:
       start_period: 20s

@@ -1,7 +1,18 @@
 # 构建上下文裁剪：本地构建产物 / 运行时 / 分发物不进镜像
+# （注意：排除父目录后无法重含其子文件，须逐层放行——scrcpy-server 即此模式）
 **/build
 dist
 !web-vue/dist
+# dist 整目录被排除后其子文件无法再含——改为只排除内容、逐层放行 scrcpy-server
+!dist/*
+dist/Houttuynia.app/*
+!dist/Houttuynia.app/Contents
+dist/Houttuynia.app/Contents/*
+!dist/Houttuynia.app/Contents/Resources
+dist/Houttuynia.app/Contents/Resources/*
+!dist/Houttuynia.app/Contents/Resources/bin
+dist/Houttuynia.app/Contents/Resources/bin/*
+!dist/Houttuynia.app/Contents/Resources/bin/scrcpy-server-v4.1
 runtime
 .git
 .DS_Store

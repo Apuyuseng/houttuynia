@@ -129,34 +129,32 @@ pub fn gwcfg_save(v: &Value) -> std::io::Result<()> {
     std::fs::write(path, serde_json::to_string_pretty(v)?)
 }
 
-/// 运行模式：device（真机，默认）| vm（虚拟机）
-pub fn run_mode() -> String {
+/// 用户选定的管理目标设备（真机模式多设备在线时用；nas.json "device_serial"）
+pub fn selected_serial() -> Option<String> {
     gwcfg_load()
-        .get("run_mode")
+        .get("device_serial")
         .and_then(|v| v.as_str())
-        .unwrap_or("device")
-        .to_string()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
-pub fn set_run_mode(mode: &str) {
+pub fn set_selected_serial(serial: &str) {
     let mut v = gwcfg_load();
     v.as_object_mut()
-        .map(|o| o.insert("run_mode".into(), json!(mode)));
+        .map(|o| o.insert("device_serial".into(), json!(serial)));
     let _ = gwcfg_save(&v);
 }
 
-/// 当前在线真机（非模拟器；唯一在线时取之）
-pub fn online_real_device() -> Option<String> {
-    let ds = crate::adb::devices().ok()?;
-    let mut reals: Vec<&crate::adb::Device> = ds
-        .iter()
-        .filter(|d| d.state == "device" && !d.serial.starts_with("emulator-"))
-        .collect();
-    // USB 设备 serial 形如 "582QUGHG2277L"；无线 "192.168.x.x:5555"
-    if reals.len() == 1 {
-        return Some(reals.remove(0).serial.clone());
-    }
-    None
+/// 在线真机列表（非模拟器、state=device）
+pub fn online_real_devices() -> Vec<String> {
+    crate::adb::devices()
+        .map(|ds| {
+            ds.iter()
+                .filter(|d| d.state == "device" && !d.serial.starts_with("emulator-"))
+                .map(|d| d.serial.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub struct AppState {
@@ -194,18 +192,17 @@ impl AppState {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// 按运行模式取管理目标：真机模式 → 唯一在线真机；虚拟机模式 → 在线模拟器
+    /// 管理目标设备：选定设备在线 → 用之；否则第一台在线真机兜底（前端可切换）
     pub fn current_serial(&self) -> Option<String> {
-        if run_mode() == "device" {
-            online_real_device()
-        } else {
-            crate::adb::online_emulator()
+        let reals = online_real_devices();
+        if let Some(sel) = selected_serial() {
+            if reals.iter().any(|s| s == &sel) {
+                return Some(sel);
+            }
         }
+        reals.into_iter().next()
     }
 
-    pub fn vm_running(&self) -> bool {
-        crate::adb::online_emulator().is_some()
-    }
 }
 
 // ---------------- 配置（~/.mwine/config.json 透传，与桌面版同文件） ----------------
@@ -232,62 +229,4 @@ pub fn config_save(v: &Value) -> std::io::Result<()> {
 
 pub fn config_get_str(key: &str) -> Option<String> {
     config_load().get(key)?.as_str().map(String::from)
-}
-
-/// AVD 名（默认 MWine4）
-pub fn avd_name() -> String {
-    config_get_str("avd").unwrap_or_else(|| "MWine4".into())
-}
-
-/// SDK 根目录探测（MWINE_SDK_ROOT > ANDROID_HOME > 平台默认路径）。
-pub fn sdk_root() -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut cands: Vec<String> = Vec::new();
-    for var in ["MWINE_SDK_ROOT", "ANDROID_HOME", "ANDROID_SDK_ROOT"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                cands.push(v);
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        cands.push(format!("{home}/Library/Application Support/MWine/runtime"));
-        cands.push(format!("{home}/Library/Android/sdk"));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        cands.push(format!("{home}/.local/share/MWine/runtime"));
-        cands.push(format!("{home}/Android/Sdk"));
-        cands.push("/opt/android-sdk".into());
-    }
-    cands.into_iter().find(|c| {
-        std::path::Path::new(&format!("{c}/emulator/emulator")).exists()
-            || std::path::Path::new(&format!("{c}/emulator")).is_dir()
-    })
-}
-
-/// AVD 目录：ANDROID_AVD_HOME 优先；否则按 <name>.ini 实际所在判定
-///（产品 AVD 常在外置数据目录，双主目录历史分裂见 C++ findAvdDir）。
-pub fn avd_home() -> String {
-    if let Ok(p) = std::env::var("ANDROID_AVD_HOME") {
-        if !p.is_empty() {
-            return p;
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let name = avd_name();
-    #[cfg(target_os = "macos")]
-    let bundled = format!("{home}/Library/Application Support/MWine/avd");
-    #[cfg(not(target_os = "macos"))]
-    let bundled = format!("{home}/.local/share/MWine/avd");
-    if std::path::Path::new(&format!("{bundled}/{name}.ini")).exists() {
-        return bundled;
-    }
-    format!("{home}/.android/avd")
-}
-
-/// AVD 实体目录（<home>/<name>.avd）。
-pub fn avd_dir() -> String {
-    format!("{}/{}.avd", avd_home(), avd_name())
 }

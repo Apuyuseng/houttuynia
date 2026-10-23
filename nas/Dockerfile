@@ -38,12 +38,14 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     && apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl unzip xz-utils \
         procps net-tools \
+        libx11-6 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/target/release/mwine-nas /usr/local/bin/mwine-nas
 COPY web-vue/dist/ /opt/mwine/web/
 COPY nas/setup-emulator.sh /opt/mwine/setup-emulator.sh
 COPY assets/companion/dist/mwine-bridge.apk /opt/mwine/bin/mwine-bridge.apk
+COPY dist/Houttuynia.app/Contents/Resources/bin/scrcpy-server-v4.1 /opt/mwine/bin/scrcpy-server-v4.1
 RUN chmod +x /opt/mwine/setup-emulator.sh
 
 # HOME=/data：~/.mwine（配置/日志/上传）、~/.android（AVD）全部落在持久卷
@@ -57,6 +59,7 @@ ENV HOME=/data \
 
 EXPOSE 7788
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:${MWINE_PORT}/health || exit 1
+    CMD curl -kfsS https://127.0.0.1:${MWINE_TLS_PORT}/health 2>/dev/null \
+        || curl -fsS http://127.0.0.1:${MWINE_PORT}/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/mwine-nas"]

@@ -40,6 +40,7 @@ pub fn find_server_jar() -> Option<String> {
     let mut cands: Vec<String> = vec![
         format!("{home}/.mwine/bin/scrcpy-server-v4.1"),
         format!("{home}/.mwine/bin/scrcpy-server-v4.0"),
+        "/opt/mwine/bin/scrcpy-server-v4.1".into(), // NAS Docker 镜像内置
         "/opt/homebrew/share/scrcpy/scrcpy-server".into(),
         "/usr/local/share/scrcpy/scrcpy-server".into(),
     ];
@@ -176,11 +177,10 @@ pub struct StartParams {
 pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     let remote = remote_jar_path();
     let local = std::fs::read(jar).map_err(|e| adb::AdbError(format!("读取 server jar: {e}")))?;
-    // 同尺寸跳过推送（jar 常驻设备；升级内容变化时尺寸不同才重推）
-    let skip = adb::remote_file_size(serial, &remote) == Some(local.len() as u64);
-    if !skip {
-        adb::push_bytes(serial, &local, &remote)?;
-    }
+    // 魅族 FlymeOS 会清理 /data/local/tmp 中被 app_process 引用的 CLASSPATH
+    // 文件（服务器进程被杀时连带回收）——不能假设 jar 常驻，每次都推
+    // （733KB 约 1-2s）。同尺寸跳过逻辑在系统清理面前不可靠。
+    adb::push_bytes(serial, &local, &remote)?;
 
     let scid: u32 = rand_scid();
     let socket_name = format!("scrcpy_{scid:08x}");
@@ -206,7 +206,7 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     let cmd = format!(
         "CLASSPATH={remote} app_process / {SERVER_CLASS} {SERVER_VERSION} {args}"
     );
-    let server = adb::shell_stream(serial, &cmd)?;
+    let server = adb::shell_stream_scrcpy(serial, &cmd)?;
 
     // 连 video socket：forward 在 server 未监听时也会接受 TCP 后立即关闭，
     // 以「读到 dummy 字节」为就绪判据；首探放宽（server 冷启 + dexopt 数秒）。

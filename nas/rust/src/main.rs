@@ -12,10 +12,11 @@ mod api;
 mod console;
 mod devices;
 mod icons;
-mod runtime;
 mod meta;
+mod pairing;
 mod scrcpy;
 mod state;
+mod tls;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -200,8 +201,6 @@ async fn main() {
         .route("/status", get(api::status))
         .route("/events/status", get(api::events_status))
         .route("/events/apps", get(api::events_apps))
-        .route("/vm/start", post(api::vm_start))
-        .route("/vm/stop", post(api::vm_stop))
         .route("/perf", get(api::perf))
         // 应用
         .route("/apps", get(api::apps))
@@ -215,24 +214,7 @@ async fn main() {
         .route("/screenshot.png", get(api::screenshot_png))
         .route("/screenshot", post(api::screenshot_png)) // 兼容桌面版语义差异：直接回 PNG
         .route("/config", get(api::config_get).post(api::config_set))
-        .route("/snapshots", get(api::snapshots))
-        .route("/snapshot/save", post(api::snapshot_save))
-        .route("/snapshot/load", post(api::snapshot_load))
-        .route("/snapshot/delete", post(api::snapshot_delete))
         // 镜像 / 运行时
-        .route("/image/list", get(api::image_list))
-        .route("/image/use", post(api::image_use))
-        .route("/image/delete", post(api::image_delete))
-        .route("/image/task", get(api::image_task))
-        .route("/image/official", get(api::not_impl_image_pull))
-        .route("/image/official-pull", post(api::not_impl_image_pull))
-        .route("/image/import", post(api::not_impl_image_pull))
-        .route("/image/cancel", post(api::not_impl_image_pull))
-        .route("/runtime/status", get(api::runtime_status))
-        .route("/runtime/task", get(api::runtime_task))
-        .route("/runtime/download", post(api::runtime_download))
-        .route("/runtime/import", post(api::not_impl_runtime_dl))
-        .route("/runtime/cancel", post(api::not_impl_runtime_dl))
         // 终端
         .route("/term/open", post(api::term_open))
         .route("/term/ws", get(api::term_ws))
@@ -248,9 +230,9 @@ async fn main() {
         .route("/devices/hostpair/cancel", post(api::hostpair_cancel))
         .route("/devices/connect", post(api::devices_connect))
         .route("/devices/disconnect", post(api::devices_disconnect))
+        .route("/devices/select", post(api::devices_select))
         .route("/devices/forget", post(api::devices_disconnect))
         // 运行模式
-        .route("/runmode", get(api::runmode_get).post(api::runmode_set))
         // 投屏
         .route("/stream/open", post(api::stream_open))
         .route("/stream/{id}/video", get(api::stream_video))
@@ -311,20 +293,56 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7788);
     let ip: IpAddr = host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    let addr = std::net::SocketAddr::new(ip, port);
-
     let lan_exposed = !ip.is_loopback();
     if lan_exposed && expected_token().is_none() {
-        tracing::warn!("⚠ 守护进程监听 {} 且未设置 MWINE_TOKEN——局域网内任何设备都可完全控制虚拟机！", addr);
+        tracing::warn!("⚠ 守护进程对外监听且未设置 MWINE_TOKEN——局域网内任何设备都可完全控制虚拟机！");
     }
+    let web_note = web_dir.as_deref().unwrap_or("未安装");
+    let nas_note = if lan_exposed { "（NAS 模式）" } else { "" };
+
+    // MWINE_TLS_PORT 置位 = 纯 HTTPS（不绑 HTTP 监听；MWINE_PORT 被忽略）。
+    // WebCodecs 投屏只在安全上下文可用，NAS 对外部署一律 TLS-only。
+    // 自签证书自动生成于 $HOME/.mwine/tls/{cert,key}.pem（重启不变）。
+    let tls_port = std::env::var("MWINE_TLS_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok());
+    if let Some(tls_port) = tls_port {
+        // rustls 0.23 无默认 provider 时必须显式安装（ring）
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert, key) = match tls::ensure_self_signed() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("TLS 证书生成失败: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let cfg = match axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("TLS 配置加载失败: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let tls_addr = std::net::SocketAddr::new(ip, tls_port);
+        tracing::info!(
+            "✓ mwine-nas (Rust) 就绪: https://{}:{}{}（Web: {}）",
+            host, tls_port, nas_note, web_note
+        );
+        if let Err(e) = axum_server::bind_rustls(tls_addr, cfg)
+            .serve(app.into_make_service())
+            .await
+        {
+            tracing::error!("HTTPS 监听失败: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let addr = std::net::SocketAddr::new(ip, port);
     tracing::info!(
         "✓ mwine-nas (Rust) 就绪: http://{}:{}{}（Web: {}）",
-        host,
-        port,
-        if lan_exposed { "（NAS 模式）" } else { "" },
-        web_dir.as_deref().unwrap_or("未安装")
+        host, port, nas_note, web_note
     );
-
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {

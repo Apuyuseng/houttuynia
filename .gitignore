@@ -40,3 +40,4 @@ scripts/build-custom-image.sh
 
 # NAS 前端预构建产物随源码分发（Docker 构建免 node）
 !web-vue/dist/
+.idea/

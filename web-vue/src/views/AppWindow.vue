@@ -30,6 +30,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ScrcpyWebPlayer } from '../player'
+import { imgUrl } from '../api'
 
 const props = defineProps({
   app: Object,        // {package, name}（应用独立窗口）
@@ -43,9 +44,9 @@ const emit = defineEmits(['close', 'front'])
 const pos = ref({ x: 120 + (props.offset || 0) * 36, y: 40 + (props.offset || 0) * 30 })
 // 初始高度不超出视口（标题栏 + 导航栏约 76px + 边距）
 const initH = Math.min(640, Math.max(420, window.innerHeight - 160))
-// 窗口体比例与副屏内容精确一致（720×1280），不留 pillarbox 黑边
-const CONTENT_W = 720, CONTENT_H = 1280
-const size = ref({ w: Math.round(initH * CONTENT_W / CONTENT_H), h: initH })
+// 副屏尺寸按设备主屏宽高比定：TV/平板横屏给 1280×720，手机竖屏保持 720×1280
+let displayW = 720, displayH = 1280, displayDpi = 320
+const size = ref({ w: Math.round(initH * displayW / displayH), h: initH })
 const status = ref('')
 const liveOn = ref(false)
 const preedit = ref('')
@@ -56,13 +57,30 @@ const bodyRef = ref(null)
 const title = props.titleText || props.app?.name || props.app?.package || ''
 const pkg = props.app?.package || ''
 
+async function resolveDisplaySize() {
+  try {
+    const r = await fetch(imgUrl('/api/screenshot.png'))
+    if (r.ok) {
+      const blob = await r.blob()
+      const img = await createImageBitmap(blob)
+      if (img.width > img.height) {
+        // 横屏设备（TV/平板）：副屏给横屏
+        displayW = 1280; displayH = 720; displayDpi = 240
+      }
+      img.close()
+    }
+  } catch { /* 探测失败保持手机竖屏 */ }
+  size.value = { w: Math.round(initH * displayW / displayH), h: initH }
+}
+
 let player = null
 let canvas = null
 
-onMounted(() => {
+onMounted(async () => {
+  await resolveDisplaySize()
   const openQuery = props.deviceSerial
     ? `&serial=${encodeURIComponent(props.deviceSerial)}`
-    : `&app=${encodeURIComponent(pkg)}&w=720&h=1280&dpi=320`
+    : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`
   player = new ScrcpyWebPlayer({
     openQuery,
     onStatus: (t) => { status.value = t },

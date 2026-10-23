@@ -41,7 +41,10 @@ export class ScrcpyWebPlayer {
   }
 
   static supported() {
-    return typeof VideoDecoder !== 'undefined' && typeof EncodedVideoChunk !== 'undefined'
+    // WebCodecs 的 VideoDecoder 仅在安全上下文（HTTPS/localhost）暴露；
+    // HTTP 部署（NAS 局域网常见）下 undefined。以 EncodedVideoChunk 为准
+    // （它不受安全上下文限制），解码失败由 _ensureDecoder 的 error 回调兜底。
+    return typeof EncodedVideoChunk !== 'undefined'
   }
 
   async start() {
@@ -58,6 +61,7 @@ export class ScrcpyWebPlayer {
         this.onStatus(`投屏中 · 会话 #${this.id} · ${this.devW}×${this.devH} · ${this.fps} fps`)
     }, 1000)
     this.abort = new AbortController()
+    this._watchdog()
     try {
       const resp = await fetch(imgUrl(`/api/stream/${this.id}/video`), { signal: this.abort.signal })
       if (!resp.ok) throw new Error(`视频流请求失败 (${resp.status})`)
@@ -83,6 +87,7 @@ export class ScrcpyWebPlayer {
     this.running = false
     this.id = 0
     clearInterval(this._statsTimer)
+    clearInterval(this._wdTimer)
     if (this.decoder) { try { this.decoder.close() } catch {} this.decoder = null }
     this.config = null
     this.needsKey = true
@@ -122,7 +127,12 @@ export class ScrcpyWebPlayer {
       this.devH = dv.getUint32(4)
       return
     }
-    if (type === 0) { this.config = payload; return }
+    if (type === 0) {
+      this.config = payload
+      // SPS/PPS（config）到达即建解码器——黑屏兜底：delta 帧丢了才等关键帧
+      this._ensureDecoder(payload)
+      return
+    }
     let data = payload
     if (type === 2) {
       if (this.config) {
@@ -173,6 +183,7 @@ export class ScrcpyWebPlayer {
 
   _render(frame) {
     if (!this.running) { frame.close(); return }
+    this._lastFrameAt = Date.now()
     const cw = frame.displayWidth, ch = frame.displayHeight
     if (this.canvas.width !== cw || this.canvas.height !== ch) {
       this.canvas.width = cw
@@ -189,6 +200,21 @@ export class ScrcpyWebPlayer {
       try { this.decoder.reset() } catch {}
       this.needsKey = true
     }
+  }
+
+  // 黑屏兜底：解码器静默丢帧（optimizeForLatency 下部分实现不报错）时
+  // 主动 reset 强制编码器重发 config+关键帧
+  _watchdog() {
+    this._lastFrameAt = Date.now()
+    this._wdTimer = setInterval(async () => {
+      if (!this.running || !this.id) return
+      const idle = Date.now() - this._lastFrameAt
+      if (idle > 1500) {
+        try { this.decoder && this.decoder.reset() } catch {}
+        this.needsKey = true
+        try { await apiPost(`/api/stream/${this.id}/reset`) } catch {}
+      }
+    }, 800)
   }
 
   async _decoderError() {

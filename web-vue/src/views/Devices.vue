@@ -20,6 +20,13 @@
           </template>
         </el-table-column>
         <el-table-column prop="state" label="状态" width="110" />
+        <el-table-column label="管理目标" width="120">
+          <template #default="{ row }">
+            <el-tag v-if="row.current" size="small" type="success" effect="dark">当前</el-tag>
+            <el-button v-else-if="row.state === 'device'" size="small" text type="primary"
+                       @click="selectDevice(row)">设为当前</el-button>
+          </template>
+        </el-table-column>
         <el-table-column width="200" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" @click="mirror(row)">投屏</el-button>
@@ -217,6 +224,15 @@ async function disconnect(row) {
     await apiPost('/api/devices/disconnect', { serial: row.serial })
     ElMessage.success('已断开')
     setTimeout(load, 800)
+  } catch (e) { ElMessage.error(e.message) }
+}
+
+// 多设备在线时选定管理目标（概览/应用库/投屏默认作用的设备）
+async function selectDevice(row) {
+  try {
+    await apiPost('/api/devices/select', { serial: row.serial })
+    ElMessage.success('已切换管理目标：' + row.serial)
+    load()
   } catch (e) { ElMessage.error(e.message) }
 }
 

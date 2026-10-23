@@ -40,15 +40,15 @@
         </transition>
       </div>
       <div v-if="loading" class="launcher-msg">读取中…</div>
-      <div v-else-if="!running" class="launcher-msg">{{ mode === 'device' ? '真机未连接 —— 到「真机」页连接后此处展示手机桌面' : '虚拟机未运行 —— 启动后此处展示设备桌面' }}</div>
+      <div v-else-if="!running" class="launcher-msg">'真机未连接 —— 到「真机」页连接后此处展示设备桌面'</div>
       <el-empty v-else-if="!filtered.length" description="暂无应用" style="padding:60px 0" />
       <div v-else class="launcher-grid">
         <el-dropdown v-for="a in filtered" :key="a.package" trigger="contextmenu"
                      @command="(cmd) => onCmd(cmd, a)">
           <div class="launcher-item" @click="openWindow(a)">
             <div class="launcher-icon" :data-pkg="a.package">
-              <img v-if="iconOk[a.package]" :data-src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))"
-                   @error="iconOk[a.package] = false" alt="">
+              <img v-if="iconOk[a.package]" :src="imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(a.package))"
+                   loading="lazy" @error="iconOk[a.package] = false" alt="">
               <template v-else>{{ (a.name || a.package).slice(0, 1).toUpperCase() }}</template>
             </div>
             <div class="launcher-name">{{ a.name }}</div>
@@ -78,9 +78,9 @@ import { Search, Upload, Refresh } from '@element-plus/icons-vue'
 import { inject } from 'vue'
 import AppWindow from './AppWindow.vue'
 
-const { vmRunning, mode, deviceSerial } = inject('vmState')
-// 真机模式：目标在线与否看真机连接；虚拟机模式看 VM
-const running = computed(() => mode.value === 'device' ? !!deviceSerial.value : vmRunning.value)
+const { deviceSerial } = inject('vmState')
+// NAS 版纯真机：目标在线与否看真机连接
+const running = computed(() => !!deviceSerial.value)
 
 const apps = ref([])
 const loading = ref(true)      // 仅首载（无内容时）显占位
@@ -97,9 +97,9 @@ function toggleSearch() { searchOn.value = !searchOn.value; if (!searchOn.value)
 
 const filtered = computed(() => {
   const q = filter.value.trim().toLowerCase()
-  // 无图标应用不展示：判据 = 服务端缓存态 has_icon（负缓存已确认无图标）；
-  // 图标请求失败/在途不再误隐藏
-  let list = apps.value.filter(a => a.has_icon !== false)
+  // 无图标的应用也要展示（字母占位块兜底），不能过滤——
+  // 真机模式下图标缓存可能整体为空，过滤会导致列表全空
+  let list = apps.value
   if (q) {
     list = list.filter(a =>
       (a.name || '').toLowerCase().includes(q) || a.package.toLowerCase().includes(q))
@@ -116,11 +116,18 @@ const taskPct = computed(() =>
   task.value.progress_total ? Math.round(task.value.progress * 100 / task.value.progress_total) : 0)
 
 function applyList(d) {
-  // 等 API 出结果再替换；只读成功响应。无图标判据用服务端缓存态（has_icon），
-  // 提取途中不再误判隐藏
+  // 只读成功响应；无图标的应用保留展示（字母块兜底）
   const list = d.apps || []
   apps.value = list
-  list.forEach(a => { iconOk.value[a.package] = a.has_icon !== false })
+  list.forEach(a => {
+    // 图标渲染不被 has_icon 门控：has_icon=false 只说明「缓存未落盘」，
+    // 渲染 img 请求图标接口本身就会触发/等待后端提取（在途合并）——
+    // 若按 has_icon 门控，全新环境永远是字母块（不请求→不提取死锁）。
+    // @error 置 false 后靠 has_icon=true（提取落盘）恢复渲染；
+    // 确认无图标（404）的包保持 false 不再重复请求。
+    if (a.has_icon) iconOk.value[a.package] = true
+    else if (iconOk.value[a.package] === undefined) iconOk.value[a.package] = true
+  })
 }
 
 async function load() {
@@ -136,7 +143,6 @@ async function load() {
   loading.value = false
   refreshing.value = false
   loadWallpaper()
-  setTimeout(observeIcons, 50)
 }
 
 // SSE 应用流：标签/图标落缓存后服务端主动推新列表，免轮询
@@ -149,7 +155,6 @@ function startAppsStream() {
         applyList(JSON.parse(e.data))
         loading.value = false
         refreshing.value = false
-        setTimeout(observeIcons, 50)
       } catch {}
     }
     appsEs.onerror = () => { /* 网络抖动由浏览器自动重连 */ }
@@ -257,38 +262,18 @@ async function pollTask() {
   } catch { polling = false }
 }
 
-// 标签后台补抓：首次加载后延迟再拉两次，名称自动变真名
-// 图标懒加载：进入视口才请求（无线真机上防止百余图标并发请求挤占连接）
-let iconObserver = null
-function setupIconObserver() {
-  iconObserver = new IntersectionObserver((entries) => {
-    for (const e of entries) {
-      if (!e.isIntersecting) continue
-      const img = e.target.querySelector("img[data-src]")
-      if (img && !img.src) {
-        img.src = img.dataset.src
-      }
-      iconObserver.unobserve(e.target)
-    }
-  }, { rootMargin: "200px" })
-}
-function observeIcons() {
-  if (!iconObserver) return
-  document.querySelectorAll(".launcher-icon[data-pkg]").forEach(el => {
-    const img = el.querySelector("img[data-src]")
-    if (img && !img.src) iconObserver.observe(el)
-  })
-}
+// 图标懒加载交给浏览器原生 loading="lazy"；手动 IntersectionObserver 方案
+// 在页面被遮挡的环境（内嵌 webview 面板等）可能永不触发，导致图标永远不加载。
+// 并发防护由后端提取槽 + 在途合并承担（详见 icons.rs）。
 
 onMounted(() => {
-  setupIconObserver()
+  startAppsStream()   // 图标/标签落盘即推新列表（配合后端预热，图标渐出）
   load()
   setTimeout(load, 6000)
   setTimeout(load, 16000)
 })
 onUnmounted(() => {
   polling = false
-  if (iconObserver) iconObserver.disconnect()
   if (appsEs) appsEs.close()
 })
 </script>

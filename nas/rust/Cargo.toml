@@ -16,11 +16,22 @@ futures-util = "0.3"
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 qrcode = { version = "0.14", default-features = false }
-reqwest = { version = "0.12", features = ["blocking"] }
+# rustls 替代 native-tls：交叉编译（aarch64 musl 静态）零 C 依赖openssl
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 无线配对：SPAKE2(ed25519) + TLS1.3 + AES-128-GCM，纯 Rust 零外部 adb 依赖
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables"] }
+sha2 = "0.10"
+hkdf = "0.12"
+aes-gcm = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# 网关自带 HTTPS（WebCodecs 投屏需要安全上下文）；
+# no-provider 变体：不引入 aws-lc-rs（cmake 链，musl/zig 交叉编不过），统一走 ring
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 
 [profile.release]
 lto = true

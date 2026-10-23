@@ -1,19 +1,19 @@
 # 鱼腥草 NAS 版部署指南
 
-> `nas` 分支：把「在 Mac 上运行 Android 应用」变成**家庭服务器上的 Web 服务**——
-> Rust 网关 `mwine-nas`（axum + 自研 adb/scrcpy 协议栈，无 Qt 依赖）对外开放
-> REST API 并内嵌 Vue 3 + Element Plus 控制台——局域网内任何设备（手机 / 平板 /
-> 电脑浏览器）都能管理虚拟机：开关机、看实时画面（scrcpy 投屏 + 触控）、
-> 装应用、管镜像、开终端、改设置。
+> `nas` 分支：**纯真机 Android 网关**——Rust 网关 `mwine-nas`（axum + 自研
+> adb/scrcpy 协议栈，无 Qt 依赖）对外开放 REST API 并内嵌 Vue 3 + Element Plus
+> 控制台。局域网内任何设备（手机 / 平板 / 电脑浏览器）都能管理局域网 / USB
+> 连接的 Android 设备（手机 / 电视 / 盒子）：投屏 + 触控、应用库（图标/安装/
+> 卸载）、ADB 终端、截图与壁纸。**无内置虚拟机**（模拟器能力属于桌面版）。
 
 ```
 ┌──────────────┐        浏览器 (http://nas-ip:7788)         ┌───────────────────────────┐
-│ 手机/平板/电脑 │ ───────────────────────────────────────▶ │ NAS / 常开服务器            │
-└──────────────┘                                          │  └─ mwine-nas（Rust）      │
-                                                           │      ├─ /        Vue 控制台 │
-                                                           │      ├─ /api/*   REST API   │
-                                                           │      └─ Android 模拟器      │
-                                                           └───────────────────────────┘
+│ 手机/平板/电脑 │ ────── HTTPS ──────▶ ┌─────────────────────────┐      ┌─ Android 设备（adb）─┐
+└──────────────┘                        │ NAS / 常开服务器          │ ◀──▶ │ 手机 / TV / 盒子      │
+                                        │  └─ mwine-nas（Rust）     │      └──────────────────────┘
+                                        │      ├─ /        Vue 控制台│
+                                        │      └─ /api/*   REST API  │
+                                        └─────────────────────────┘
 ```
 
 ## 技术栈与双后端说明
@@ -31,33 +31,29 @@
 
 | 能力 | 状态 |
 |---|---|
-| 虚拟机开关机（快照存档）/ 状态 / 性能监控 | ✅ |
 | scrcpy 实时投屏（WebCodecs 硬解）+ 触控/按键/滚轮/文本注入 | ✅ |
+| 设备性能监控（CPU/内存/运行时长） | ✅ |
 | 宿主输入法（IME 组合文本注入，CJK 走剪贴板粘贴通道） | ✅ |
 | 剪贴板双向共享（设备变化自动同步宿主；宿主粘贴/同步进设备） | ✅ |
 | 应用独立窗口（new_display 副屏直通 + 浏览器浮窗，可拖/缩放/多开） | ✅ |
 | 应用列表 / 启动 / 卸载 / APK 上传安装（进度）/ 真实图标（APK 提取） | ✅ |
 | 截图 PNG 直出 / 截图下载 / 设备壁纸（root 镜像直读，桥应用导出兜底） | ✅ |
 | ADB 交互终端（v2 pty 优先，v1 回落） | ✅ |
-| 配置读写（与桌面版同 ~/.mwine/config.json）/ 快照管理 | ✅ |
-| 镜像列表 / 切换 / 删除；真机列表（只读） | ✅ |
-| 在线商店 / 镜像在线拉取 / 运行时下载 / 流量分析 / 真机配对 | ⏳ 501（用桌面端） |
+| 多设备管理（连接 / 断开 / 扫码配对 / 选定管理目标） | ✅ |
+| 真机配对（扫码 / 配对码：SPAKE2 + TLS1.3 + AES-GCM 全自研实现）/ 连接 / 断开 | ✅ |
+| 在线商店 | ⏳ 501（用桌面端） |
 
 ---
 
-## 一、三种部署形态
+## 一、两种部署形态
 
-| 形态 | 适用 | VM 性能 | 说明 |
-|---|---|---|---|
-| **A. Docker（x86_64 NAS）** | 群晖 / 威联通 / 绿联 / TrueNAS 等 | ⚠️ ARM64 镜像靠指令翻译，慢，仅适合挂机类场景 | 最常见 NAS，开箱即用 |
-| **B. Docker（ARM64 主机）** | ARM NAS / 树莓派 / RK3588 / ARM 服务器 | ❗ Google 未发布 linux-arm64 模拟器，需自行提供 emulator | Web 管理完整可用 |
-| **C. Mac 服务器模式** | 常开的 Mac mini / Mac Studio | ✅ 全速（HVF 硬件加速，与桌面版一致） | **当前体验最好的形态** |
+| 形态 | 适用 | 说明 |
+|---|---|---|
+| **A. Docker** | 群晖 / 威联通 / 绿联 / TrueNAS / 任何常开服务器 | 最常见，开箱即用；amd64 与 arm64 均可 |
+| **B. Mac 服务器模式** | 常开的 Mac mini / Mac Studio | 不需要 Docker，直接跑网关 |
 
-> **架构说明**：本产品的系统镜像是 ARM64 Android。x86_64 宿主运行 ARM64
-> guest 只能走 qemu TCG 纯软件翻译（无硬件加速），交互操作很卡，适合
-> 无头挂机（后台任务、定时脚本、抓包等）。要完整流畅体验请用形态 C。
-
----
+> 架构说明：amd64 宿主可直接用官方镜像；arm64 宿主用 `nas/Dockerfile.prebuilt`
+> （musl 静态二进制 + scratch，零网络拉取）。
 
 ## 二、形态 A/B：Docker 部署
 
@@ -81,35 +77,23 @@ docker compose up -d
 
 ```bash
 docker run -d --name houttuynia-nas \
-  -p 7788:7788 \
+  --network host \
   -e MWINE_TOKEN='改成强密码' \
+  -e MWINE_TLS_PORT=18443 \
   -v houttuynia-data:/data \
-  --device /dev/kvm:/dev/kvm \
   houttuynia-nas
 ```
 
-### 3. 安装模拟器运行时（首次必做）
-
-镜像里不含 Android 模拟器（许可与体积原因），首次运行安装到持久卷：
-
-```bash
-docker exec -it houttuynia-nas /opt/mwine/setup-emulator.sh
-```
-
-装完在 compose 里取消 `MWINE_SDK_ROOT: /data/android-sdk` 注释并重启容器。
-然后打开 Web 控制台「镜像」页拉取系统镜像即可。
-
-### 4. 群晖 / 威联通图形化操作
+### 3. 群晖 / 威联通图形化操作
 
 - **群晖**：Container Manager → 项目 → 用 `nas/docker-compose.yml` 建项目；
-  或 SSH 进 NAS 执行上面的命令。`/dev/kvm` 需要较新 x86 机型 + 套件内
-  Virtual Machine Manager 已启用虚拟化；无 KVM 把 `devices:` 段删掉也能跑（更慢）。
+  或 SSH 进 NAS 执行上面的命令。
 - **威联通**：Container Station → 创建应用程序 → 粘贴 compose 内容。
 - **绿联 / 极空间 / TrueNAS**：同理，都是标准 compose。
 
 ### 5. 打开控制台
 
-浏览器访问 `http://<NAS的IP>:7788`，输入 `MWINE_TOKEN` 即可。
+浏览器访问 `https://<NAS的IP>:18443`（自签证书，接受一次警告），输入 `MWINE_TOKEN` 即可。
 
 ---
 
@@ -129,8 +113,7 @@ MWINE_HEADLESS=1 \
 ```
 
 - `MWINE_HOST=0.0.0.0`：对局域网开放（默认只听 127.0.0.1）
-- `MWINE_TOKEN`：访问令牌；**对外开放时不设令牌 = 局域网任何人都能操控虚拟机**（启动时会大字警告）
-- `MWINE_HEADLESS=1`：模拟器不弹窗口（`-no-window`），屏幕由 Web 投屏/截图通道承担
+- `MWINE_TOKEN`：访问令牌；**对外开放时不设令牌 = 局域网任何人都能操控连接的设备**（启动时会大字警告）
 - `MWINE_WEB_DIR`：自定义前端目录；不设置时自动探测 `web-vue/dist` / `web/`
 - `MWINE_PORT`：端口，默认 7788
 - `MWINE_SDK_ROOT`：Android SDK 位置（默认自动探测本机 SDK / MWine 外置运行时）
@@ -147,11 +130,10 @@ MWINE_HEADLESS=1 \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MWINE_HOST` | `127.0.0.1` | 绑定地址；`0.0.0.0` 对外开放 |
-| `MWINE_PORT` | `7788` | 监听端口 |
+| `MWINE_TLS_PORT` | 空（HTTP 模式） | **TLS-only 监听端口**：置位后只起 HTTPS、完全不绑 HTTP（`MWINE_PORT` 被忽略）。自签证书自动生成为 `~/.mwine/tls/{cert,key}.pem`（重启不变，浏览器只需接受一次自签警告）。**对外部署一律用它**——WebCodecs 投屏只在 https 安全上下文可用 |
+| `MWINE_PORT` | `7788` | HTTP 监听端口（仅在未设 `MWINE_TLS_PORT` 时生效；本机开发/调试用） |
 | `MWINE_TOKEN` | 空 | 访问令牌；设置后所有 `/api/*` 需 `Authorization: Bearer <token>`（`<img>` 场景可用 `?token=`）。`/health` 恒开放供容器探活 |
 | `MWINE_WEB_DIR` | 自动探测 | Web 控制台静态文件目录（需含 index.html） |
-| `MWINE_HEADLESS` | 关 | 置位后模拟器以 `-no-window` 启动；Linux 上无 DISPLAY 时自动生效 |
-| `MWINE_SDK_ROOT` | 自动探测 | 指定 Android SDK（运行时）根目录 |
 | `MWINE_REPLACE_DAEMON` | 关 | 置位后新守护会替换占端口的旧守护 |
 
 ## 五、Web 控制台新增的 API（相对桌面版）
@@ -208,7 +190,7 @@ MWINE_HEADLESS=1 \
 
 1. **必须设置 `MWINE_TOKEN`**。令牌等同 root 权限：ADB 终端可执行任意 guest
    命令，设置接口可改代理/参数。请用强随机串，并只在可信局域网开放。
-2. 不要把 7788 端口直接映射到公网。需要远程访问请走 Tailscale /
+2. 不要把 18443（TLS）端口直接暴露到公网。需要远程访问请走 Tailscale /
    WireGuard / 反向代理 + HTTPS + 额外鉴权。
 3. 上传安装接口只接受 zip 魔数的 APK，≤512MB，落盘在 `~/.mwine/uploads`
    （24h 自动清理）。
@@ -218,13 +200,14 @@ MWINE_HEADLESS=1 \
 ## 七、常见问题
 
 - **打开页面提示「无法连接服务器」**：确认容器/守护进程在跑（`docker logs
-  houttuynia-nas`），端口映射正确。
-- **启动虚拟机报「SDK 探测失败」**：还没装运行时 → 跑 `setup-emulator.sh`
-  并设置 `MWINE_SDK_ROOT`（形态 C 用本机 Android SDK 即可）。
-- **x86_64 NAS 上虚拟机特别慢**：预期内（ARM64 镜像软件翻译）。确认
-  `/dev/kvm` 已映射能略有改善；交互场景请换形态 C。
-- **linux/arm64 主机无法启动 VM**：Google 没有 linux-arm64 模拟器官方构建，
-  需要自行编译 emulator 放进 `$MWINE_SDK_ROOT/emulator/`。其余功能
-  （应用库/商店/终端在 VM 运行后）不受影响。
-- **图标全是字母块**：无头构建不含 iconfetch 子进程（避免 Qt Gui 依赖），
-  应用图标显示为占位字母块，功能不受影响。
+  houttuynia-nas`），端口正确。
+- **应用列表为空 / 真机连不上**：先确认宿主机 adb server 在跑（`adb devices`
+  能看到设备）；无线设备需要设备侧开「无线调试」。
+- **投屏不可用**：必须走 `https://`（WebCodecs 只在安全上下文暴露），
+  用内置 TLS 端口（默认部署 18443），首次访问接受一次自签证书警告。
+- **图标全是字母块**：图标后台预热中（在线商店包名查询 + APK 提取），落盘后
+  SSE 自动推新列表渐出；确认无图标的应用才保持字母块兜底。
+- **真机（无线调试/扫码配对）连不上**：mDNS 组播不过 Docker 桥接网络 →
+  compose 必须用 `network_mode: host`（本仓库 compose 已默认）。host 网络下
+  端口直接落在宿主机，注意与宿主机已有端口冲突（adb server 共享 5037）。
+- **多台设备在线时操作了错误设备**：「真机」页用「设为当前」选定管理目标。

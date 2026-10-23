@@ -13,7 +13,6 @@
         <el-menu-item index="/apps"><el-icon><Grid /></el-icon>应用库</el-menu-item>
         <el-menu-item index="/devices"><el-icon><Iphone /></el-icon>真机</el-menu-item>
         <el-menu-item index="/store"><el-icon><Shop /></el-icon>在线商店</el-menu-item>
-        <el-menu-item index="/images"><el-icon><Film /></el-icon>镜像</el-menu-item>
         <el-menu-item index="/terminal"><el-icon><TerminalIcon /></el-icon>终端</el-menu-item>
         <el-menu-item index="/settings"><el-icon><Setting /></el-icon>设置</el-menu-item>
       </el-menu>
@@ -29,10 +28,8 @@
     <el-container>
       <el-header class="topbar">
         <h2 style="margin:0">{{ route.meta.title || '概览' }}</h2>
-        <el-tag :type="vmRunning || deviceSerial ? 'success' : 'info'" effect="dark" size="large">
-          {{ mode === 'device'
-            ? (deviceSerial ? '真机 · ' + deviceSerial : '真机模式 · 未连接')
-            : (vmRunning ? '运行中 · ' + (serial || '') : '未运行') }}
+        <el-tag :type="deviceSerial ? 'success' : 'info'" effect="dark" size="large">
+          {{ deviceSerial ? '真机 · ' + deviceSerial : '真机未连接' }}
         </el-tag>
       </el-header>
       <el-main style="padding: 18px 24px 60px">
@@ -54,20 +51,17 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, provide } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, Grid, Shop, Film, Setting, Iphone, Connection as TerminalIcon } from '@element-plus/icons-vue'
+import { Monitor, Grid, Shop, Setting, Iphone, Connection as TerminalIcon } from '@element-plus/icons-vue'
 import { apiGet, authState, saveToken } from './api'
 
 const route = useRoute()
 
 const connected = ref(false)
 const version = ref('')
-const vmRunning = ref(false)
-const serial = ref('')
-const mode = ref('vm')
 const deviceSerial = ref('')
 
-// 全局状态共享给各页面（注入）
-const vmState = { vmRunning, serial, connected, mode, deviceSerial }
+// 全局状态共享给各页面（注入）；NAS 版纯真机，无虚拟机概念
+const vmState = { connected, deviceSerial }
 provide('vmState', vmState)
 
 const needLogin = computed({
@@ -96,9 +90,6 @@ async function refresh() {
   try {
     const st = await apiGet('/api/status')
     connected.value = true
-    vmRunning.value = !!st.vm?.running
-    serial.value = st.vm?.serial || ''
-    mode.value = st.mode || 'vm'
     deviceSerial.value = st.device_serial || ''
     version.value = (st.version ? 'v' + st.version : '') + (st.backend === 'rust' ? ' · Rust' : '')
   } catch {
@@ -116,9 +107,6 @@ function startStatusStream() {
       try {
         const st = JSON.parse(e.data)
         connected.value = true
-        vmRunning.value = !!st.vm?.running
-        serial.value = st.vm?.serial || ''
-        mode.value = st.mode || 'vm'
         deviceSerial.value = st.device_serial || ''
         version.value = (st.version ? 'v' + st.version : '') + (st.backend === 'rust' ? ' · Rust' : '')
       } catch {}

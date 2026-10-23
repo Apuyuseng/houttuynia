@@ -1,225 +1,40 @@
 <template>
   <div style="display:grid;gap:18px;">
     <el-card shadow="never">
-      <template #header>运行模式</template>
-      <el-radio-group v-model="runMode" @change="switchMode" :disabled="switching">
-        <el-radio-button value="device">📱 真机模式</el-radio-button>
-        <el-radio-button value="vm">🖥 虚拟机模式</el-radio-button>
-      </el-radio-group>
+      <template #header>网关信息</template>
+      <el-descriptions :column="1" border>
+        <el-descriptions-item label="后端">Rust 网关（mwine-nas）{{ version ? ' · v' + version : '' }}</el-descriptions-item>
+        <el-descriptions-item label="当前设备">
+          <span v-if="deviceSerial" class="mono">{{ deviceSerial }}</span>
+          <span v-else class="muted">未连接 —— 到「真机」页连接设备</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="访问令牌">
+          由服务端 MWINE_TOKEN 环境变量控制，<el-link type="primary" class="small" @click="needLogin = true">点此更换本浏览器令牌</el-link>
+        </el-descriptions-item>
+      </el-descriptions>
       <div class="small muted" style="margin-top:10px;">
-        真机模式：管理局域网/USB 连接的 Android 手机（「真机」页连接）。<br>
-        虚拟机模式：使用内置 Android 模拟器。<span v-if="!runtimePresent" style="color:var(--el-color-warning)">首次切换将自动下载模拟器运行时（约 330MB，可在「镜像」页查看进度）。</span>
+        NAS 版为纯真机网关：管理局域网 / USB 连接的 Android 设备（手机、电视、盒子等），
+        支持投屏、应用库、终端与文件互传；无内置虚拟机。
       </div>
-    </el-card>
-
-    <el-card shadow="never">
-      <template #header>虚拟机配置</template>
-      <el-form :model="cfg" label-width="200px" label-position="left">
-        <el-form-item label="设备形态">
-          <el-radio-group v-model="cfg.mode">
-            <el-radio-button value="phone">手机 1080×2400</el-radio-button>
-            <el-radio-button value="tablet">平板 2560×1600</el-radio-button>
-            <el-radio-button value="custom">自定义</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item v-if="cfg.mode === 'custom'" label="自定义尺寸">
-          <el-space>
-            <el-input-number v-model="cfg.width" :min="240" :max="4096" controls-position="right" style="width:110px" />
-            ×
-            <el-input-number v-model="cfg.height" :min="320" :max="4096" controls-position="right" style="width:110px" />
-            @
-            <el-input-number v-model="cfg.dpi" :min="120" :max="960" controls-position="right" style="width:100px" />
-            DPI
-          </el-space>
-        </el-form-item>
-        <el-form-item label="内存 MB（0=默认 2048）">
-          <el-input-number v-model="cfg.memory_mb" :min="0" :max="16384" :step="512" controls-position="right" style="width:140px" />
-        </el-form-item>
-        <el-form-item label="CPU 核数（0=默认 4）">
-          <el-input-number v-model="cfg.cpu_cores" :min="0" :max="16" controls-position="right" style="width:120px" />
-        </el-form-item>
-        <el-form-item label="GPU 后端">
-          <el-select v-model="cfg.gpu_mode" style="width:240px">
-            <el-option value="host" label="host（硬件加速）" />
-            <el-option value="swiftshader_indirect" label="swiftshader（软渲兼容）" />
-            <el-option value="swangle" label="swangle" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="刷新率 Hz（0=默认 60）">
-          <el-input-number v-model="cfg.vsync_rate" :min="0" :max="120" :step="30" controls-position="right" style="width:120px" />
-        </el-form-item>
-        <el-form-item label="HTTP 代理">
-          <el-input v-model="cfg.proxy" placeholder="如 http://192.168.1.2:7890，空=不代理" style="width:320px" clearable />
-        </el-form-item>
-        <el-form-item label="自定义 DNS">
-          <el-input v-model="cfg.dns_servers" placeholder="逗号分隔，空=默认" style="width:320px" clearable />
-        </el-form-item>
-        <el-form-item label="宿主共享目录（9p → /mnt/host）">
-          <el-input v-model="cfg.share_dir" placeholder="空=不挂载" style="width:320px" clearable />
-        </el-form-item>
-        <el-form-item label="空闲自动关停（分钟，0=从不）">
-          <el-input-number v-model="cfg.idle_stop_min" :min="0" :max="1440" controls-position="right" style="width:140px" />
-        </el-form-item>
-        <el-form-item label="语言覆盖">
-          <el-input v-model="cfg.locale" placeholder="如 zh-CN；空=跟随宿主" style="width:200px" clearable />
-        </el-form-item>
-        <el-form-item label="启动行为">
-          <el-space direction="vertical" alignment="flex-start">
-            <el-switch v-model="cfg.no_snapshot" active-text="禁用快照（每次冷启动）" />
-            <el-switch v-model="cfg.no_boot_anim" active-text="禁用启动动画" />
-            <el-switch v-model="cfg.hw_keyboard" active-text="宿主键盘直通" />
-            <el-switch v-model="cfg.allow_host_audio" active-text="允许使用宿主麦克风" />
-          </el-space>
-        </el-form-item>
-        <el-form-item>
-          <el-space>
-            <el-button type="primary" :loading="saving" @click="save">保存配置</el-button>
-            <span class="small muted">屏幕 / 内存 / GPU 修改后需重启虚拟机生效</span>
-          </el-space>
-        </el-form-item>
-      </el-form>
-    </el-card>
-
-    <el-card shadow="never">
-      <template #header>存档点（快照）</template>
-      <el-space style="margin-bottom:12px;">
-        <el-input v-model="snapName" placeholder="存档名（字母/数字/_/-）" style="width:240px" />
-        <el-button type="primary" size="default" @click="saveSnap">保存当前状态</el-button>
-      </el-space>
-      <el-empty v-if="!snaps.length" description="无存档点" />
-      <el-table v-else :data="snaps" style="width:100%">
-        <el-table-column prop="name" label="名称" min-width="180" />
-        <el-table-column label="时间" min-width="180">
-          <template #default="{ row }">{{ row.mtime_ms ? new Date(row.mtime_ms).toLocaleString() : '' }}</template>
-        </el-table-column>
-        <el-table-column width="180" fixed="right">
-          <template #default="{ row }">
-            <el-button size="small" @click="loadSnap(row)">恢复</el-button>
-            <el-popconfirm title="删除该存档？" @confirm="delSnap(row)">
-              <template #reference><el-button size="small" type="danger" text>删除</el-button></template>
-            </el-popconfirm>
-          </template>
-        </el-table-column>
-      </el-table>
-    </el-card>
-
-    <el-card shadow="never">
-      <template #header><span style="color:var(--el-color-danger)">危险操作</span></template>
-      <el-space wrap>
-        <el-button @click="resetIdentity">重置设备身份</el-button>
-        <el-button type="danger" @click="resetVm">重置虚拟机（清空全部数据）</el-button>
-      </el-space>
-      <div class="small muted" style="margin-top:8px">重置设备身份：更换 android_id / 广告 ID，应用视作全新设备。</div>
     </el-card>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { apiGet, apiPost } from '../api'
+import { ref, computed, onMounted, inject } from 'vue'
+import { apiGet, authState } from '../api'
 
-const cfg = ref({})
-const saving = ref(false)
-const runMode = ref('vm')
-const runtimePresent = ref(true)
-const switching = ref(false)
-const snaps = ref([])
-const snapName = ref('')
+const { deviceSerial } = inject('vmState')
+const version = ref('')
+const needLogin = computed({
+  get: () => authState.needLogin,
+  set: (v) => { authState.needLogin = v },
+})
 
-async function loadCfg() {
-  try { cfg.value = await apiGet('/api/config') } catch (e) { ElMessage.error(e.message) }
-}
-
-async function save() {
-  saving.value = true
+onMounted(async () => {
   try {
-    await apiPost('/api/config', cfg.value)
-    ElMessage.success('配置已保存')
-  } catch (e) { ElMessage.error(e.message) }
-  saving.value = false
-}
-
-async function loadSnaps() {
-  try {
-    const d = await apiGet('/api/snapshots')
-    snaps.value = d.snapshots || []
-  } catch { snaps.value = [] }
-}
-
-async function saveSnap() {
-  const n = snapName.value.trim()
-  if (!n) return ElMessage.error('请输入存档名')
-  try {
-    await apiPost('/api/snapshot/save', { name: n })
-    ElMessage.success('存档已保存')
-    snapName.value = ''
-    loadSnaps()
-  } catch (e) { ElMessage.error(e.message) }
-}
-
-async function loadSnap(row) {
-  try {
-    await ElMessageBox.confirm(`恢复到存档「${row.name}」？当前运行状态将被替换。`, '恢复存档', { type: 'warning' })
-  } catch { return }
-  try {
-    await apiPost('/api/snapshot/load', { name: row.name })
-    ElMessage.success('已恢复存档')
-  } catch (e) { ElMessage.error(e.message) }
-}
-
-async function delSnap(row) {
-  try {
-    await apiPost('/api/snapshot/delete', { name: row.name })
-    ElMessage.success('已删除')
-    loadSnaps()
-  } catch (e) { ElMessage.error(e.message) }
-}
-
-async function resetIdentity() {
-  try {
-    await ElMessageBox.confirm('重置设备身份（android_id / 广告 ID 换新）？', '重置身份', { type: 'warning' })
-  } catch { return }
-  try {
-    await apiPost('/api/identity/reset')
-    ElMessage.success('设备身份已重置')
-  } catch (e) { ElMessage.error(e.message) }
-}
-
-async function resetVm() {
-  try {
-    await ElMessageBox.confirm('⚠ 确定重置虚拟机？全部应用、数据、快照都会被清空，不可恢复！', '重置虚拟机', { type: 'error', confirmButtonText: '我确定' })
-  } catch { return }
-  try {
-    await apiPost('/api/vm/reset')
-    ElMessage.success('虚拟机已重置')
-  } catch (e) { ElMessage.error(e.message) }
-}
-
-async function loadMode() {
-  try {
-    const d = await apiGet('/api/runmode')
-    runMode.value = d.mode || 'vm'
-    runtimePresent.value = !!d.runtime_present
+    const st = await apiGet('/api/status')
+    version.value = st.version || ''
   } catch {}
-}
-
-async function switchMode(mode) {
-  switching.value = true
-  try {
-    const r = await apiPost('/api/runmode', { mode })
-    if (r.downloading) {
-      ElMessage.success('已切换到虚拟机模式，运行时下载已开始（见「镜像」页进度）')
-      runtimePresent.value = false
-    } else {
-      ElMessage.success(mode === 'device' ? '已切换到真机模式' : '已切换到虚拟机模式')
-    }
-  } catch (e) {
-    ElMessage.error(e.message)
-    loadMode() // 回滚显示
-  }
-  switching.value = false
-}
-
-onMounted(() => { loadCfg(); loadSnaps(); loadMode() })
+})
 </script>

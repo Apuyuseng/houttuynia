@@ -273,6 +273,51 @@ fn shape_score_of(path: &str) -> u32 {
     3
 }
 
+/// 精准通道：manifest <application> 的 icon/logo/banner 资源引用 → arsc
+/// 全配置路径收集 → dpi/格式打分选最优 → 读条目并校验魔数。
+/// 这是 AndResGuard 混淆包（res/-2.png 式路径，启发式必然失灵）的唯一可靠来源；
+/// 正常包也先走这里（系统渲染的就是这个引用），启发式只做兜底。
+fn icon_via_meta<F>(read_entry: F) -> Option<(Vec<u8>, &'static str)>
+where
+    F: Fn(&str) -> Option<Vec<u8>>, // 按 zip 内路径取条目内容
+{
+    let manifest = read_entry("AndroidManifest.xml")?;
+    let refs = crate::meta::axml_app_icon_refs(&manifest);
+    if refs.is_empty() {
+        return None;
+    }
+    let arsc = read_entry("resources.arsc")?;
+    for id in refs {
+        let paths = crate::meta::arsc_collect_paths(&arsc, id);
+        let best = paths
+            .iter()
+            .filter(|p| {
+                let l = p.to_lowercase();
+                l.ends_with(".png") || l.ends_with(".webp")
+            })
+            .max_by_key(|p| {
+                let l = p.to_lowercase();
+                dpi_weight(&l) * 10 + if l.ends_with(".png") { 1 } else { 0 }
+            });
+        let Some(p) = best else { continue };
+        let Some(data) = read_entry(p) else { continue };
+        if data.len() > 8 && &data[..4] == b"\x89PNG" {
+            return Some((data, "image/png"));
+        }
+        if data.len() > 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+            return Some((data, "image/webp"));
+        }
+    }
+    None
+}
+
+/// 区间读取指定中央目录条目（local header + 数据一次拉回）
+fn read_cd_entry_ranged(serial: &str, path: &str, e: &CdEntry) -> Option<Vec<u8>> {
+    let want = 512 + e.comp_size as u64;
+    let slice = adb::pull_range(serial, path, e.local_off, want).ok()?;
+    zip_read_slice(&slice, e.method, e.comp_size)
+}
+
 /// 区间读取式图标提取：尾部 EOCD → 中央目录 → 图标切片（三次小读）
 fn icon_from_apk_ranged(serial: &str, path: &str, size: u64) -> Option<(Vec<u8>, &'static str)> {
     // 尾部 256KB 找 EOCD
@@ -298,6 +343,17 @@ fn icon_from_apk_ranged(serial: &str, path: &str, size: u64) -> Option<(Vec<u8>,
     }
     let cd = adb::pull_range(serial, path, cd_off, cd_size).ok()?;
     let entries = cd_parse(&cd);
+    // 精准通道优先：manifest 引用 → arsc → 条目（混淆包唯一可靠路径）
+    {
+        let entries_ref = &entries;
+        let r = icon_via_meta(|name| {
+            let e = entries_ref.iter().find(|e| e.name == name)?;
+            read_cd_entry_ranged(serial, path, e)
+        });
+        if r.is_some() {
+            return r;
+        }
+    }
     let e = pick_icon_entry(&entries)?;
     // 图标切片：local header(30) + name + extra + 压缩数据；extra 长度在 local header 里，
     // 先读 512 头再按 comp_size 补读（一次读足 comp_size + 512 通常够）
@@ -318,6 +374,10 @@ fn icon_from_apk_ranged(serial: &str, path: &str, size: u64) -> Option<(Vec<u8>,
 
 /// 从 APK 字节里挑启动器图标（PNG/WebP）——整包路径（兜底）
 fn icon_from_apk(apk: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    // 精准通道优先（manifest 引用 → arsc → 条目）
+    if let Some(r) = icon_via_meta(|name| apk_file_entry(apk, name)) {
+        return Some(r);
+    }
     let entries = zip_list(apk);
     let mut best: Option<(u32, &ZipEntry)> = None;
     for e in &entries {
@@ -445,9 +505,19 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     }
     let _inflight_guard = InflightGuard { pkg: pkg.to_string() };
 
-    // 提取（并发槽限流）：pm path → 尺寸 → 区间读取（三小读）→ 兜底整拉
+    // 提取（并发槽限流）。顺序按用户拍板：在线商店包名查询优先（快）；
+    // APK 提取是下下策（无线真机上拉包慢），只对商店没有的应用（系统/TV 自带）启用。
     let slot = (pkg.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize))) % ICON_SLOTS.len();
     let _guard = ICON_SLOTS[slot].lock().unwrap();
+    // 通道 1：在线商店包名查询（豌豆荚 → 应用宝；一次 HTTP 出图标 + 落缓存）
+    if let Some((icon, mime)) =
+        icon_from_wandoujia(pkg).or_else(|| icon_from_yingyongbao(pkg))
+    {
+        let ext = if mime == "image/png" { "png" } else { "webp" };
+        let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
+        return Ok((icon, mime));
+    }
+    // 通道 2（下下策）：APK 提取。pm path → 区间读取 → 兜底整拉
     let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 30000)
         .map_err(|e| adb::AdbError(e.to_string()))?;
     let text = String::from_utf8_lossy(&out);
@@ -463,7 +533,7 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
             return Ok((icon, mime));
         }
     }
-    // 兜底 A：整包拉取（>120MB 的巨型包跳过——游戏包整拉不现实）
+    // 兜底：整包拉取（>120MB 的巨型包跳过——游戏包整拉不现实）
     if size > 0 && size <= 120 * 1024 * 1024 {
         if let Ok(apk) = adb::pull_file(serial, &apk_path, 120 * 1024 * 1024) {
             if let Some((icon, mime)) = icon_from_apk(&apk) {
@@ -473,14 +543,8 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
             }
         }
     }
-    // 兜底 B：豌豆荚按包名取图标（设备侧提取全部失败时；服务器出网即可）
-    if let Some((icon, mime)) = icon_from_wandoujia(pkg) {
-        let ext = if mime == "image/png" { "png" } else { "webp" };
-        let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
-        return Ok((icon, mime));
-    }
     let _ = std::fs::write(dir.join(format!("{pkg}.noicon")), b"");
-    err("APK 提取与豌豆荚均无可用图标")
+    err("在线商店与 APK 提取均无可用图标")
 }
 
 // ---------------- 应用标签 ----------------
@@ -515,6 +579,11 @@ pub fn icon_cached(pkg: &str) -> bool {
     dir.join(format!("{pkg}.png")).exists()
         || dir.join(format!("{pkg}.webp")).exists()
         || desktop_icon_hit(pkg).is_some()
+}
+
+/// 已缓存或正在提取中（列表预热去重：在途的包不再起新预热线程）
+pub fn icon_cached_or_inflight(pkg: &str) -> bool {
+    icon_cached(pkg) || ICON_INFLIGHT.lock().unwrap().contains(pkg)
 }
 
 /// 只读标签缓存（不触发提取）：列表响应用
@@ -679,12 +748,14 @@ pub fn icon_from_wandoujia(pkg: &str) -> Option<(Vec<u8>, &'static str)> {
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
         .build()
         .ok()?;
-    let page = client
+    let resp = client
         .get(format!("https://www.wandoujia.com/apps/{pkg}"))
         .send()
-        .ok()?
-        .text()
         .ok()?;
+    if !resp.status().is_success() {
+        return None; // 404 页无图标；且防错误页推荐位图张冠李戴
+    }
+    let page = resp.text().ok()?;
     // 找 itemprop="image" 的 img 的 src
     let mut idx = 0;
     let icon_url = loop {
@@ -717,5 +788,96 @@ pub fn icon_from_wandoujia(pkg: &str) -> Option<(Vec<u8>, &'static str)> {
         Some((bytes, "image/jpeg"))
     } else {
         None
+    }
+}
+
+/// 应用宝详情页按包名取图标：页内第一张 class 含 GameIcon_icon 的 img
+/// 即应用自身图标（pp.myapp.com CDN，/256 = 256px）。覆盖电视端应用
+/// （云视听/芒果 TV 等）豌豆荚没有的场景。
+pub fn icon_from_yingyongbao(pkg: &str) -> Option<(Vec<u8>, &'static str)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .build()
+        .ok()?;
+    let resp = client
+        .get(format!("https://sj.qq.com/appdetail/{pkg}"))
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None; // 404 页含推荐应用图标，必须拦掉防张冠李戴
+    }
+    let page = resp.text().ok()?;
+    let mut idx = 0;
+    let icon_url = loop {
+        let Some(img) = page[idx..].find("<img").map(|o| idx + o) else { return None };
+        let end = page[img..].find('>').map(|e| img + e).unwrap_or(page.len() - 1);
+        let tag = &page[img..end];
+        if tag.contains("GameIcon_icon") {
+            if let Some(s0) = tag.find("src=\"") {
+                let rest = &tag[s0 + 5..];
+                if let Some(e0) = rest.find('"') {
+                    let u = &rest[..e0];
+                    if u.contains("pp.myapp.com/ma_icon") {
+                        break u.to_string();
+                    }
+                }
+            }
+        }
+        idx = end + 1;
+        if idx >= page.len() {
+            return None;
+        }
+    };
+    let bytes = client.get(&icon_url).send().ok()?.bytes().ok()?.to_vec();
+    if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
+        Some((bytes, "image/png"))
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some((bytes, "image/webp"))
+    } else if bytes.len() > 3 && &bytes[..3] == b"\xff\xd8\xff" {
+        Some((bytes, "image/jpeg"))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 真机抓回的混淆/特殊 APK 样本（/tmp/apktest，无样本时跳过）：
+    /// AndResGuard 混淆包必须经 manifest+arsc 精准通道提取到图标。
+    #[test]
+    fn obfuscated_apk_icon() {
+        let mut checked = 0;
+        for p in ["com.github.tvbox.osc", "com.tcl.appmarket2", "com.zentraedi.zspace.tv"] {
+            let f = format!("/tmp/apktest/{p}.apk");
+            let Ok(apk) = std::fs::read(&f) else { continue };
+            checked += 1;
+            let r = super::icon_from_apk(&apk);
+            match &r {
+                Some((data, mime)) => println!("{p}: {mime} {} bytes", data.len()),
+                None => println!("{p}: 未提取到图标"),
+            }
+            assert!(r.is_some(), "{p} 应提取到图标");
+        }
+        if checked == 0 {
+            println!("无本地 APK 样本，跳过");
+        }
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod online_tests {
+    /// rustls TLS 实测：豌豆荚 + 应用宝在线图标源（需联网）
+    #[test]
+    fn online_icon_sources() {
+        let r = super::icon_from_wandoujia("com.tencent.mm");
+        println!("wandoujia mm: {:?}", r.as_ref().map(|(d, m)| (d.len(), m)));
+        let r2 = super::icon_from_yingyongbao("com.tencent.qqmusictv");
+        println!("yingyongbao qqmusictv: {:?}", r2.as_ref().map(|(d, m)| (d.len(), m)));
+        assert!(r.is_some(), "豌豆荚应取到微信图标");
+        assert!(r2.is_some(), "应用宝应取到QQ音乐图标");
     }
 }

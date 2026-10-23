@@ -115,7 +115,10 @@ impl SmartConn {
     }
 
     /// 切到设备传输：优先 host:tport（server 34+），失败回落 legacy。
-    /// tport OKAY 后必须消费紧跟的 8 字节 transport_id。
+    ///
+    /// 注意：tport 失败后**必须换新连接**再回落 host:transport —— tport 的 FAIL
+    /// 应答会把当前连接置于 closed 状态，任何后续 service 都收不到应答（实测
+    /// server 34/37 上直接 EOF），这是 adb server 的既定行为而非异常。
     pub fn transport(&mut self, serial: &str) -> AdbResult<()> {
         match self.service(&format!("host:tport:{serial}")) {
             Ok(()) => {
@@ -125,7 +128,14 @@ impl SmartConn {
                 }
                 Ok(())
             }
-            Err(_) => self.service(&format!("host:transport:{serial}")),
+            Err(_) => {
+                // 换新连接回落 legacy（旧 server 无 tport 服务）
+                let mut c = SmartConn::connect(5000)?;
+                c.service(&format!("host:transport:{serial}"))?;
+                // 接管底层连接供调用方继续用
+                self.stream = c.stream;
+                Ok(())
+            }
         }
     }
 
@@ -223,18 +233,32 @@ fn shell_v2(serial: &str, cmd: &str, timeout_ms: u64, pty: bool) -> AdbResult<Ve
     let mut out = Vec::new();
     let deadline = now_deadline(timeout_ms);
     loop {
-        let hdr = match c.read_exact_timeout(5, 1000) {
-            Ok(h) => h,
-            Err(_) => {
-                if Instant::now() >= deadline {
-                    return err("shell v2 读取超时");
+        // 逐字节读帧头与帧体，避免半帧/半载荷超时把已到达数据丢掉
+        // （此前 read_exact_timeout 超时放弃已读字节 → 下一帧错位解析 → EOF）
+        let read_bytes = |c: &mut SmartConn, n: usize| -> AdbResult<Vec<u8>> {
+            let mut out = Vec::with_capacity(n);
+            while out.len() < n {
+                let mut b = [0u8; 1];
+                match c.stream.read(&mut b) {
+                    Ok(0) => return err("eof in the middle of packet"),
+                    Ok(_) => out.push(b[0]),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        if Instant::now() >= deadline {
+                            return err("shell v2 读取超时");
+                        }
+                    }
+                    Err(e) => return err(format!("shell v2 读取失败: {e}")),
                 }
-                continue;
             }
+            Ok(out)
         };
+        let hdr = read_bytes(&mut c, 5)?;
         let id = hdr[0];
         let len = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-        let payload = c.read_exact_timeout(len, timeout_ms)?;
+        let payload = read_bytes(&mut c, len)?;
         match id {
             1 | 2 => out.extend_from_slice(&payload), // stdout/stderr 合并
             3 => break,                               // exit
@@ -526,22 +550,63 @@ fn read_frame_exact(s: &mut TcpStream, buf: &mut [u8]) -> AdbResult<bool> {
 
 // ===================== adb 二进制子进程（配对/连接/mDNS 发现） =====================
 
+/// 以 shell v1（`shell:<cmd>`）打开命令进程（流式，不等待输出）。
+pub fn shell_v1_stream(serial: &str, cmd: &str) -> AdbResult<ShellProcess> {
+    let mut c = SmartConn::connect(30000)?;
+    c.transport(serial)?;
+    c.service(&format!("shell:{cmd}"))?;
+    Ok(ShellProcess { stream: c.stream })
+}
+
+/// scrcpy server 拉起通道：先 v1 后 v2。
+///
+/// 背景：魅族 FlymeOS（Android 16）固件的 `register_android_util_SeempLog`
+/// 会在 v2（pty）通道下让 app_process 崩溃（SeempLog 类缺失 → ART abort），
+/// 但 v1 通道正常。官方 scrcpy 桌面版始终走 v1 也是同样原因的历史选择。
+pub fn shell_stream_scrcpy(serial: &str, cmd: &str) -> AdbResult<ShellProcess> {
+    match shell_v1_stream(serial, cmd) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            tracing::debug!("shell v1 失败，回落 v2: {e}");
+            shell_stream(serial, cmd)
+        }
+    }
+}
+
 // ===== 自研 adb server 会话命令（pair/connect/disconnect —— 不再依赖外部 adb 二进制）=====
 
-/// host:pair:<addr>:<code> —— 无线 TLS 配对（手机端「配对码」的服务端在手机上）
+/// 读 OKAY 之后的长度前缀文本载荷（4 位十六进制长度 + 内容）。
+fn read_len_prefixed(c: &mut SmartConn, timeout_ms: u64) -> AdbResult<String> {
+    let lenb = c.read_exact_timeout(4, timeout_ms)?;
+    let len = usize::from_str_radix(std::str::from_utf8(&lenb).unwrap_or("0"), 16).unwrap_or(0);
+    let msg = c.read_exact_timeout(len.min(4096), timeout_ms)?;
+    Ok(String::from_utf8_lossy(&msg).trim().to_string())
+}
+
+/// host:pair —— 无线配对：纯 Rust SPAKE2+TLS 实现（见 pairing.rs，零外部 adb 依赖）。
+/// 配对成功后手机信任本机 adbkey，后续 host:connect 即可建立加密连接。
 pub fn adb_pair(addr: &str, code: &str) -> AdbResult<String> {
-    let mut c = SmartConn::connect(5000)?;
-    c.service(&format!("host:pair:{addr}:{code}"))
-        .map_err(|e| AdbError(format!("配对失败: {}", e.to_string().replace("adb service request failed: ", ""))))?;
-    Ok("paired".into())
+    // adbkey 由 adb server 首次启动生成；配对要把它发给手机
+    ensure_server()?;
+    crate::pairing::pair(addr, code).map_err(AdbError)
 }
 
 /// host:connect:<addr>
+///
+/// 注意：server 对 host:connect 永远先回 OKAY，真实结果在 OKAY 后的
+/// 长度前缀载荷里（"connected to ..." / "failed to connect ..."）——
+/// 必须读载荷并判定，否则失败也被报成 ok。
 pub fn adb_connect(addr: &str) -> AdbResult<String> {
     let mut c = SmartConn::connect(5000)?;
     c.service(&format!("host:connect:{addr}"))
         .map_err(|e| AdbError(format!("连接失败: {}", e.to_string().replace("adb service request failed: ", ""))))?;
-    Ok("connected".into())
+    match read_len_prefixed(&mut c, 15000) {
+        Ok(msg) if msg.starts_with("failed") || msg.starts_with("cannot") => {
+            err(format!("连接失败: {msg}"))
+        }
+        Ok(msg) => Ok(msg),
+        Err(_) => Ok("connected".into()), // 老 server 不回载荷：保持原有宽松语义
+    }
 }
 
 /// host:disconnect:<serial>
@@ -549,7 +614,13 @@ pub fn adb_disconnect(serial: &str) -> AdbResult<String> {
     let mut c = SmartConn::connect(5000)?;
     c.service(&format!("host:disconnect:{serial}"))
         .map_err(|e| AdbError(format!("断开失败: {}", e.to_string().replace("adb service request failed: ", ""))))?;
-    Ok("disconnected".into())
+    match read_len_prefixed(&mut c, 10000) {
+        Ok(msg) if msg.starts_with("failed") || msg.starts_with("cannot") => {
+            err(format!("断开失败: {msg}"))
+        }
+        Ok(msg) => Ok(msg),
+        Err(_) => Ok("disconnected".into()),
+    }
 }
 
 /// mDNS 发现的 _adb._tcp / _adb-tls-pairing._tcp 服务（adb mdns services 输出）

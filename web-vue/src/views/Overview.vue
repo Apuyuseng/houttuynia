@@ -1,5 +1,5 @@
 <template>
-  <div class="overview-grid">
+  <div class="overview-grid" :class="{ landscape: isLandscape }">
     <el-card shadow="never">
       <template #header>
         <div style="display:flex;align-items:center;gap:8px;">
@@ -14,16 +14,16 @@
           </el-button>
         </div>
       </template>
-      <div class="phone-frame">
-        <span class="phone-btn phone-btn-vol"></span>
-        <span class="phone-btn phone-btn-power"></span>
+      <div class="phone-frame" :class="{ landscape: isLandscape }">
+        <span v-if="!isLandscape" class="phone-btn phone-btn-vol"></span>
+        <span v-if="!isLandscape" class="phone-btn phone-btn-power"></span>
         <div class="phone-panel">
           <div class="screen-box" ref="screenBox">
             <div class="placeholder" v-if="!imgShown">
-              {{ mode === 'device' ? (deviceSerial ? '真机已连接' : '真机未连接') : (running ? '虚拟机运行中' : '虚拟机未运行') }}<br>
-              <span class="small muted">{{ running ? '点击投屏查看实时画面' : (mode === 'device' ? '到「真机」页连接手机后此处显示画面' : '启动后此处显示设备画面') }}</span>
+              {{ deviceSerial ? '真机已连接' : '真机未连接' }}<br>
+              <span class="small muted">{{ deviceSerial ? '点击投屏查看实时画面' : '到「真机」页连接设备后此处显示画面' }}</span>
             </div>
-            <img v-if="imgUrlNow && !streaming" :src="imgUrlNow" @load="imgShown = true" @error="imgShown = false; imgUrlNow = ''" alt="">
+            <img v-if="imgUrlNow && !streaming" :src="imgUrlNow" @load="onImgLoad" @error="imgShown = false; imgUrlNow = ''" alt="">
           </div>
         </div>
       </div>
@@ -46,23 +46,11 @@
 
     <div style="display:grid;gap:18px;">
       <el-card shadow="never">
-        <template #header>{{ mode === 'device' ? '真机' : '虚拟机' }}</template>
+        <template #header>真机</template>
         <div class="muted small">
-          <template v-if="mode === 'device'">
-            模式：<b>真机模式</b> · 
-            <template v-if="deviceSerial">设备 <span class="mono">{{ deviceSerial }}</span></template>
-            <template v-else>未连接（到「真机」页连接手机）</template>
-          </template>
-          <template v-else>
-            状态：<b :style="{color: running ? 'var(--el-color-success)' : 'inherit'}">{{ running ? '运行中' : '未运行' }}</b>
-            <template v-if="serial"> · 设备 <span class="mono">{{ serial }}</span></template>
-          </template>
+          <template v-if="deviceSerial">设备 <span class="mono">{{ deviceSerial }}</span></template>
+          <template v-else>未连接 —— 到「真机」页连接手机 / 电视等 Android 设备</template>
         </div>
-        <el-space style="margin-top:14px;" v-if="mode !== 'device'">
-          <el-button type="primary" :loading="busy === 'start'" @click="vmAction('start')">▶ 启动</el-button>
-          <el-button :loading="busy === 'stop'" @click="vmAction('stop')">■ 停止（自动存档）</el-button>
-        </el-space>
-        <div v-if="vmError" class="small" style="color:var(--el-color-danger);margin-top:10px;">{{ vmError }}</div>
       </el-card>
 
       <el-card shadow="never">
@@ -84,7 +72,7 @@
             <el-statistic title="已运行" :value="fmtUptime(perf.uptime_s || 0)" />
           </el-col>
         </el-row>
-        <el-text v-else type="info" size="small">虚拟机未运行</el-text>
+        <el-text v-else type="info" size="small">真机未连接</el-text>
       </el-card>
     </div>
   </div>
@@ -96,16 +84,21 @@ import { ElMessage } from 'element-plus'
 import { apiGet, apiPost, imgUrl, fmtMb, fmtUptime } from '../api'
 import { ScrcpyWebPlayer } from '../player'
 
-const { vmRunning, serial, mode, deviceSerial } = inject('vmState')
-const running = computed(() => mode.value === 'device' ? !!deviceSerial.value : vmRunning.value)
-const targetSerial = computed(() => mode.value === 'device' ? deviceSerial.value : serial.value)
+const { deviceSerial } = inject('vmState')
+const running = computed(() => !!deviceSerial.value)
+const targetSerial = computed(() => deviceSerial.value)
 
 const screenBox = ref(null)
-const busy = ref('')
-const vmError = ref('')
 const perf = ref({ running: false, cpu_pct: 0, mem: {}, uptime_s: 0 })
 const imgUrlNow = ref('')
 const imgShown = ref(false)
+const isLandscape = ref(false)   // 横屏内容（TV/平板）：去掉手机边框
+function onImgLoad(e) {
+  imgShown.value = true
+  const img = e.target
+  if (img && img.naturalWidth > img.naturalHeight) isLandscape.value = true
+  else isLandscape.value = false
+}
 const live = ref(false)
 const streaming = ref(false)
 const streamStatus = ref('')
@@ -118,24 +111,12 @@ const memUsed = computed(() => (perf.value.mem?.total_mb || 0) - (perf.value.mem
 const memPct = computed(() => perf.value.mem?.total_mb ? memUsed.value * 100 / perf.value.mem.total_mb : 0)
 const gaugeColor = (p) => p > 85 ? '#f87171' : p > 65 ? '#fbbf24' : '#4ade80'
 
-async function vmAction(act) {
-  busy.value = act
-  try {
-    const r = await apiPost('/api/vm/' + act)
-    ElMessage.success(act === 'start' ? (r.already ? '虚拟机已在运行' : '启动指令已下发') : '停止指令已下发（正在存档）')
-  } catch (e) {
-    ElMessage.error(e.message)
-  }
-  busy.value = ''
-}
-
 async function refreshPerf() {
   if (streaming.value) return
   try { perf.value = await apiGet('/api/perf') } catch {}
   try {
     const st = await apiGet('/api/status')
-    vmError.value = st.error || ''
-    if ((st.vm?.running || st.target_serial) && !live.value && !streaming.value) loadShotOnce()
+    if (st.target_serial && !live.value && !streaming.value) loadShotOnce()
   } catch {}
 }
 
@@ -161,7 +142,13 @@ async function toggleStream() {
   imgUrlNow.value = ''
   imgShown.value = false
   player = new ScrcpyWebPlayer({
+    openQuery: targetSerial.value ? `&serial=${encodeURIComponent(targetSerial.value)}` : '',
     onStatus: (t, isErr) => { streamStatus.value = t },
+    onFirstFrame: () => {
+      // 首帧到手即知真实宽高比：横屏（TV/平板）切无边框样式
+      if (player.devW > player.devH) isLandscape.value = true
+      else isLandscape.value = false
+    },
     onEnd: () => {
       player = null
       streaming.value = false
@@ -205,7 +192,7 @@ function sendText() {
 async function downloadScreenshot() {
   try {
     const resp = await fetch(imgUrl('/api/screenshot.png'))
-    if (!resp.ok) throw new Error('截图失败（虚拟机在运行吗？）')
+    if (!resp.ok) throw new Error('截图失败（设备已连接？）')
     const blob = await resp.blob()
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)

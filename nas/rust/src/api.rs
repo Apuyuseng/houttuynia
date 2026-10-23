@@ -42,125 +42,16 @@ fn require_vm(state: &AppState) -> Result<String, (StatusCode, Json<Value>)> {
 // ===================== 基础 =====================
 
 pub async fn status(State(st): State<SharedState>) -> Json<Value> {
-    let mode = state::run_mode();
-    let vm_online = crate::adb::online_emulator();
-    let device = state::online_real_device();
-    let serial = st.current_serial();
+    // NAS 版纯真机网关：无虚拟机/运行时概念
+    let device = st.current_serial();
     Json(json!({
-        "vm": { "running": vm_online.is_some(), "serial": vm_online },
         "error": "",
         "version": "0.1.0-rust",
         "backend": "rust",
-        "mode": mode,
+        "mode": "device",
         "device_serial": device,
-        "target_serial": serial,
-        "runtime_present": crate::runtime::runtime_present(),
+        "target_serial": device,
     }))
-}
-
-pub async fn vm_start(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
-    if state::run_mode() == "device" {
-        return err(409, "当前为真机模式（设置页可切换到虚拟机模式）");
-    }
-    if st.vm_running() {
-        return ok(json!({ "ok": true, "already": true }));
-    }
-    let r = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let sdk = state::sdk_root().ok_or("SDK 探测失败（未找到 emulator）")?;
-        let exe = format!("{sdk}/emulator/emulator");
-        let avd = state::avd_name();
-        let cfg = state::config_load();
-        let mut args: Vec<String> = vec!["-avd".into(), avd.clone()];
-        // 无头判定：显式环境变量或 Linux 无显示服务器
-        let headless = std::env::var("MWINE_HEADLESS").is_ok()
-            || (cfg!(target_os = "linux")
-                && std::env::var("DISPLAY").is_err()
-                && std::env::var("WAYLAND_DISPLAY").is_err());
-        if headless {
-            args.push("-no-window".into());
-        }
-        args.push("-no-boot-anim".into());
-        if let Some(gpu) = cfg.get("gpu_mode").and_then(|v| v.as_str()) {
-            if !gpu.is_empty() {
-                args.push("-gpu".into());
-                args.push(gpu.to_string());
-            }
-        }
-        if let Some(mem) = cfg.get("memory_mb").and_then(|v| v.as_u64()) {
-            if mem > 0 {
-                args.push("-memory".into());
-                args.push(mem.to_string());
-            }
-        }
-        if let Some(proxy) = cfg.get("proxy").and_then(|v| v.as_str()) {
-            if !proxy.is_empty() {
-                args.push("-http-proxy".into());
-                args.push(proxy.to_string());
-            }
-        }
-        // 日志落文件，脱离父进程生命周期
-        let home = std::env::var("HOME").unwrap_or_default();
-        let logdir = format!("{home}/.mwine/logs");
-        let _ = std::fs::create_dir_all(&logdir);
-        let logf = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{logdir}/vm-rust.log"))
-            .map_err(|e| format!("日志文件: {e}"))?;
-        let logf2 = logf.try_clone().map_err(|e| format!("日志文件: {e}"))?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.args(&args)
-            .stdout(logf)
-            .stderr(logf2)
-            // AVD 可能在外置数据目录（与 C++ resolveActiveAvd 同口径）
-            .env("ANDROID_AVD_HOME", state::avd_home());
-        cmd.spawn().map_err(|e| format!("emulator 启动失败: {e}"))?;
-        // 等 adb 上线（冷启可达分钟级）
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-        while std::time::Instant::now() < deadline {
-            let _ = adb::ensure_server();
-            if adb::online_emulator().is_some() {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        Err("等待虚拟机上线超时（180s）".into())
-    })
-    .await;
-    match r {
-        Ok(Ok(())) => ok(json!({ "ok": true })),
-        Ok(Err(e)) => err(500, e),
-        Err(e) => err(500, format!("启动任务失败: {e}")),
-    }
-}
-
-pub async fn vm_stop(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
-    if state::run_mode() == "device" {
-        return err(409, "当前为真机模式");
-    }
-    let serial = match crate::adb::online_emulator() {
-        Some(s) => s,
-        None => return ok(json!({ "ok": true, "already": false, "note": "未在运行" })),
-    };
-    let r = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // 存档 → kill（与桌面版 vm stop 同语义）
-        let _ = console::cmd(&serial, "avd snapshot save mwine_default", true);
-        let _ = console::cmd(&serial, "kill", false);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            if adb::online_emulator().is_none() {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-        Err("等待虚拟机退出超时".into())
-    })
-    .await;
-    match r {
-        Ok(Ok(())) => ok(json!({ "ok": true })),
-        Ok(Err(e)) => err(500, e),
-        Err(e) => err(500, format!("停止任务失败: {e}")),
-    }
 }
 
 // ===================== 性能 =====================
@@ -283,6 +174,36 @@ pub async fn apps(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
                         let _ = crate::icons::app_label(&serial_bg, &pkg);
                     }
                 });
+            }
+        }
+        // 图标后台预热：图标提取只由图标接口懒触发，而前端只对 has_icon=true
+        // 的包渲染 img——全新环境（缓存为空）会死锁成全字母块。这里主动补齐：
+        // 分 3 路打满提取槽；负缓存（.noicon）在 app_icon 内部快速返回不重复劳动；
+        // 落盘后 cache_stamp 变化 → SSE /api/events/apps 推新列表，前端图标渐出。
+        {
+            let missing: Vec<String> = pkgs
+                .iter()
+                .map(|p| p.to_string())
+                .filter(|p| !crate::icons::icon_cached_or_inflight(p))
+                .collect();
+            if !missing.is_empty() {
+                for lane in 0..3usize {
+                    let serial_ic = serial.clone();
+                    let chunk: Vec<String> = missing
+                        .iter()
+                        .skip(lane)
+                        .step_by(3)
+                        .cloned()
+                        .collect();
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    std::thread::spawn(move || {
+                        for pkg in chunk {
+                            let _ = crate::icons::app_icon(&serial_ic, &pkg);
+                        }
+                    });
+                }
             }
         }
         let apps: Vec<Value> = pkgs
@@ -531,294 +452,9 @@ pub async fn config_set(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
 
 // ===================== 快照 =====================
 
-fn snapshots_dir() -> Option<String> {
-    let dir = format!("{}/snapshots", state::avd_dir());
-    std::path::Path::new(&dir).is_dir().then_some(dir)
-}
-
-pub async fn snapshots() -> (StatusCode, Json<Value>) {
-    let Some(dir) = snapshots_dir() else {
-        return ok(json!({ "snapshots": [] }));
-    };
-    let mut arr = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                let mtime = e
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                arr.push(json!({
-                    "name": e.file_name().to_string_lossy(),
-                    "mtime_ms": mtime,
-                }));
-            }
-        }
-    }
-    arr.sort_by_key(|v| v.get("mtime_ms").and_then(|x| x.as_u64()).unwrap_or(0));
-    arr.reverse();
-    ok(json!({ "snapshots": arr }))
-}
-
-fn snapshot_name_ok(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 48
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-pub async fn snapshot_save(
-    State(st): State<SharedState>,
-    Json(v): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if !snapshot_name_ok(name) {
-        return err(400, "存档名须为 1–48 位字母/数字/_/-");
-    }
-    let serial = match st.current_serial() {
-        Some(s) => s,
-        None => return err(503, "Android 未运行"),
-    };
-    let cmd = format!("avd snapshot save {name}");
-    let r = tokio::task::spawn_blocking(move || console::cmd(&serial, &cmd, true)).await;
-    match r {
-        Ok(Ok(_)) => ok(json!({ "ok": true })),
-        Ok(Err(e)) => err(500, e.to_string()),
-        Err(e) => err(500, format!("存档失败: {e}")),
-    }
-}
-
-pub async fn snapshot_load(
-    State(st): State<SharedState>,
-    Json(v): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if !snapshot_name_ok(name) {
-        return err(400, "存档名非法");
-    }
-    let serial = match st.current_serial() {
-        Some(s) => s,
-        None => return err(503, "Android 未运行"),
-    };
-    let cmd = format!("avd snapshot load {name}");
-    let r = tokio::task::spawn_blocking(move || console::cmd(&serial, &cmd, true)).await;
-    match r {
-        Ok(Ok(_)) => ok(json!({ "ok": true })),
-        Ok(Err(e)) => err(500, e.to_string()),
-        Err(e) => err(500, format!("恢复失败: {e}")),
-    }
-}
-
-pub async fn snapshot_delete(
-    State(st): State<SharedState>,
-    Json(v): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if !snapshot_name_ok(name) {
-        return err(400, "存档名非法");
-    }
-    let serial = match st.current_serial() {
-        Some(s) => s,
-        None => return err(503, "Android 未运行"),
-    };
-    let cmd = format!("avd snapshot delete {name}");
-    let r = tokio::task::spawn_blocking(move || console::cmd(&serial, &cmd, true)).await;
-    match r {
-        Ok(Ok(_)) => ok(json!({ "ok": true })),
-        Ok(Err(e)) => err(500, e.to_string()),
-        Err(e) => err(500, format!("删除失败: {e}")),
-    }
-}
-
 // ===================== 镜像 =====================
 
-fn android_version_name(api: &str) -> Option<&'static str> {
-    Some(match api {
-        "android-21" => "Android 5.0",
-        "android-22" => "Android 5.1",
-        "android-23" => "Android 6.0",
-        "android-24" => "Android 7.0",
-        "android-25" => "Android 7.1",
-        "android-26" => "Android 8.0",
-        "android-27" => "Android 8.1",
-        "android-28" => "Android 9",
-        "android-29" => "Android 10",
-        "android-30" => "Android 11",
-        "android-31" => "Android 12",
-        "android-32" => "Android 12L",
-        "android-33" => "Android 13",
-        "android-34" => "Android 14",
-        "android-35" => "Android 15",
-        "android-36" => "Android 16",
-        _ => return None,
-    })
-}
-
-fn current_sysdir_rel() -> Option<String> {
-    // AVD config.ini 的 image.sysdir.1（相对 SDK 根）
-    let text = std::fs::read_to_string(format!("{}/config.ini", state::avd_dir())).ok()?;
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("image.sysdir.1") {
-            return Some(
-                v.trim_start_matches([' ', '='])
-                    .trim_end_matches('/')
-                    .to_string(),
-            );
-        }
-    }
-    None
-}
-
-pub async fn image_list() -> (StatusCode, Json<Value>) {
-    let Some(sdk) = state::sdk_root() else {
-        return err(500, "SDK 探测失败（未找到 emulator）");
-    };
-    let sysdir = format!("{sdk}/system-images");
-    let _ = std::fs::create_dir_all(&sysdir);
-    let in_use = current_sysdir_rel();
-    let mut arr = Vec::new();
-    if let Ok(apis) = std::fs::read_dir(&sysdir) {
-        for api in apis.flatten() {
-            let api_name = api.file_name().to_string_lossy().to_string();
-            if let Ok(tags) = std::fs::read_dir(api.path()) {
-                for tag in tags.flatten() {
-                    let abi = tag.path().join("arm64-v8a");
-                    let has_system = abi.join("system-qemu.img").is_file()
-                        || abi.join("system.img").is_file();
-                    if !has_system {
-                        continue;
-                    }
-                    let size: u64 = std::fs::read_dir(&abi)
-                        .map(|rd| {
-                            rd.flatten()
-                                .filter_map(|f| f.metadata().ok().map(|m| m.len()))
-                                .sum()
-                        })
-                        .unwrap_or(0);
-                    let rel = format!(
-                        "system-images/{}/{}/arm64-v8a",
-                        api_name,
-                        tag.file_name().to_string_lossy()
-                    );
-                    arr.push(json!({
-                        "api": api_name,
-                        "display": android_version_name(&api_name),
-                        "name": tag.file_name().to_string_lossy(),
-                        "path": abi.to_string_lossy(),
-                        "rel": rel,
-                        "in_use": in_use.as_deref() == Some(rel.as_str()),
-                        "size_mb": size / 1_048_576,
-                    }));
-                }
-            }
-        }
-    }
-    ok(json!({ "images": arr }))
-}
-
-pub async fn image_use(
-    State(st): State<SharedState>,
-    Json(v): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
-    let stop_vm = v.get("stop_vm").map(|x| x.as_bool().unwrap_or(false)).unwrap_or(false);
-    let Some(sdk) = state::sdk_root() else {
-        return err(500, "SDK 探测失败");
-    };
-    let sysroot = std::fs::canonicalize(format!("{sdk}/system-images")).unwrap_or_default();
-    let canon = std::fs::canonicalize(path).unwrap_or_default();
-    if !canon.starts_with(&sysroot)
-        || !(canon.join("system-qemu.img").is_file() || canon.join("system.img").is_file())
-    {
-        return err(400, "非法的镜像目录");
-    }
-    // rel：system-images/<api>/<tag>/arm64-v8a
-    let rel = canon
-        .strip_prefix(&sysroot)
-        .map(|r| format!("system-images{}", r.to_string_lossy()))
-        .unwrap_or_default();
-    let running = st.current_serial();
-    if running.is_some() && !stop_vm {
-        return err(409, "虚拟机运行中：需先停止（传 stop_vm=true 自动停止）");
-    }
-    if let Some(serial) = running {
-        let _ = console::cmd(&serial, "kill", false);
-        for _ in 0..30 {
-            if adb::online_emulator().is_none() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
-    // 改写 config.ini 的 image.sysdir.1
-    let ini = format!("{}/config.ini", state::avd_dir());
-    let text = std::fs::read_to_string(&ini).unwrap_or_default();
-    let mut out = String::new();
-    let mut found = false;
-    for line in text.lines() {
-        if line.starts_with("image.sysdir.1") {
-            out.push_str(&format!("image.sysdir.1 = {rel}\n"));
-            found = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !found {
-        out.push_str(&format!("image.sysdir.1 = {rel}\n"));
-    }
-    if let Err(e) = std::fs::write(&ini, out) {
-        return err(500, format!("写入 AVD 配置失败: {e}"));
-    }
-    ok(json!({ "ok": true, "restarted": false, "sysdir": rel }))
-}
-
-pub async fn image_delete(
-    State(_st): State<SharedState>,
-    Json(v): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
-    let Some(sdk) = state::sdk_root() else {
-        return err(500, "SDK 探测失败");
-    };
-    let sysroot = std::fs::canonicalize(format!("{sdk}/system-images")).unwrap_or_default();
-    let canon = std::fs::canonicalize(path).unwrap_or_default();
-    if !canon.starts_with(&sysroot) {
-        return err(400, "非法的镜像目录");
-    }
-    let rel = format!("system-images{}", canon.strip_prefix(&sysroot).map(|r| r.to_string_lossy()).unwrap_or_default());
-    if current_sysdir_rel().as_deref() == Some(rel.as_str()) {
-        return err(409, "在用镜像不许删除");
-    }
-    match std::fs::remove_dir_all(&canon) {
-        Ok(()) => ok(json!({ "ok": true })),
-        Err(e) => err(500, format!("删除失败: {e}")),
-    }
-}
-
-pub async fn image_task(State(st): State<SharedState>) -> Json<Value> {
-    Json(st.image_task.to_json())
-}
-
 // ===================== 运行时 =====================
-
-pub async fn runtime_status() -> Json<Value> {
-    let sdk = state::sdk_root();
-    let present = sdk.is_some();
-    Json(json!({
-        "present": present,
-        "source": if present { "sdk" } else { "none" },
-        "path": sdk,
-    }))
-}
-
-pub async fn runtime_task(State(st): State<SharedState>) -> Json<Value> {
-    Json(st.runtime_task.to_json())
-}
 
 // ===================== 终端 =====================
 
@@ -975,12 +611,6 @@ pub async fn not_impl_capture() -> (StatusCode, Json<Value>) {
 pub async fn not_impl_pair() -> (StatusCode, Json<Value>) {
     not_impl("真机配对")
 }
-pub async fn not_impl_runtime_dl() -> (StatusCode, Json<Value>) {
-    not_impl("运行时在线下载")
-}
-pub async fn not_impl_image_pull() -> (StatusCode, Json<Value>) {
-    not_impl("镜像在线拉取")
-}
 pub async fn not_impl_misc() -> (StatusCode, Json<Value>) {
     not_impl("该功能")
 }
@@ -991,7 +621,13 @@ pub async fn stream_open(
     State(st): State<SharedState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<Value>) {
-    let serial = match st.current_serial() {
+    // 显式 serial 优先（前端指定设备），缺省回落 run_mode 自动选
+    let serial = q
+        .get("serial")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| st.current_serial());
+    let serial = match serial {
         Some(s) => s,
         None => return err(503, "Android 未运行"),
     };
@@ -1019,6 +655,16 @@ pub async fn stream_open(
         max_size
     };
     let params = scrcpy::StartParams { max_size, bit_rate, fps, new_display, start_app };
+
+    // TV/大屏设备待机（Dreaming）时 scrcpy 抓的是黑缓冲——开流前先唤醒
+    // （不影响手机：已亮屏的设备 wake_up 是 no-op；scrcpy stay_awake=true 接管保活）
+    let serial_wake = serial.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = adb::shell_blocking(&serial_wake, "input keyevent KEYCODE_WAKEUP", 5000);
+    })
+    .await;
+    // 唤醒后给 SurfaceFlinger 一点时间建立新帧（TV 的管线启动比手机慢）
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial, &jar, &params)).await;
     let mut session = match r {
@@ -1448,42 +1094,13 @@ async fn term_ws_loop(mut socket: WebSocket, st: SharedState, cols: u16, rows: u
 
 // ===================== 运行模式 =====================
 
-/// GET /api/runmode → {mode, runtime_present, vm_online, device_serial}
-pub async fn runmode_get(State(st): State<SharedState>) -> Json<Value> {
-    let mode = state::run_mode();
-    let device = state::online_real_device();
-    Json(json!({
-        "mode": mode,
-        "runtime_present": crate::runtime::runtime_present(),
-        "vm_online": st.vm_running(),
-        "device_serial": device,
-    }))
-}
-
-/// POST /api/runmode {mode}：切虚拟机模式且无运行时 → 自动触发下载
-pub async fn runmode_set(State(st): State<SharedState>, Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
-    let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("");
-    if mode != "device" && mode != "vm" {
-        return err(400, "mode 须为 device 或 vm");
-    }
-    state::set_run_mode(mode);
-    let mut downloading = false;
-    if mode == "vm" && !crate::runtime::runtime_present() {
-        let r = crate::runtime::start_download(&st, None);
-        downloading = r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-    }
-    ok(json!({
-        "ok": true,
-        "mode": mode,
-        "downloading": downloading,
-    }))
-}
-
 // ===================== 真机连接 =====================
 
-pub async fn devices_list() -> (StatusCode, Json<Value>) {
+pub async fn devices_list(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
     match tokio::task::spawn_blocking(adb::devices).await {
         Ok(Ok(ds)) => {
+            let current = st.current_serial();
+            let selected = crate::state::selected_serial();
             let arr: Vec<Value> = ds
                 .iter()
                 .map(|d| {
@@ -1492,6 +1109,8 @@ pub async fn devices_list() -> (StatusCode, Json<Value>) {
                         "state": d.state,
                         "kind": if d.serial.starts_with("emulator-") { "emulator" }
                                 else if d.serial.contains(':') { "wifi" } else { "usb" },
+                        "current": current.as_deref() == Some(d.serial.as_str()),
+                        "selected": selected.as_deref() == Some(d.serial.as_str()),
                     })
                 })
                 .collect();
@@ -1500,6 +1119,25 @@ pub async fn devices_list() -> (StatusCode, Json<Value>) {
         Ok(Err(e)) => err(500, e.to_string()),
         Err(e) => err(500, format!("设备列表失败: {e}")),
     }
+}
+
+/// POST /api/devices/select {serial} —— 多设备在线时选定管理目标（持久化到 nas.json）
+pub async fn devices_select(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let serial = v
+        .get("serial")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if serial.is_empty() {
+        return err(400, "缺少 serial");
+    }
+    let online = crate::state::online_real_devices();
+    if !online.iter().any(|s| s == &serial) {
+        return err(404, format!("设备不在线: {serial}"));
+    }
+    crate::state::set_selected_serial(&serial);
+    ok(json!({ "ok": true, "serial": serial }))
 }
 
 /// POST /api/devices/pair {host, port, code, connect_port?}
@@ -1595,19 +1233,6 @@ pub async fn hostpair_cancel(State(st): State<SharedState>) -> Json<Value> {
 }
 
 // ===================== 运行时下载 =====================
-
-/// POST /api/runtime/download {url?}
-pub async fn runtime_download(State(st): State<SharedState>, body: Bytes) -> (StatusCode, Json<Value>) {
-    let url = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v.get("url").and_then(|x| x.as_str()).map(String::from));
-    let r = crate::runtime::start_download(&st, url);
-    if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
-        ok(r)
-    } else {
-        err(409, r.get("error").and_then(|x| x.as_str()).unwrap_or("无法开始下载"))
-    }
-}
 
 // ===================== SSE 事件流（替代轮询） =====================
 
