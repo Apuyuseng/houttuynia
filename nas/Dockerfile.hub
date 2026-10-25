@@ -1,0 +1,45 @@
+# ============================================================
+# 鱼腥草（Houttuynia）NAS 版 —— 多架构自含镜像（Docker Hub 发布用）
+#
+# 与 nas/Dockerfile.selfhost 的差异：二进制按 TARGETARCH 从构建上下文
+# 选择（amd64/arm64 都已交叉编译好，构建期零编译零网络拉取——
+# debian:bookworm-slim 基础层除外）。
+#
+# 安全：不含 adb 授权私钥。entrypoint 首启自动生成密钥对，用户在设备上
+# 允许一次 USB/无线调试授权即可（标准流程）。
+#
+# 构建上下文（docker/ 目录，见 .github 或 README）：
+#   mwine-nas-amd64 / mwine-nas-arm64  musl 静态网关
+#   web/                               web-vue/dist
+#   scrcpy-server-v4.1                 scrcpy server jar
+#   mwine-bridge.apk                   壁纸/通知桥
+#   adb-amd64 / adb-arm64              官方 platform-tools adb
+#   entrypoint.sh                      入口脚本
+# ============================================================
+
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+
+COPY mwine-nas-${TARGETARCH} /usr/local/bin/mwine-nas
+COPY web/ /opt/mwine/web/
+COPY scrcpy-server-v4.1 /opt/mwine/bin/scrcpy-server-v4.1
+COPY mwine-bridge.apk /opt/mwine/bin/mwine-bridge.apk
+COPY adb-${TARGETARCH} /opt/mwine/adb
+COPY entrypoint.sh /opt/mwine/entrypoint.sh
+
+RUN chmod +x /opt/mwine/entrypoint.sh /opt/mwine/adb /usr/local/bin/mwine-nas \
+    && chmod +x /opt/mwine/bin/scrcpy-server-v4.1 \
+    && mkdir -p /data
+
+# adb 二进制为动态链接（glibc），基座已提供；ca-certificates 由 rustls
+# 内置根证书替代，无需安装。scratch 最小化但不适合（entrypoint 需 shell）。
+ENV HOME=/data \
+    MWINE_HOST=0.0.0.0 \
+    MWINE_TLS_PORT=18443 \
+    MWINE_WEB_DIR=/opt/mwine/web \
+    PATH=/opt/mwine:$PATH
+
+VOLUME /data
+EXPOSE 18443
+ENTRYPOINT ["/opt/mwine/entrypoint.sh"]
