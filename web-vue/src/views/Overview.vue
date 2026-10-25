@@ -1,10 +1,16 @@
 <template>
   <div class="overview-grid" :class="{ landscape: isLandscape }">
-    <el-card shadow="never">
-      <template #header>
+    <div class="screen-panel">
+      <div class="screen-head">
         <div style="display:flex;align-items:center;gap:8px;">
-          <span>设备屏幕</span>
           <div style="flex:1"></div>
+          <el-select v-model="quality" size="small" style="width:112px" title="画质档位"
+                     @change="onQualityChange" :disabled="qualityChanging">
+            <el-option value="low" label="流畅 720·15fps" />
+            <el-option value="medium" label="均衡 1080·24fps" />
+            <el-option value="high" label="高清 1440·30fps" />
+            <el-option value="auto" label="⚡ 自动（推荐）" />
+          </el-select>
           <el-button size="small" @click="downloadScreenshot">保存截图</el-button>
           <el-button v-if="canStream" size="small" :type="streaming ? 'danger' : 'primary'" @click="toggleStream">
             {{ streaming ? '■ 停止投屏' : '▶ 投屏' }}
@@ -13,7 +19,7 @@
             {{ live ? '暂停画面' : '实时画面' }}
           </el-button>
         </div>
-      </template>
+      </div>
       <div class="phone-frame" :class="{ landscape: isLandscape }">
         <span v-if="!isLandscape" class="phone-btn phone-btn-vol"></span>
         <span v-if="!isLandscape" class="phone-btn phone-btn-power"></span>
@@ -35,6 +41,7 @@
           <el-button size="small" @click="sendKey(26)">电源</el-button>
           <el-button size="small" @click="sendKey(24)">音量+</el-button>
           <el-button size="small" @click="sendKey(25)">音量−</el-button>
+          <el-button size="small" @click="toggleMute">{{ muted ? '🔇 已静音' : '🔊 本页声音' }}</el-button>
         </el-space>
         <el-input v-model="textToSend" size="small" placeholder="输入文本发送到设备" style="margin-top:8px"
                   @keyup.enter="sendText">
@@ -42,7 +49,7 @@
         </el-input>
         <div class="small muted" style="margin-top:6px">{{ streamStatus }}</div>
       </div>
-    </el-card>
+        </div>
 
     <div style="display:grid;gap:18px;">
       <el-card shadow="never">
@@ -50,6 +57,11 @@
         <div class="muted small">
           <template v-if="deviceSerial">设备 <span class="mono">{{ deviceSerial }}</span></template>
           <template v-else>未连接 —— 到「真机」页连接手机 / 电视等 Android 设备</template>
+          <template v-if="devInfo?.battery?.present">
+            <br>电量 <b>{{ devInfo.battery.level }}%</b>{{ devInfo.battery.status === 'charging' ? ' ⚡充电中' : '' }}
+            <template v-if="devInfo.battery.temp_c"> · 电池 {{ devInfo.battery.temp_c.toFixed(1) }}°C</template>
+          </template>
+          <template v-else-if="devInfo"><br>供电正常（无电池/固定电源）</template>
         </div>
       </el-card>
 
@@ -85,6 +97,13 @@ import { apiGet, apiPost, imgUrl, fmtMb, fmtUptime } from '../api'
 import { ScrcpyWebPlayer } from '../player'
 
 const { deviceSerial } = inject('vmState')
+const devInfo = ref(null)
+async function loadDevInfo() {
+  try {
+    const m = await apiGet('/api/device/info')
+    devInfo.value = m[deviceSerial.value] || null
+  } catch { devInfo.value = null }
+}
 const running = computed(() => !!deviceSerial.value)
 const targetSerial = computed(() => deviceSerial.value)
 
@@ -103,6 +122,23 @@ const live = ref(false)
 const streaming = ref(false)
 const streamStatus = ref('')
 const textToSend = ref('')
+const quality = ref(localStorage.getItem('mw_quality') || 'auto')
+const qualityChanging = ref(false)
+async function onQualityChange(v) {
+  qualityChanging.value = true
+  try {
+    if (player) await player.setQuality(v)
+    else if (v !== 'auto') {
+      // 未投屏时只落偏好（下次开流生效）
+      localStorage.setItem('mw_auto_tier', v)
+    }
+  } finally { qualityChanging.value = false }
+}
+const muted = ref(false)
+function toggleMute() {
+  muted.value = !muted.value
+  if (player) player.setMuted(muted.value)
+}
 const canStream = ScrcpyWebPlayer.supported()
 
 let player = null
@@ -152,6 +188,7 @@ async function toggleStream() {
     onEnd: () => {
       player = null
       streaming.value = false
+      muted.value = false
       loadShotOnce()
     },
   })
@@ -203,10 +240,11 @@ async function downloadScreenshot() {
   } catch (e) { ElMessage.error(e.message) }
 }
 
-let timer
-onMounted(() => { refreshPerf(); timer = setInterval(refreshPerf, 2500) })
+let timer, infoTimer
+onMounted(() => { refreshPerf(); loadDevInfo(); timer = setInterval(refreshPerf, 2500); infoTimer = setInterval(loadDevInfo, 20000) })
 onUnmounted(() => {
   clearInterval(timer)
+  if (infoTimer) clearInterval(infoTimer)
   if (liveTimer) clearInterval(liveTimer)
   if (player) { const p = player; player = null; p.stop() }
 })

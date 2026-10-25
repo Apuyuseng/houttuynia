@@ -31,19 +31,65 @@ public class WallpaperDump {
             Class<?> at = Class.forName("android.app.ActivityThread");
             Object thread = at.getDeclaredMethod("systemMain").invoke(null);
             Context sysContext = (Context) at.getMethod("getSystemContext").invoke(thread);
-            // wallpaper 服务校验 opPackageName 与调用 uid 的归属：
-            // systemContext 的属主包与 shell uid 不匹配会被拒（IllegalArgumentException）。
-            // shell uid 自带包 com.android.shell —— 以它为 op 包即可通过校验。
+            // wallpaper 服务校验 opPackageName 与调用 uid 的归属（A12 实测
+            // "Given calling package android does not match caller's uid 2000"）。
+            // shell uid 自带包 com.android.shell —— 归因成它即可通过校验。
             Context context = sysContext;
             try {
                 context = sysContext.createPackageContext("com.android.shell", 0);
-            } catch (Exception ignored) {
+            } catch (Throwable t) {
+                System.err.println("createPackageContext failed: " + t);
+            }
+            // systemContext/createPackageContext 的 opPackageName 都是 "android"
+            //（A12 实测），binder 归因校验要 opPackageName 与 uid 的包一致——
+            // shell uid 本尊包是 com.android.shell，反射改写 ContextImpl 字段
+            try {
+                java.lang.reflect.Field f = context.getClass().getDeclaredField("mOpPackageName");
+                f.setAccessible(true);
+                f.set(context, "com.android.shell");
+                System.err.println("attribution set: " + context.getOpPackageName());
+            } catch (Throwable t) {
+                System.err.println("attribution set failed: " + t);
             }
 
             WallpaperManager wm = WallpaperManager.getInstance(context);
-            Drawable d = wm.getDrawable();
-            if (d == null)
-                d = wm.getBuiltInDrawable();
+            Drawable d = null;
+            // 策略 1：getDrawable（A11 TV 可调但回 1×1；A12 需归因正确）
+            try {
+                d = wm.getDrawable();
+                System.err.println("getDrawable -> " + (d == null ? "null" : d.getIntrinsicWidth() + "x" + d.getIntrinsicHeight()));
+            } catch (Throwable t) {
+                System.err.println("getDrawable failed: " + t);
+            }
+            // 策略 2：getWallpaperFile（ParcelFileDescriptor 直读壁纸原图，
+            // 走不同的 binder 路径，可能不受 getDrawable 的限制）
+            if (d == null || d.getIntrinsicWidth() <= 1 || d.getIntrinsicHeight() <= 1) {
+                try {
+                    android.os.ParcelFileDescriptor pfd =
+                            wm.getWallpaperFile(WallpaperManager.FLAG_SYSTEM);
+                    System.err.println("getWallpaperFile -> " + (pfd == null ? "null" : pfd.getStatSize() + "B"));
+                    if (pfd != null) {
+                        android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+                        android.graphics.Bitmap raw = android.graphics.BitmapFactory.decodeFileDescriptor(pfd.getFileDescriptor(), null, o);
+                        if (raw != null) {
+                            System.err.println("raw wallpaper: " + raw.getWidth() + "x" + raw.getHeight());
+                            d = new android.graphics.drawable.BitmapDrawable(
+                                    android.content.res.Resources.getSystem(), raw);
+                        }
+                    }
+                } catch (Throwable t) {
+                    System.err.println("getWallpaperFile failed: " + t);
+                }
+            }
+            // 策略 3：getBuiltInDrawable（出厂默认图）
+            if (d == null || d.getIntrinsicWidth() <= 1 || d.getIntrinsicHeight() <= 1) {
+                try {
+                    d = wm.getBuiltInDrawable();
+                    System.err.println("getBuiltInDrawable -> " + (d == null ? "null" : d.getIntrinsicWidth() + "x" + d.getIntrinsicHeight()));
+                } catch (Throwable t) {
+                    System.err.println("getBuiltInDrawable failed: " + t);
+                }
+            }
             if (d == null) {
                 System.err.println("no wallpaper drawable");
                 System.exit(3);

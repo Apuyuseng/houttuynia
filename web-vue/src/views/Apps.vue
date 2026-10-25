@@ -21,24 +21,6 @@
     <!-- 启动器桌面：设备壁纸背景 + 图标网格 -->
     <div class="launcher" :style="launcherStyle">
       <img v-if="wallpaperUrl" class="launcher-bg" :class="{ blur: wallpaperBlur }" :src="wallpaperUrl" alt="">
-      <div class="macbar">
-        <div class="macbar-actions">
-          <button class="macbar-btn" :class="{ active: searchOn }" title="搜索" @click="toggleSearch">
-            <el-icon><Search /></el-icon>
-          </button>
-          <button class="macbar-btn" title="上传 APK 安装" @click="fileInput.click()">
-            <el-icon><Upload /></el-icon>
-          </button>
-          <button class="macbar-btn" title="刷新列表" @click="load">
-            <el-icon :class="{ 'is-spin': refreshing }"><Refresh /></el-icon>
-          </button>
-        </div>
-        <input ref="fileInput" type="file" accept=".apk" style="display:none" @change="onFile" />
-        <transition name="el-zoom-in-center">
-          <input v-if="searchOn" v-model="filter" class="macbar-search"
-                 placeholder="筛选应用名 / 包名" autofocus />
-        </transition>
-      </div>
       <div v-if="loading" class="launcher-msg">读取中…</div>
       <div v-else-if="!running" class="launcher-msg">'真机未连接 —— 到「真机」页连接后此处展示设备桌面'</div>
       <el-empty v-else-if="!filtered.length" description="暂无应用" style="padding:60px 0" />
@@ -85,27 +67,15 @@ const running = computed(() => !!deviceSerial.value)
 const apps = ref([])
 const loading = ref(true)      // 仅首载（无内容时）显占位
 const refreshing = ref(false)  // 后台刷新标识（不清空现有内容）
-const filter = ref('')
-const fileInput = ref(null)
 const iconOk = ref({})
 const task = ref({})
 const taskVisible = ref(false)
 const wallpaperUrl = ref('')
 const wallpaperBlur = ref(false)
-const searchOn = ref(false)
-function toggleSearch() { searchOn.value = !searchOn.value; if (!searchOn.value) filter.value = '' }
 
-const filtered = computed(() => {
-  const q = filter.value.trim().toLowerCase()
-  // 无图标的应用也要展示（字母占位块兜底），不能过滤——
-  // 真机模式下图标缓存可能整体为空，过滤会导致列表全空
-  let list = apps.value
-  if (q) {
-    list = list.filter(a =>
-      (a.name || '').toLowerCase().includes(q) || a.package.toLowerCase().includes(q))
-  }
-  return list
-})
+// 无图标的应用也要展示（字母占位块兜底），不能过滤——
+// 真机模式下图标缓存可能整体为空，过滤会导致列表全空
+const filtered = computed(() => apps.value)
 
 const launcherStyle = computed(() => ({
   background: 'linear-gradient(155deg, #232a3b 0%, #10141c 60%, #0c0f16 100%)',
@@ -216,33 +186,6 @@ function bringFront(key) {
   if (w) w.z = ++zTop
 }
 
-function onFile(e) {
-  const f = e.target.files[0]
-  e.target.value = ''
-  if (!f) return
-  if (f.size > 512 * 1024 * 1024) return ElMessage.error('APK 超过 512MB 上限')
-  const xhr = new XMLHttpRequest()
-  xhr.open('POST', '/api/apps/install-upload?name=' + encodeURIComponent(f.name))
-  xhr.setRequestHeader('Content-Type', 'application/octet-stream')
-  if (authState.token) xhr.setRequestHeader('Authorization', 'Bearer ' + authState.token)
-  xhr.onload = () => {
-    let d = {}
-    try { d = JSON.parse(xhr.responseText) } catch {}
-    if (xhr.status >= 200 && xhr.status < 300) {
-      ElMessage.success('上传完成，开始安装')
-      taskVisible.value = true
-      pollTask()
-    } else {
-      ElMessage.error(d.error || '上传失败')
-    }
-  }
-  xhr.onerror = () => ElMessage.error('上传失败：网络错误')
-  xhr.send(f)
-  taskVisible.value = true
-  task.value = { running: true, phase: '上传到服务器…' }
-  pollTask()
-}
-
 let polling = false
 async function pollTask() {
   if (polling) return
@@ -335,35 +278,6 @@ onUnmounted(() => {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 /* 桌面上沿工具栏：与 launcher 面板左右上三边贴合（负 margin 吃掉内边距） */
-.macbar {
-  position: relative;
-  display: flex; align-items: center; justify-content: flex-end;
-  height: 34px;
-  margin: -26px -30px 18px;   /* 贴合面板顶/左/右，下缘与内容留 18px */
-  background: rgba(20, 23, 30, 0.45);   /* 更高透明度，壁纸透出来 */
-  backdrop-filter: blur(18px) saturate(1.3);
-  -webkit-backdrop-filter: blur(18px) saturate(1.3);
-  border-bottom: 1px solid #ffffff10;
-  padding: 0 10px;
-}
-.macbar-actions { display: flex; gap: 6px; z-index: 1; }
-.macbar-btn {
-  border: none; background: transparent; color: #9aa3b2;
-  width: 28px; height: 22px; border-radius: 6px; cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center;
-  font-size: 13px;
-}
-.macbar-btn:hover { background: #ffffff14; color: #e6e9ef; }
-.macbar-btn.active { background: #4ade8033; color: #86efac; }
-.macbar-search {
-  position: absolute; right: 100px; top: 4px;
-  z-index: 2;
-  width: 220px; height: 26px;
-  background: #14171e; border: 1px solid #3a4152; border-radius: 8px;
-  color: #e6e9ef; padding: 0 10px; outline: none; font-size: 12.5px;
-}
-.macbar-search:focus { border-color: #4ade80; }
-
 /* 壁纸背景图（截图兜底时模糊化） */
 .launcher-bg {
   position: absolute; inset: 0;
@@ -375,9 +289,11 @@ onUnmounted(() => {
 }
 /* 应用库整页贴合 el-main（抵消其内边距，仅本页生效） */
 .apps-page {
-  display: flex; flex-direction: column; gap: 18px;
+  display: flex; flex-direction: column; gap: 12px;
   margin: -18px -24px -60px;
-  min-height: calc(100vh - 60px - 60px); /* el-header 60px + el-main 原下边距 */
+  padding: 0 0 20px;
+  height: calc(100vh - 52px);
+  box-sizing: border-box;
 }
 /* 任务卡在整页贴合下保持呼吸感 */
 .apps-page > .el-card { margin: 18px 24px 0; }

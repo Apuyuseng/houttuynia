@@ -11,12 +11,14 @@ mod adb;
 mod api;
 mod console;
 mod devices;
+mod filemgr;
 mod icons;
 mod meta;
 mod pairing;
 mod scrcpy;
 mod state;
 mod tls;
+mod guard;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -38,6 +40,8 @@ const PKT_CONFIG: u8 = 0;
 const PKT_DELTA: u8 = 1;
 const PKT_KEY: u8 = 2;
 const PKT_META: u8 = 3;
+const PKT_AUDIO_CONFIG: u8 = 5; // 音频解码器配置（AAC = AudioSpecificConfig）
+const PKT_AUDIO: u8 = 6; // 音频帧
 
 fn encode_frame(typ: u8, pts: u64, data: &[u8]) -> FrameMsg {
     let mut out = Vec::with_capacity(15 + data.len());
@@ -47,6 +51,24 @@ fn encode_frame(typ: u8, pts: u64, data: &[u8]) -> FrameMsg {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(data);
     out
+}
+
+/// 音频包 → 帧队列（独立线程：audio socket 阻塞读不影响视频喂包）。
+/// 音频流异常只降级（视频继续），绝不置位会话 ended。
+fn scrcpy_audio_feeder(sock: std::net::TcpStream, tx: tokio::sync::mpsc::Sender<FrameMsg>) {
+    let mut demux = scrcpy::AudioDemuxer::new(sock);
+    loop {
+        match demux.next_packet() {
+            Ok(Some(pkt)) => {
+                let typ = if pkt.config { PKT_AUDIO_CONFIG } else { PKT_AUDIO };
+                if tx.blocking_send(encode_frame(typ, pkt.pts, &pkt.data)).is_err() {
+                    break; // 浏览器已断开（视频线程负责会话清理）
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break, // 音频中断仅降级
+        }
+    }
 }
 
 /// 视频包 → 帧队列（客户端断开 → send 失败 → 退出并清理会话）。
@@ -194,6 +216,82 @@ async fn main() {
     let _ = adb::ensure_server();
 
     let state = state::AppState::new();
+    // 家长管控巡检线程（每 5s：屏幕状态/前台应用/规则执行）
+    {
+        let st = state.clone();
+        std::thread::spawn(move || crate::guard::run_loop(st));
+    }
+    // 已知无线设备自动回连：adb server 与网关同生命周期（容器内），
+    // 重启后 adb 侧无线连接清空——按选定设备/管控设备主动 connect 恢复
+    {
+        let st = state.clone();
+        std::thread::spawn(move || {
+            // USB 自愈状态：连续检测到「总线有 ADB 接口但 adb 无 USB transport」
+            // 达 2 轮即触发；60s 防抖
+            let mut usb_strikes: u32 = 0;
+            let mut last_heal_ms: i64 = 0;
+            loop {
+            let mut cands: Vec<String> = Vec::new();
+            if let Some(sel) = st.current_serial() {
+                cands.push(sel);
+            }
+            for s in crate::guard::known_serials() {
+                if !cands.contains(&s) {
+                    cands.push(s);
+                }
+            }
+            for s in state::known_devices() {
+                if !cands.contains(&s) {
+                    cands.push(s);
+                }
+            }
+            for serial in cands {
+                // 无线设备序列号形如 192.168.x.x:5555
+                if serial.contains(':') && adb::devices()
+                    .map(|ds| !ds.iter().any(|d| d.serial == serial))
+                    .unwrap_or(true)
+                {
+                    match adb::adb_connect(&serial) {
+                        Ok(_) => tracing::info!("已回连设备 {serial}"),
+                        Err(e) => tracing::debug!("回连 {serial} 未成功: {e}"),
+                    }
+                }
+            }
+            // USB 自愈：/sys 有 ADB 接口但 adb 无 USB transport（外部 server
+            // 占用 5037 / 热插拔事件丢失）→ 协议级重启 adb server 重扫，
+            // 随后立即再跑一轮回连恢复 WiFi 连接
+            let usb_iface = adb::usb_adb_iface_present();
+            let has_usb_transport = adb::devices()
+                .map(|ds| {
+                    ds.iter().any(|d| {
+                        !d.serial.contains(':') && !d.serial.starts_with("emulator")
+                    })
+                })
+                .unwrap_or(true);
+            if usb_iface && !has_usb_transport {
+                usb_strikes += 1;
+            } else {
+                usb_strikes = 0;
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if usb_iface && !has_usb_transport && usb_strikes >= 2 && now_ms - last_heal_ms > 60_000 {
+                match adb::restart_server() {
+                    Ok(_) => {
+                        tracing::info!("USB 自愈：adb server 已重启并重扫（5037 被外部占用或热插拔丢失）");
+                        last_heal_ms = now_ms;
+                        usb_strikes = 0;
+                        continue; // 立即进入下一轮回连
+                    }
+                    Err(e) => tracing::warn!("USB 自愈失败: {e}"),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+    }
 
     // 501 占位处理器共用
     let api = Router::new()
@@ -231,6 +329,13 @@ async fn main() {
         .route("/devices/connect", post(api::devices_connect))
         .route("/devices/disconnect", post(api::devices_disconnect))
         .route("/devices/select", post(api::devices_select))
+        .route("/devices/known/remove", post(api::devices_known_remove))
+        .route("/device/info", get(api::device_info))
+        .route("/guard", get(api::guard_get).post(api::guard_set))
+        .route("/files", get(filemgr::files_list))
+        .route("/files/download", get(filemgr::files_download))
+        .route("/files/upload", post(filemgr::files_upload))
+        .route("/files/op", post(filemgr::files_op))
         .route("/devices/forget", post(api::devices_disconnect))
         // 运行模式
         // 投屏

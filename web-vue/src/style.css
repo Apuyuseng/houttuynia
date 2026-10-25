@@ -8,19 +8,80 @@ body {
 
 /* 深色基调微调（element dark vars 之上的产品色） */
 html.dark {
-  --el-bg-color: #1b2029;
-  --el-bg-color-overlay: #222835;
-  --el-bg-color-page: #0f1115;
-  --el-fill-color-blank: #1b2029;
-  --el-border-color: #2a3140;
-  --el-border-color-light: #2a3140;
-  --el-border-color-lighter: #262c39;
+  /* 壁纸衍生主题：表面=玻璃白透明（不再用暗灰填充，避免与亮玻璃割裂） */
+  --el-bg-color: rgba(255, 255, 255, 0.05);
+  --el-bg-color-overlay: rgba(38, 44, 56, 0.85);
+  --el-bg-color-page: transparent;
+  --el-fill-color-blank: transparent;
+  --el-fill-color: rgba(255, 255, 255, 0.06);
+  --el-fill-color-light: rgba(255, 255, 255, 0.05);
+  --el-fill-color-lighter: rgba(255, 255, 255, 0.04);
+  --el-fill-color-dark: rgba(255, 255, 255, 0.09);
+  --el-fill-color-darker: rgba(255, 255, 255, 0.12);
+  --el-border-color: rgba(255, 255, 255, 0.12);
+  --el-border-color-light: rgba(255, 255, 255, 0.09);
+  --el-border-color-lighter: rgba(255, 255, 255, 0.07);
   --el-color-primary: #4ade80;
+  /* Apple 设计圆角标尺（连续大圆角观感）：大表面大圆角、小组件小圆角 */
+  --r-card: 18px;      /* 卡片/面板（大表面） */
+  --r-control: 10px;   /* 按钮/输入框（控件） */
+  --r-chip: 99px;      /* 徽标/胶囊 */
+  --el-border-radius-base: 10px;
 }
 html.dark .el-menu {
   border-right: none;
   background: transparent;
 }
+
+/* Apple 材质：卡片 = 半透明表面 + 细亮边 + 柔和投影（内容浮于壁纸上） */
+html.dark .el-card {
+  border-radius: var(--r-card);
+  /* Liquid Glass：玻璃体 = 低透明度亮面 + 强模糊高饱和（折射感） */
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.14) 0%,
+    rgba(255, 255, 255, 0.07) 45%,
+    rgba(160, 170, 190, 0.09) 100%);
+  backdrop-filter: blur(24px) saturate(1.8);
+  -webkit-backdrop-filter: blur(24px) saturate(1.8);
+  /* 玻璃边缘：顶部高光内描边（光从上来）+ 外侧细亮边 + 柔和落影 */
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 1px rgba(255, 255, 255, 0.06),
+    0 10px 34px rgba(0, 0, 0, 0.35);
+}
+/* 卡片头部与圆角衔接（Element 默认直角分割线） */
+html.dark .el-card__header { border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+/* 控件圆角统一（按钮/输入框/选择器/对话框/抽屉/消息） */
+html.dark .el-button,
+html.dark .el-input__wrapper,
+html.dark .el-select__wrapper,
+html.dark .el-textarea__inner { border-radius: var(--r-control); }
+html.dark .el-dialog,
+html.dark .el-drawer,
+html.dark .el-message { border-radius: var(--r-card); }
+html.dark .el-tag,
+html.dark .el-progress-bar__outer,
+html.dark .el-progress-bar__inner { border-radius: var(--r-chip); }
+html.dark .el-table { border-radius: var(--r-control); overflow: hidden;
+  background: transparent; }
+html.dark .el-table tr, html.dark .el-table th.el-table__cell {
+  background: transparent; }
+html.dark .el-table--enable-row-hover .el-table__body tr:hover > td.el-table__cell {
+  background: rgba(255, 255, 255, 0.06); }
+html.dark .el-table td.el-table__cell, html.dark .el-table th.el-table__cell.is-leaf {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+html.dark .el-table__inner-wrapper::before { display: none; } /* 表格默认底部分割线与圆角冲突 */
+/* 输入类控件：白透玻璃填充 */
+html.dark .el-input__wrapper, html.dark .el-select__wrapper, html.dark .el-textarea__inner {
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1) inset; }
+/* 弹层（菜单/下拉/对话框/消息）统一厚玻璃 */
+html.dark .el-popper:not(.is-message), html.dark .el-dropdown-menu,
+html.dark .el-select-dropdown { background: rgba(38, 44, 56, 0.82);
+  backdrop-filter: blur(24px) saturate(1.7);
+  -webkit-backdrop-filter: blur(24px) saturate(1.7);
+  border: 1px solid rgba(255, 255, 255, 0.1); }
 
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .muted { color: var(--el-text-color-secondary); }
@@ -28,7 +89,7 @@ html.dark .el-menu {
 
 /* 屏幕/投屏 */
 .screen-box {
-  background: #000; border-radius: 10px; overflow: hidden; position: relative;
+  background: #000; border-radius: var(--r-control); overflow: hidden; position: relative;
   margin: 0 auto; width: fit-content; max-width: 100%;
   /* 宽度随内容固有比例收缩——边框与画面贴合，不留黑边 */
 }
@@ -102,12 +163,12 @@ html.dark .el-menu {
 }
 .app-card {
   background: var(--el-bg-color-overlay); border: 1px solid var(--el-border-color);
-  border-radius: 11px; padding: 14px 10px; text-align: center;
+  border-radius: var(--r-card); padding: 14px 10px; text-align: center;
   transition: border-color .15s, transform .1s;
 }
 .app-card:hover { border-color: var(--el-text-color-secondary); transform: translateY(-1px); }
 .app-icon {
-  width: 56px; height: 56px; border-radius: 13px; margin: 0 auto 8px;
+  width: 56px; height: 56px; border-radius: 15px; margin: 0 auto 8px;
   display: flex; align-items: center; justify-content: center;
   background: linear-gradient(135deg, #334155, #1e293b);
   font-size: 24px; font-weight: 700; color: #94a3b8; overflow: hidden;
@@ -118,7 +179,7 @@ html.dark .el-menu {
 
 /* 终端 */
 .term-box {
-  background: #0a0c10; border: 1px solid var(--el-border-color); border-radius: 10px;
+  background: #0a0c10; border: 1px solid var(--el-border-color); border-radius: var(--r-control);
   padding: 12px 14px; height: 52vh; overflow-y: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
@@ -127,6 +188,9 @@ html.dark .el-menu {
 
 /* 概览布局 */
 .overview-grid { display: grid; grid-template-columns: minmax(380px, auto) 1fr; gap: 18px; align-items: start; }
+/* 设备屏幕：透明无边框面板，标题区与画面间距加宽 */
+.screen-panel { display: flex; flex-direction: column; gap: 28px; }
+.screen-head { display: flex; align-items: center; }
 /* 横屏内容（TV/平板）：设备屏幕单独一行占满，右栏元素挪到下方 */
 .overview-grid.landscape { grid-template-columns: 1fr; }
 @media (max-width: 1100px) { .overview-grid { grid-template-columns: 1fr; } }

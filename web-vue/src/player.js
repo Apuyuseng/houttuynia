@@ -8,9 +8,20 @@ export const SCRCPY_KEY = {
   UP: 19, DOWN: 20, LEFT: 21, RIGHT: 22,
 }
 
+// 画质档位（max_size=长边上限 / bit_rate / fps）
+export const QUALITY_TIERS = [
+  { key: 'low',    label: '流畅', max_size: 720,  bit_rate: 800_000,  fps: 15 },
+  { key: 'medium', label: '均衡', max_size: 1080, bit_rate: 2_000_000, fps: 24 },
+  { key: 'high',   label: '高清', max_size: 1440, bit_rate: 4_000_000, fps: 30 },
+]
+
 export class ScrcpyWebPlayer {
-  constructor({ onStatus, onEnd, onFirstFrame, openQuery = '' }) {
+  constructor({ onStatus, onEnd, onFirstFrame, openQuery = '', quality }) {
     this.openQuery = openQuery
+    // 画质：'auto'（自动升降档）或档位 key；缺省读用户偏好
+    this.qualityPref = quality || localStorage.getItem('mw_quality') || 'auto'
+    this.tier = QUALITY_TIERS.find(t => t.key === localStorage.getItem('mw_auto_tier')) || QUALITY_TIERS[1]
+    this._switching = false
     this.onFirstFrame = onFirstFrame || (() => {})
     this._firstFrameFired = false
     this.onStatus = onStatus || (() => {})
@@ -37,6 +48,14 @@ export class ScrcpyWebPlayer {
     this._downPos = null
     this._lastMove = 0
     this._lastWheel = 0
+    // 音频状态
+    this.audioDecoder = null
+    this.actx = null
+    this.gain = null
+    this.muted = false
+    this._audioDisabled = false
+    this._nextAudio = 0
+    this._audioMeta = null
     this._bindInput()
   }
 
@@ -49,28 +68,131 @@ export class ScrcpyWebPlayer {
 
   async start() {
     this.onStatus('正在建立投屏会话…')
-    const r = await apiPost('/api/stream/open?max_size=1280&bit_rate=4000000&fps=30' + this.openQuery, {})
+    try {
+      await this._openAndPump()
+    } catch (e) {
+      if (e.name !== 'AbortError' && this.running) this.onStatus('投屏中断：' + e.message, true)
+      this._finish()
+    }
+  }
+
+  // 建会话并拉流（start 与换挡重开共用）。拉流循环后台跑——_pump 直到流
+  // 断开才返回，若 await 它，换挡（setQuality）会永远挂起（UI 选择器卡死）。
+  // 代际守卫：旧 pump 结束时若已有新会话（gen 变化）不得误杀。
+  async _openAndPump() {
+    const gen = (this._pumpGen = (this._pumpGen || 0) + 1)
+    const t = this.tier
+    const r = await apiPost('/api/stream/open?max_size=' + t.max_size + '&bit_rate=' + t.bit_rate + '&fps=' + t.fps + this.openQuery, {})
     this.id = r.id
     this.devW = r.width || 0
     this.devH = r.height || 0
+    this._frames = 0
+    this.fps = 0
+    this._sessionAt = Date.now()
+    this._lastFrameAt = Date.now()
     this.running = true
-    this._statsTimer = setInterval(() => {
-      this.fps = this._frames
-      this._frames = 0
-      if (this.running)
-        this.onStatus(`投屏中 · 会话 #${this.id} · ${this.devW}×${this.devH} · ${this.fps} fps`)
-    }, 1000)
-    this.abort = new AbortController()
-    this._watchdog()
-    try {
-      const resp = await fetch(imgUrl(`/api/stream/${this.id}/video`), { signal: this.abort.signal })
-      if (!resp.ok) throw new Error(`视频流请求失败 (${resp.status})`)
-      this.onStatus(`投屏中 · 会话 #${this.id} · 等待首帧…`)
-      await this._pump(resp.body.getReader())
-    } catch (e) {
-      if (e.name !== 'AbortError' && this.running) this.onStatus('投屏中断：' + e.message, true)
+    window.__mwinePlayer = this  // 诊断钩子（自动化验证用）
+    if (!this._statsTimer) {
+      this._statsTimer = setInterval(() => this._onTick(), 1000)
     }
-    this._finish()
+    this.abort = new AbortController()
+    if (!this._wdTimer) this._watchdog()
+    const resp = await fetch(imgUrl(`/api/stream/${this.id}/video`), { signal: this.abort.signal })
+    if (!resp.ok) throw new Error(`视频流请求失败 (${resp.status})`)
+    this.onStatus(`投屏中 · ${this._tierLabel()} · 等待首帧…`)
+    this._pump(resp.body.getReader())
+      .catch(e => {
+        // 换挡主动中断不当作错误
+        if (e.name !== 'AbortError' && this.running) this.onStatus('投屏中断：' + e.message, true)
+      })
+      .then(() => {
+        if (gen === this._pumpGen && !this._switching && this.running) this._finish()
+      })
+  }
+
+  _tierLabel() {
+    return this.qualityPref === 'auto' ? `自动·${this.tier.label}` : this.tier.label
+  }
+
+  // 每秒：状态栏 + 自动档升降判断
+  _onTick() {
+    this.fps = this._frames
+    this._frames = 0
+    if (!this.running) return
+    this.onStatus(`投屏中 · ${this._tierLabel()} · ${this.devW}×${this.devH} · ${this.fps} fps`)
+    if (this.qualityPref !== 'auto' || this._switching || !this.id) return
+    const t = this.tier
+    const now = Date.now()
+    // 卡顿判定：帧率持续低于目标 55%；会话稳定 10s 后，连续 3s 完全无帧
+    // 也计入（深卡顿不能被「等待首帧」豁免吞掉）
+    const deep = this.fps === 0
+      && Date.now() - this._sessionAt > 10000
+      && Date.now() - this._lastFrameAt > 3000
+    if ((this.fps > 0 && this.fps < t.fps * 0.55) || deep) {
+      this._strikes = (this._strikes || 0) + 1
+    } else {
+      this._strikes = 0
+    }
+    if (now < (this._cooldownUntil || 0)) return
+    const idx = QUALITY_TIERS.indexOf(t)
+    if (this._strikes >= 5 && idx > 0) {
+      this._autoSwitch(idx - 1, `链路吃紧，自动降档 → ${QUALITY_TIERS[idx - 1].label}`)
+    } else if (this._strikes === 0 && this.fps >= t.fps * 0.92 && idx < QUALITY_TIERS.length - 1) {
+      this._stableSecs = (this._stableSecs || 0) + 1
+      if (this._stableSecs >= 60) this._autoSwitch(idx + 1, `链路富余，自动升档 → ${QUALITY_TIERS[idx + 1].label}`)
+    } else {
+      this._stableSecs = 0
+    }
+  }
+
+  async _autoSwitch(newIdx, reason) {
+    this._switching = true
+    this._strikes = 0
+    this._stableSecs = 0
+    this._cooldownUntil = Date.now() + 45000 // 冷却 45s 防来回抖
+    this.tier = QUALITY_TIERS[newIdx]
+    localStorage.setItem('mw_auto_tier', this.tier.key)
+    this.onStatus(reason + '，重建会话…')
+    await this._reopen()
+    this._switching = false
+  }
+
+  // 换挡重开：关旧会话 → 建新会话（canvas 与输入绑定保留，UI 不闪）
+  async _reopen() {
+    if (this.abort) { this.abort.abort(); this.abort = null }
+    if (this.id) {
+      const old = this.id
+      this.id = 0
+      try { await apiPost(`/api/stream/${old}/close`) } catch {}
+    }
+    if (this.decoder) { try { this.decoder.close() } catch {} this.decoder = null }
+    this.config = null
+    this.needsKey = true
+    try {
+      await this._openAndPump()
+    } catch (e) {
+      this.onStatus('换挡失败：' + e.message, true)
+      this._finish()
+    }
+  }
+
+  // 手动切档（外部 UI 调用；quality='auto' 或档位 key）
+  async setQuality(pref) {
+    this.qualityPref = pref
+    localStorage.setItem('mw_quality', pref)
+    if (pref !== 'auto') {
+      const t = QUALITY_TIERS.find(x => x.key === pref)
+      if (t && t !== this.tier) {
+        this.tier = t
+        localStorage.setItem('mw_auto_tier', t.key)
+      }
+    }
+    if (this.running) {
+      this._switching = true
+      this.onStatus(`已切 ${pref === 'auto' ? '自动·' + this.tier.label : this.tier.label}，重建会话…`)
+      await this._reopen()
+      this._switching = false
+    }
   }
 
   async stop() {
@@ -89,6 +211,8 @@ export class ScrcpyWebPlayer {
     clearInterval(this._statsTimer)
     clearInterval(this._wdTimer)
     if (this.decoder) { try { this.decoder.close() } catch {} this.decoder = null }
+    if (this.audioDecoder) { try { this.audioDecoder.close() } catch {} this.audioDecoder = null }
+    if (this.actx) { try { this.actx.close() } catch {} this.actx = null; this.gain = null }
     this.config = null
     this.needsKey = true
     this.onEnd()
@@ -127,6 +251,8 @@ export class ScrcpyWebPlayer {
       this.devH = dv.getUint32(4)
       return
     }
+    if (type === 5) { this._onAudioConfig(payload); return }
+    if (type === 6) { this._onAudioFrame(pts, payload); return }
     if (type === 0) {
       this.config = payload
       // SPS/PPS（config）到达即建解码器——黑屏兜底：delta 帧丢了才等关键帧
@@ -169,6 +295,96 @@ export class ScrcpyWebPlayer {
       this.decoder = null
       return false
     }
+  }
+
+  // ---- 音频（AAC；scrcpy config 包 = AudioSpecificConfig）----
+  _onAudioConfig(asc) {
+    if (!window.AudioDecoder) { this._audioDisabled = true; return }
+    // ASC 解析：AOT(5bit) sf_index(4bit) channel(4bit)
+    let sampleRate = 48000, channels = 2
+    try {
+      const b0 = asc[0], b1 = asc[1]
+      const sfIdx = ((b0 & 0x07) << 1) | (b1 >> 7)
+      channels = (b1 >> 3) & 0x07
+      sampleRate = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                    16000, 12000, 11025, 8000, 7350][sfIdx] || 48000
+    } catch {}
+    try {
+      if (this.audioDecoder) { try { this.audioDecoder.close() } catch {} }
+      this.audioDecoder = new AudioDecoder({
+        output: (ad) => this._playAudio(ad),
+        error: () => { this._audioDisabled = true },
+      })
+      this.audioDecoder.configure({
+        codec: 'mp4a.40.2',
+        sampleRate, numberOfChannels: channels,
+        description: asc,
+      })
+      this._audioMeta = { sampleRate, channels }
+      // AudioContext 需用户手势解锁——投屏由点击发起，这里补 resume 兜底
+      if (!this.actx) {
+        this.actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate })
+        this.gain = this.actx.createGain()
+        this.gain.gain.value = this.muted ? 0 : 1
+        this.gain.connect(this.actx.destination)
+      }
+      this.actx.resume().catch(() => {})
+    } catch {
+      this._audioDisabled = true
+    }
+  }
+
+  _onAudioFrame(pts, data) {
+    if (this._audioDisabled || !this.audioDecoder) return
+    try {
+      this.audioDecoder.decode(new EncodedAudioChunk({
+        type: 'key',
+        timestamp: Math.round(pts),
+        data,
+      }))
+    } catch { /* 忽略瞬时解码失败 */ }
+  }
+
+  // 解码输出 → AudioBufferSourceNode 顺序调度（追赶：积压超 0.5s 丢齐）
+  _playAudio(ad) {
+    if (!this.running || !this.actx) { ad.close(); return }
+    const { sampleRate, channels } = this._audioMeta || { sampleRate: 48000, channels: 2 }
+    const frames = ad.numberOfFrames
+    if (!frames) { ad.close(); return }
+    const buf = this.actx.createBuffer(channels, frames, sampleRate)
+    for (let ch = 0; ch < channels; ch++) {
+      // WebCodecs AAC 输出常见 f32-planar；按格式取交错/平面
+      try {
+        if (ad.format === 'f32-planar') {
+          const plane = new Float32Array(frames)
+          ad.copyTo(plane, { planeIndex: ch, frameCount: frames })
+          buf.copyToChannel(plane, ch)
+        } else {
+          const tmp = new Float32Array(frames * channels)
+          ad.copyTo(tmp, { format: 'f32', frameCount: frames })
+          const chData = new Float32Array(frames)
+          for (let i = 0; i < frames; i++) chData[i] = tmp[i * channels + ch]
+          buf.copyToChannel(chData, ch)
+        }
+      } catch {}
+    }
+    ad.close()
+    const t = this.actx.currentTime
+    if (this._nextAudio === undefined || this._nextAudio < t) {
+      this._nextAudio = Math.max(this._nextAudio || 0, t + 0.03)
+    }
+    if (this._nextAudio - t > 0.5) this._nextAudio = t + 0.03 // 追赶丢齐
+    const src = this.actx.createBufferSource()
+    src.buffer = buf
+    src.connect(this.gain)
+    src.start(this._nextAudio)
+    this._nextAudio += frames / sampleRate
+    this._audioPlayed = (this._audioPlayed || 0) + 1
+  }
+
+  setMuted(m) {
+    this.muted = !!m
+    if (this.gain) this.gain.gain.value = this.muted ? 0 : 1
   }
 
   _codecFromSps(data) {

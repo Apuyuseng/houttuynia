@@ -22,6 +22,14 @@ pub struct VideoPacket {
     pub data: Vec<u8>,
 }
 
+/// 音频包（config 包 = 编解码器特定配置，如 AAC 的 AudioSpecificConfig）
+#[derive(Debug, Clone)]
+pub struct AudioPacket {
+    pub pts: u64,
+    pub config: bool,
+    pub data: Vec<u8>,
+}
+
 fn err<T>(msg: impl Into<String>) -> AdbResult<T> {
     Err(adb::AdbError(msg.into()))
 }
@@ -40,6 +48,10 @@ pub fn find_server_jar() -> Option<String> {
     let mut cands: Vec<String> = vec![
         format!("{home}/.mwine/bin/scrcpy-server-v4.1"),
         format!("{home}/.mwine/bin/scrcpy-server-v4.0"),
+        // 开发树直跑（CWD=仓库根）：dist 内置 jar 优先于 homebrew 装的
+        // scrcpy-server（后者可能是旧版本——server/client 版本不匹配会
+        // 直接 IllegalArgumentException，曾致 Mac 本地开流恒超时）
+        "dist/Houttuynia.app/Contents/Resources/bin/scrcpy-server-v4.1".into(),
         "/opt/mwine/bin/scrcpy-server-v4.1".into(), // NAS Docker 镜像内置
         "/opt/homebrew/share/scrcpy/scrcpy-server".into(),
         "/usr/local/share/scrcpy/scrcpy-server".into(),
@@ -64,6 +76,9 @@ pub struct Session {
     pub codec: String,
     pub video: TcpStream,
     pub control: Option<TcpStream>,
+    /// 音频 socket（aac 等；设备不支持音频采集时 None——server 下发 codec id 0）
+    pub audio: Option<TcpStream>,
+    pub audio_codec: String,
     pub width: u32,
     pub height: u32,
     pub forward_port: u16,
@@ -166,6 +181,8 @@ pub struct StartParams {
     pub max_size: u32,
     pub bit_rate: u32,
     pub fps: u32,
+    /// 请求音频流（浏览器 WebCodecs 播放；设备不支持时自动回退纯视频）
+    pub audio: bool,
     /// 创建虚拟副屏（W, H, DPI）：应用独立窗口的基石（与 qemu 窗口模式无关，
     /// 无头下帧尺寸也正确——桌面版的 qemu multidisplay 在无头模式反而会信箱化）
     pub new_display: Option<(u32, u32, u32)>,
@@ -177,10 +194,16 @@ pub struct StartParams {
 pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     let remote = remote_jar_path();
     let local = std::fs::read(jar).map_err(|e| adb::AdbError(format!("读取 server jar: {e}")))?;
-    // 魅族 FlymeOS 会清理 /data/local/tmp 中被 app_process 引用的 CLASSPATH
-    // 文件（服务器进程被杀时连带回收）——不能假设 jar 常驻，每次都推
-    // （733KB 约 1-2s）。同尺寸跳过逻辑在系统清理面前不可靠。
-    adb::push_bytes(serial, &local, &remote)?;
+    // 魅族 FlymeOS / 部分 TV 会清理 /data/local/tmp 的 jar——用「远端 stat
+    // 尺寸一致则跳过」代替每次全量推：被清理时 stat 失败/尺寸不符照常重推，
+    // 而省电劣化链路（实测 RTT ~1s 的无线真机）上 733KB 推送是开流时延大头。
+    let remote_size = adb::shell_blocking(serial, &format!("stat -c %s {remote} 2>/dev/null"), 8000)
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o).trim().parse::<u64>().ok());
+    if remote_size != Some(local.len() as u64) {
+        tracing::info!("推送 scrcpy server jar（{}B，远端缺失/不符）", local.len());
+        adb::push_bytes(serial, &local, &remote)?;
+    }
 
     let scid: u32 = rand_scid();
     let socket_name = format!("scrcpy_{scid:08x}");
@@ -191,8 +214,16 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     adb::forward_abstract(serial, port, &socket_name)?;
 
     // 组装 server 命令行（与 toArgs 逐字段对齐；scid 双发是 fork 的既定怪癖）
+    // 音频编码：本产品镜像/常见 TV 的可用集里 AAC 浏览器兼容最好
+    //（WebCodecs mp4a.40.2 通用；opus 在部分 TV 缺编码器——TCL 实测只有
+    // aac/flac hybrid）。设备不支持音频采集时 server 会下发 disable 码。
+    let audio_args = if p.audio {
+        "audio=true audio_codec=aac audio_bit_rate=128000"
+    } else {
+        "audio=false"
+    };
     let mut args = format!(
-        "scid={scid:08x} log_level=info video=true audio=false control=true \
+        "scid={scid:08x} log_level=info video=true control=true {audio_args} \
          video_codec=h264 video_bit_rate={} max_size={} scid={scid:x} max_fps={} \
          stay_awake=true power_off_on_close=false keep_active=false show_touches=false \
          tunnel_forward=true clipboard_autosync=true",
@@ -243,7 +274,24 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
         }
     };
 
-    // control socket（server 在 video 后按序 accept；双 accept 完成才发设备名）
+    // audio socket（启用音频时；server 在 video 后按序 accept 它，再 control）
+    let audio = if p.audio {
+        let adeadline = Instant::now() + Duration::from_secs(15);
+        let mut a = None;
+        while Instant::now() < adeadline {
+            if let Ok(conn) = TcpStream::connect(("127.0.0.1", port)) {
+                conn.set_nodelay(true).ok();
+                a = Some(conn);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some(a.ok_or_else(|| adb::AdbError("audio socket 连接超时".into()))?)
+    } else {
+        None
+    };
+
+    // control socket（video/audio 之后；全部 accept 完成才发设备名）
     let control = {
         let cdeadline = Instant::now() + Duration::from_secs(15);
         let mut c = None;
@@ -280,6 +328,43 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     }
     .to_string();
 
+    // 音频流 meta：仅 4 字节 codec id（无 dummy/设备名——那些只在首个 socket）。
+    // id=0 设备禁用音频（静默回退纯视频）；id=1 配置错误（同样降级，不杀视频）
+    let mut audio = audio;
+    let mut audio_codec = String::new();
+    if let Some(mut a) = audio.take() {
+        let mut cid = [0u8; 4];
+        match read_exact(&mut a, &mut cid, 10000) {
+            Ok(true) => {
+                let id = u32::from_be_bytes(cid);
+                match id {
+                    0 | 1 => {
+                        tracing::warn!("设备侧音频不可用（disable 码 {id}），回退纯视频");
+                        let _ = a.shutdown(std::net::Shutdown::Both);
+                    }
+                    _ => {
+                        audio_codec = match &cid {
+                            b"\0aac" => "aac".into(),
+                            b"opus" => "opus".into(),
+                            b"flac" => "flac".into(),
+                            other => format!("unknown:{}", String::from_utf8_lossy(other)),
+                        };
+                        if audio_codec.starts_with("unknown") {
+                            tracing::warn!("未知音频 codec id {id:#x}，忽略音频流");
+                            let _ = a.shutdown(std::net::Shutdown::Both);
+                        } else {
+                            audio = Some(a);
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!("音频 codec id 读取失败，回退纯视频");
+                let _ = a.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
     // 副屏会话：建立后即下发 StartApp（应用直接落在该副屏）
     if let Some(app) = &p.start_app {
         if let Some(msg) = control::start_app(app) {
@@ -297,6 +382,8 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
         codec,
         video,
         control: Some(control),
+        audio,
+        audio_codec,
         width: 0,
         height: 0,
         forward_port: port,
@@ -448,5 +535,46 @@ pub mod control {
         out.push(b.len() as u8);
         out.extend_from_slice(b);
         Some(out)
+    }
+}
+
+
+// ===================== 音频流解复用（独立线程持有 socket） =====================
+
+/// 音频 socket 上的包读取器。协议（上游 Streamer.writePacket，与视频同构）：
+/// [u64 pts+flags（bit62=CONFIG）][u32 len][data]；流干净结束返回 Ok(None)。
+pub struct AudioDemuxer {
+    sock: TcpStream,
+}
+
+impl AudioDemuxer {
+    pub fn new(sock: TcpStream) -> Self {
+        AudioDemuxer { sock }
+    }
+
+    pub fn next_packet(&mut self) -> AdbResult<Option<AudioPacket>> {
+        let mut h8 = [0u8; 8];
+        match read_exact(&mut self.sock, &mut h8, 0) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let pts_flags = u64::from_be_bytes(h8);
+        let config = pts_flags & FLAG_CONFIG != 0;
+        let pts = pts_flags & !(FLAG_CONFIG | FLAG_KEYFRAME);
+        let mut l4 = [0u8; 4];
+        match read_exact(&mut self.sock, &mut l4, 0)? {
+            true => {}
+            false => return err("音频包长度前缀前 EOF"),
+        }
+        let len = u32::from_be_bytes(l4) as usize;
+        let mut data = vec![0u8; len];
+        if len > 0 {
+            match read_exact(&mut self.sock, &mut data, 0)? {
+                true => {}
+                false => return err("音频包中途 EOF"),
+            }
+        }
+        Ok(Some(AudioPacket { pts, config, data }))
     }
 }

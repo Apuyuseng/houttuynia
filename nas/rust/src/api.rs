@@ -56,6 +56,130 @@ pub async fn status(State(st): State<SharedState>) -> Json<Value> {
 
 // ===================== 性能 =====================
 
+/// 单设备性能+信息采样（SSE 顶栏与 /api/perf 共用）。
+/// 一次 shell 取 /proc 数据；电池/机型额外两发（机型按 serial 缓存）。
+pub fn dev_snapshot(st: &AppState, serial: &str) -> Value {
+    let mut out = json!({ "serial": serial });
+    if let Ok(o) = adb::shell_blocking(
+        serial,
+        "head -1 /proc/stat; grep -E 'MemTotal|MemAvailable' /proc/meminfo; cat /proc/uptime",
+        5000,
+    ) {
+        let text = String::from_utf8_lossy(&o);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() >= 4 {
+            // 按键名解析（kB→MB），不依赖行序
+            let mem_kb = |key: &str| -> u64 {
+                lines
+                    .iter()
+                    .find(|l| l.contains(key))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0)
+                    / 1024
+            };
+            let fields: Vec<u64> = lines[0]
+                .split_whitespace()
+                .filter_map(|t| t.parse::<u64>().ok())
+                .collect();
+            if fields.len() >= 4 {
+                let total: u64 = fields.iter().sum();
+                let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+                let busy = total - idle;
+                let mem_total_mb = mem_kb("MemTotal");
+                let avail_mb = mem_kb("MemAvailable");
+                let uptime: f64 = lines[3]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0.0);
+                // cpu% 差分（与全局 perf_last 状态共享）
+                let cpu_pct = {
+                    let mut last = st.perf_last.lock().unwrap();
+                    match *last {
+                        Some((lb, lt)) if total > lt && busy >= lb => {
+                            (busy - lb) as f64 * 100.0 / (total - lt) as f64
+                        }
+                        _ => 0.0,
+                    }
+                };
+                {
+                    let mut last = st.perf_last.lock().unwrap();
+                    *last = Some((busy, total));
+                }
+                out["cpu_pct"] = json!((cpu_pct * 10.0).round() / 10.0);
+                out["mem"] = json!({
+                    "total_mb": mem_total_mb,
+                    "available_mb": avail_mb,
+                });
+                out["uptime_s"] = json!(uptime as u64);
+            }
+        }
+    }
+    // 电池/温度（复用 device_info 的解析逻辑，单设备版）
+    if let Some(batt) = battery_of(serial) {
+        out["battery"] = batt;
+    }
+    // 机型（缓存——getprop 每次都查太浪费）
+    out["model"] = json!(model_of(serial));
+    out
+}
+
+/// 单设备电池信息（device_info 的单设备版）
+fn battery_of(serial: &str) -> Option<Value> {
+    let out = adb::shell_blocking(serial, "dumpsys battery", 6000).ok()?;
+    let text = String::from_utf8_lossy(&out);
+    let g = |k: &str| -> Option<i64> {
+        text.lines().find_map(|l| {
+            let l = l.trim();
+            l.starts_with(k).then(|| l[k.len()..].trim().parse().ok())?
+        })
+    };
+    let status_code = g("status:")?;
+    let status = match status_code {
+        2 => "charging",
+        3 => "discharging",
+        4 => "not_charging",
+        5 => "full",
+        _ => "unknown",
+    };
+    Some(json!({
+        "present": text.contains("present: true"),
+        "level": g("level:"),
+        "status": status,
+        "temp_c": g("temperature:").map(|t| t as f64 / 10.0),
+        "usb_powered": text.contains("USB powered: true"),
+    }))
+}
+
+/// 机型名缓存（"HONOR VNE-AN00" 式：manufacturer model）
+fn model_of(serial: &str) -> String {
+    static MODELS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(m) = MODELS.lock().unwrap().get(serial) {
+        return m.clone();
+    }
+    let m = adb::shell_blocking(
+        serial,
+        "getprop ro.product.manufacturer; getprop ro.product.model",
+        5000,
+    )
+    .ok()
+    .map(|o| {
+        let text = String::from_utf8_lossy(&o).to_string();
+        // 两行各取非空：manufacturer 可为空（TCL TV 实测只有 model）
+        let parts: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        match parts.as_slice() {
+            [a, b] => format!("{a} {b}"),
+            [a] => a.to_string(),
+            _ => serial.to_string(),
+        }
+    })
+    .unwrap_or_else(|| serial.to_string());
+    MODELS.lock().unwrap().insert(serial.to_string(), m.clone());
+    m
+}
+
 pub async fn perf(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
     let serial = match st.current_serial() {
         Some(s) => s,
@@ -654,7 +778,8 @@ pub async fn stream_open(
     } else {
         max_size
     };
-    let params = scrcpy::StartParams { max_size, bit_rate, fps, new_display, start_app };
+    // 音频始终请求：设备不支持时 server 下发 disable 码自动回退纯视频
+    let params = scrcpy::StartParams { max_size, bit_rate, fps, audio: true, new_display, start_app };
 
     // TV/大屏设备待机（Dreaming）时 scrcpy 抓的是黑缓冲——开流前先唤醒
     // （不影响手机：已亮屏的设备 wake_up 是 no-op；scrcpy stay_awake=true 接管保活）
@@ -677,6 +802,12 @@ pub async fn stream_open(
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let codec = session.codec.clone();
     let serial = session.serial.clone();
+
+    // 音频 socket 交给专用喂包线程（与视频线程并行读）
+    if let Some(audio_sock) = session.audio.take() {
+        let tx_audio = tx.clone();
+        std::thread::spawn(move || crate::scrcpy_audio_feeder(audio_sock, tx_audio));
+    }
 
     // 控制通道克隆用于 stop_fn
     let control = session.control.take().map(|c| Arc::new(Mutex::new(c)));
@@ -1114,11 +1245,21 @@ pub async fn devices_list(State(st): State<SharedState>) -> (StatusCode, Json<Va
                     })
                 })
                 .collect();
-            ok(json!({ "devices": arr }))
+            ok(json!({ "devices": arr, "known": crate::state::known_devices() }))
         }
         Ok(Err(e)) => err(500, e.to_string()),
         Err(e) => err(500, format!("设备列表失败: {e}")),
     }
+}
+
+/// POST /api/devices/known/remove {serial} —— 从历史连接记忆中遗忘
+pub async fn devices_known_remove(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let serial = v.get("serial").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if serial.is_empty() {
+        return err(400, "缺少 serial");
+    }
+    crate::state::forget_device(&serial);
+    ok(json!({ "ok": true }))
 }
 
 /// POST /api/devices/select {serial} —— 多设备在线时选定管理目标（持久化到 nas.json）
@@ -1138,6 +1279,181 @@ pub async fn devices_select(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
     }
     crate::state::set_selected_serial(&serial);
     ok(json!({ "ok": true, "serial": serial }))
+}
+
+// ===================== 设备信息（电量/温度） =====================
+
+/// GET /api/device/info —— 全部在线设备的电量/充电状态/电池温度/温区
+/// （TV 等无电池设备返回 present=false，前端显示供电状态）
+pub async fn device_info() -> (StatusCode, Json<Value>) {
+    let serials = state::online_real_devices();
+    let r = tokio::task::spawn_blocking(move || -> Value {
+        let mut map = serde_json::Map::new();
+        for serial in serials {
+            let out = adb::shell_blocking(
+                &serial,
+                "dumpsys battery; echo __TH__; \
+                 for z in /sys/class/thermal/thermal_zone*; do \
+                   t=$(cat $z/type 2>/dev/null); v=$(cat $z/temp 2>/dev/null); \
+                   [ -n \"$v\" ] && echo \"$t $v\"; done 2>/dev/null | head -6",
+                8000,
+            );
+            let text = match out {
+                Ok(o) => String::from_utf8_lossy(&o).to_string(),
+                Err(_) => continue,
+            };
+            let g = |k: &str| -> Option<i64> {
+                text.lines().find_map(|l| {
+                    let l = l.trim();
+                    l.starts_with(k).then(|| l[k.len()..].trim().parse().ok())?
+                })
+            };
+            let status_code = g("status:").unwrap_or(0);
+            let status = match status_code {
+                2 => "charging",
+                3 => "discharging",
+                4 => "not_charging",
+                5 => "full",
+                _ => "unknown",
+            };
+            let thermal: Vec<Value> = text
+                .split("__TH__")
+                .nth(1)
+                .map(|th| {
+                    th.lines()
+                        .filter_map(|l| {
+                            let mut it = l.trim().split(' ');
+                            let t = it.next()?.to_string();
+                            let v: i64 = it.next()?.parse().ok()?;
+                            Some(json!({ "type": t, "temp_c": v as f64 / 1000.0 }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            map.insert(
+                serial,
+                json!({
+                    // 电池温度单位 0.1°C
+                    "battery": {
+                        "present": text.contains("present: true"),
+                        "level": g("level:"),
+                        "status": status,
+                        "voltage_mv": g("voltage:"),
+                        "temp_c": g("temperature:").map(|t| t as f64 / 10.0),
+                        "usb_powered": text.contains("USB powered: true"),
+                        "ac_powered": text.contains("AC powered: true"),
+                    },
+                    "thermal": thermal,
+                }),
+            );
+        }
+        Value::Object(map)
+    })
+    .await;
+    match r {
+        Ok(v) => ok(v),
+        Err(e) => err(500, format!("设备信息失败: {e}")),
+    }
+}
+
+// ===================== 家长管控（防沉迷） =====================
+
+/// GET /api/guard?serial= —— 指定设备的管控配置 + 实时屏幕 + 今日用量 + 近 30 天历史 + 事件；
+/// 附全部在线设备清单（各设备独立管控，供前端切换）
+pub async fn guard_get(
+    State(st): State<SharedState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    let serial = match q.get("serial").filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => match st.current_serial() {
+            Some(s) => s,
+            None => return err(503, "Android 未连接"),
+        },
+    };
+    let cfg = crate::guard::cfg_get(&serial);
+    let probe_serial = serial.clone();
+    let probe = tokio::task::spawn_blocking(move || crate::guard::probe(&probe_serial)).await;
+    let (today, _minute) = crate::guard::local_today_minute();
+    let screen = match probe {
+        Ok(Ok(p)) => json!({ "on": p.screen_on, "wakefulness": p.wakefulness, "foreground": p.foreground }),
+        _ => json!(null),
+    };
+    let history: Vec<Value> = crate::guard::usage_history(&serial, 30)
+        .into_iter()
+        .map(|(d, m)| json!({ "date": d, "min": m }))
+        .collect();
+    // 各在线设备的管控状态一览（不在线的设备配置仍在，但不执行）
+    let devices: Vec<Value> = crate::state::online_real_devices()
+        .into_iter()
+        .map(|s| {
+            let c = crate::guard::cfg_get(&s);
+            json!({ "serial": s, "enabled": c.enabled, "current": s == serial })
+        })
+        .collect();
+    let last_check = crate::guard::LAST_CHECK
+        .lock()
+        .unwrap()
+        .get(&serial)
+        .copied();
+    ok(json!({
+        "serial": serial,
+        "enabled": cfg.enabled,
+        "windows": cfg.windows,
+        "daily_limit_min": cfg.daily_limit_min,
+        "blocked_apps": cfg.blocked_apps,
+        "block_internet": cfg.block_internet,
+        "today_used_min": crate::guard::usage_secs(&serial, &today) / 60,
+        "in_window": crate::guard::in_window_now(&cfg.windows),
+        "screen": screen,
+        "last_check_ms": last_check,
+        "usage_history": history,
+        "devices": devices,
+        "events": crate::guard::events_recent(&serial, 50),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct GuardSetReq {
+    #[serde(default)]
+    pub serial: Option<String>,
+    #[serde(flatten)]
+    pub cfg: crate::guard::GuardCfg,
+}
+
+/// POST /api/guard —— 更新指定设备（缺省当前设备）的管控配置；
+/// 设备离线时仅保存（上线后巡检会补执行外网封禁）
+pub async fn guard_set(
+    State(st): State<SharedState>,
+    Json(v): Json<GuardSetReq>,
+) -> (StatusCode, Json<Value>) {
+    let serial = match v.serial.clone().filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => match st.current_serial() {
+            Some(s) => s,
+            None => return err(503, "Android 未连接"),
+        },
+    };
+    if !serial.chars().all(|c| c.is_ascii_alphanumeric() || ".:-_".contains(c)) {
+        return err(400, "serial 非法");
+    }
+    for w in &v.cfg.windows {
+        if !w.contains('-') || w.len() != 11 {
+            return err(400, format!("时段格式应为 HH:MM-HH:MM：{w}"));
+        }
+    }
+    let online = crate::state::online_real_devices();
+    let is_online = online.iter().any(|s| s == &serial);
+    let cfg = crate::guard::cfg_set(&serial, &v.cfg, is_online);
+    ok(json!({
+        "ok": true,
+        "serial": serial,
+        "enabled": cfg.enabled,
+        "windows": cfg.windows,
+        "daily_limit_min": cfg.daily_limit_min,
+        "blocked_apps": cfg.blocked_apps,
+        "block_internet": cfg.block_internet,
+    }))
 }
 
 /// POST /api/devices/pair {host, port, code, connect_port?}
@@ -1182,9 +1498,13 @@ pub async fn devices_connect(Json(v): Json<Value>) -> (StatusCode, Json<Value>) 
     if addr.is_empty() || !addr.contains(':') {
         return err(400, "addr 须为 IP:端口");
     }
+    let addr_for_memory = addr.clone();
     let r = tokio::task::spawn_blocking(move || adb::adb_connect(&addr)).await;
     match r {
-        Ok(Ok(_)) => ok(json!({ "ok": true })),
+        Ok(Ok(_)) => {
+            state::remember_device(&addr_for_memory); // 回连记忆（容器内 adb 重启后自动恢复）
+            ok(json!({ "ok": true }))
+        }
         Ok(Err(e)) => err(500, e.to_string()),
         Err(e) => err(500, format!("连接失败: {e}")),
     }
@@ -1247,14 +1567,28 @@ pub async fn events_status(
     tokio::spawn(async move {
         let mut last = String::new();
         loop {
-            let body = status(State(st.clone())).await.0.to_string();
+            // 基础状态 + 当前设备快照（机型/CPU/内存/电量/温度/运行时长）。
+            // cpu 每轮几乎必变 → 实际按巡检周期（3s）推新；无设备时退化为纯状态。
+            let mut body = status(State(st.clone())).await.0;
+            if let Some(serial) = st.current_serial() {
+                let st2 = st.clone();
+                let snap = tokio::task::spawn_blocking(move || dev_snapshot(&st2, &serial)).await;
+                if let Ok(v) = snap {
+                    if let (Some(o), Some(v2)) = (body.as_object_mut(), v.as_object()) {
+                        for (k, val) in v2 {
+                            o.insert(k.clone(), val.clone());
+                        }
+                    }
+                }
+            }
+            let body = body.to_string();
             if body != last {
                 last = body.clone();
                 if tx.send(Ok(SseEvent::default().data(body))).await.is_err() {
                     return;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
     Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))

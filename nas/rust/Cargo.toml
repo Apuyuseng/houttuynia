@@ -16,8 +16,6 @@ futures-util = "0.3"
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 qrcode = { version = "0.14", default-features = false }
-# rustls 替代 native-tls：交叉编译（aarch64 musl 静态）零 C 依赖openssl
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 tracing = "0.1"
@@ -32,6 +30,8 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"]
 # 网关自带 HTTPS（WebCodecs 投屏需要安全上下文）；
 # no-provider 变体：不引入 aws-lc-rs（cmake 链，musl/zig 交叉编不过），统一走 ring
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+# 家长管控存储（配置/用量统计/事件；事务化防崩溃损坏，bundled 零系统依赖）
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [profile.release]
 lto = true

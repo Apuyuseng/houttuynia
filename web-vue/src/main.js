@@ -14,6 +14,8 @@ const routes = [
   { path: '/devices', name: 'devices', component: () => import('./views/Devices.vue'), meta: { title: '真机连接' } },
   { path: '/store', name: 'store', component: () => import('./views/Store.vue'), meta: { title: '在线商店' } },
   { path: '/terminal', name: 'terminal', component: () => import('./views/Terminal.vue'), meta: { title: 'ADB 终端' } },
+  { path: '/guard', name: 'guard', component: () => import('./views/Guard.vue'), meta: { title: '家长管控' } },
+  { path: '/files', name: 'files', component: () => import('./views/Files.vue'), meta: { title: '文件' } },
   { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },
 ]
 

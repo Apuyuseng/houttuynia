@@ -6,6 +6,12 @@
     <!-- Android 13+ 通知运行时权限；targetSdk 为 legacy 时默认已授予，
          声明后用户在系统设置中可见、pm grant 也可控 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 壁纸导出直写 /sdcard（A11+ scoped storage）；授权走网关 appops set，
+         无需用户点弹窗 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- A12+ WallpaperManager.getDrawable 需要读存储权限（网关 pm grant） -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
     <application
         android:label="mwine bridge"

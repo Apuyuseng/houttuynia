@@ -509,14 +509,8 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
     // APK 提取是下下策（无线真机上拉包慢），只对商店没有的应用（系统/TV 自带）启用。
     let slot = (pkg.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize))) % ICON_SLOTS.len();
     let _guard = ICON_SLOTS[slot].lock().unwrap();
-    // 通道 1：在线商店包名查询（豌豆荚 → 应用宝；一次 HTTP 出图标 + 落缓存）
-    if let Some((icon, mime)) =
-        icon_from_wandoujia(pkg).or_else(|| icon_from_yingyongbao(pkg))
-    {
-        let ext = if mime == "image/png" { "png" } else { "webp" };
-        let _ = std::fs::write(dir.join(format!("{pkg}.{ext}")), &icon);
-        return Ok((icon, mime));
-    }
+    // 单一通道：Android 系统提取（APK 内图标资源），无任何在线查询
+    //（在线商店源已按用户要求全部移除，规避版权纠纷）
     // 通道 2（下下策）：APK 提取。pm path → 区间读取 → 兜底整拉
     let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 30000)
         .map_err(|e| adb::AdbError(e.to_string()))?;
@@ -544,7 +538,7 @@ pub fn app_icon(serial: &str, pkg: &str) -> AdbResult<(Vec<u8>, &'static str)> {
         }
     }
     let _ = std::fs::write(dir.join(format!("{pkg}.noicon")), b"");
-    err("在线商店与 APK 提取均无可用图标")
+    err("APK 内无可提取图标")
 }
 
 // ---------------- 应用标签 ----------------
@@ -643,6 +637,36 @@ fn wallpaper_stamp(serial: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).trim().to_string())
 }
 
+/// session 安装（等价 adb install：create → write(-S, 设备侧 stdin 重定向) →
+/// commit）。单文件 `pm install <path>` 会被部分 TV 的包校验器拒（TCL 实测
+/// INSTALL_FAILED_VERIFICATION_FAILURE），session 流走 adb install 同路径。
+fn session_install(serial: &str, remote: &str, size: usize) -> AdbResult<()> {
+    let out = adb::shell_blocking(serial, "pm install-create -r", 15000)?;
+    let sid = String::from_utf8_lossy(&out)
+        .trim()
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .unwrap_or("")
+        .to_string();
+    if sid.is_empty() {
+        return err("pm install-create 无 session id");
+    }
+    let out = adb::shell_blocking(
+        serial,
+        &format!("pm install-write -S {size} {sid} base - < '{remote}'"),
+        60000,
+    )?;
+    if !String::from_utf8_lossy(&out).contains("Success") {
+        return err(format!("install-write 失败: {}", String::from_utf8_lossy(&out).trim()));
+    }
+    let out = adb::shell_blocking(serial, &format!("pm install-commit {sid}"), 60000)?;
+    if !String::from_utf8_lossy(&out).contains("Success") {
+        return err(format!("install-commit 失败: {}", String::from_utf8_lossy(&out).trim()));
+    }
+    Ok(())
+}
+
 /// 设备壁纸（带指纹缓存）。多通道：userdebug 直接读系统文件；否则走
 /// companion 桥应用导出（桌面版同协议）；都没有 → Err（前端用渐变兜底）。
 pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
@@ -657,6 +681,18 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
                 return Ok((bytes, "cache"));
             }
         }
+    } else {
+        // 非 root 设备 stat 不了 wallpaper_info.xml（stamp 空）——按 stamp_file
+        // mtime 走 1 小时 TTL 缓存，否则每轮都重走桥（实测 4.4s/次）
+        if let (Ok(m), Ok(bytes)) = (std::fs::metadata(&stamp_file), std::fs::read(&cache)) {
+            if let Ok(age) = m.modified().map(|t| std::time::SystemTime::now().duration_since(t)) {
+                if let Ok(d) = age {
+                    if d.as_secs() < 3600 && !bytes.is_empty() {
+                        return Ok((bytes, "cache"));
+                    }
+                }
+            }
+        }
     }
     // 通道 1：userdebug 镜像 root 直读
     if let Ok(bytes) =
@@ -668,8 +704,10 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
             return Ok((bytes, "direct"));
         }
     }
-    // 通道 2：companion 桥导出（对齐 iconfetch --wallpaper 协议）；
-    // 桥缺失时按需自动装配（桌面版同样在首用时装桥）
+    // 通道 2：companion 桥导出（app 进程内读 WallpaperManager——免 root）。
+    // 桥缺失时 session 自动装配；A12+ 需 pm grant 读存储（getDrawable 校验）
+    // + appops MANAGE_EXTERNAL_STORAGE（/sdcard 直写）。落点 /sdcard/mwine/
+    // （shell 可读——A11+ scoped storage 挡的正是应用外部私有目录）。
     let bridge = adb::shell_blocking(serial, "pm list packages com.mwine.bridge", 8000)
         .map(|o| String::from_utf8_lossy(&o).contains("com.mwine.bridge"))
         .unwrap_or(false);
@@ -677,25 +715,42 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
         if let Some(apk) = find_bridge_apk() {
             if let Ok(bytes) = std::fs::read(&apk) {
                 let remote = "/data/local/tmp/mwine-bridge.apk";
-                if adb::push_bytes(serial, &bytes, remote).is_ok() {
-                    let _ = adb::shell_blocking(serial, &format!("pm install -r '{remote}'"), 120000);
-                    let _ = adb::shell_blocking(serial, &format!("rm -f '{remote}'"), 10000);
+                // 尺寸一致跳过推送（省电劣化链路上省 RTT；被系统清理时重推）
+                let rsize = adb::shell_blocking(
+                    serial,
+                    &format!("stat -c %s '{remote}' 2>/dev/null"),
+                    5000,
+                )
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o).trim().parse::<u64>().ok());
+                if rsize != Some(bytes.len() as u64) {
+                    adb::push_bytes(serial, &bytes, remote)?;
+                }
+                match session_install(serial, remote, bytes.len()) {
+                    Ok(_) => tracing::info!("companion 桥安装成功"),
+                    Err(e) => tracing::warn!("companion 桥安装失败（回退截图）: {e}"),
                 }
             }
         }
     }
-    let bridge = bridge || adb::shell_blocking(serial, "pm list packages com.mwine.bridge", 8000)
+    let bridge = adb::shell_blocking(serial, "pm list packages com.mwine.bridge", 8000)
         .map(|o| String::from_utf8_lossy(&o).contains("com.mwine.bridge"))
         .unwrap_or(false);
     if bridge {
+        let _ = adb::shell_blocking(
+            serial,
+            "pm grant com.mwine.bridge android.permission.READ_EXTERNAL_STORAGE;              pm grant com.mwine.bridge android.permission.WRITE_EXTERNAL_STORAGE;              appops set --user 0 com.mwine.bridge MANAGE_EXTERNAL_STORAGE allow",
+            8000,
+        );
         // 对齐 iconfetch fetchViaBridge：先解冻（新装应用 stopped 态收不到
         // 广播）+ 显式组件广播（隐式会被系统拦）+ 等文件出现
-        let dev_path = "/sdcard/Android/data/com.mwine.bridge/files/wallpaper.png";
+        let new_path = "/sdcard/mwine/wallpaper.png";
+        let old_path = "/sdcard/Android/data/com.mwine.bridge/files/wallpaper.png";
         let _ = adb::shell_blocking(
             serial,
             &format!(
                 "am start -n com.mwine.bridge/.UnlockActivity; \
-                 rm -f '{dev_path}'; \
+                 rm -f '{new_path}' '{old_path}'; \
                  am broadcast -n com.mwine.bridge/.WallpaperReceiver \
                  -a com.mwine.bridge.EXPORT_WALLPAPER --es out wallpaper.png --ei maxDim 1080"
             ),
@@ -703,16 +758,27 @@ pub fn wallpaper(serial: &str) -> AdbResult<(Vec<u8>, &'static str)> {
         );
         std::thread::sleep(std::time::Duration::from_millis(1500));
         for _ in 0..5 {
-            if let Ok(bytes) = adb::pull_file(serial, dev_path, 32 * 1024 * 1024) {
-                if bytes.len() > 1024 && &bytes[..4] == b"\x89PNG" {
-                    let _ = std::fs::write(&cache, &bytes);
-                    let _ = std::fs::write(&stamp_file, &stamp);
-                    return Ok((bytes, "bridge"));
+            for dev_path in [new_path, old_path] {
+                if let Ok(bytes) = adb::pull_file(serial, dev_path, 32 * 1024 * 1024) {
+                    if bytes.len() > 1024 && &bytes[..4] == b"\x89PNG" {
+                        let _ = adb::shell_blocking(
+                            serial,
+                            &format!("rm -f '{new_path}'"),
+                            5000,
+                        );
+                        let _ = std::fs::write(&cache, &bytes);
+                        let _ = std::fs::write(&stamp_file, &stamp);
+                        return Ok((bytes, "bridge"));
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        let _ = adb::shell_blocking(serial, &format!("rm -f '{dev_path}'"), 5000);
+        let _ = adb::shell_blocking(
+            serial,
+            &format!("rm -f '{new_path}' '{old_path}'"),
+            5000,
+        );
     }
     // 通道 3：主屏截图（前端 CSS 高斯模糊后视觉等同氛围壁纸）
     if let Ok(bytes) = adb::shell_blocking(serial, "screencap -p", 15000) {
@@ -740,107 +806,6 @@ fn find_bridge_apk() -> Option<String> {
     cands.into_iter().find(|p| std::path::Path::new(p).is_file())
 }
 
-/// 豌豆荚应用详情页按包名取图标（itemprop="image" 的 img src）。
-/// 对齐桌面版 wandoujia 商店的图标来源（android-artworks CDN）。
-pub fn icon_from_wandoujia(pkg: &str) -> Option<(Vec<u8>, &'static str)> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .build()
-        .ok()?;
-    let resp = client
-        .get(format!("https://www.wandoujia.com/apps/{pkg}"))
-        .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None; // 404 页无图标；且防错误页推荐位图张冠李戴
-    }
-    let page = resp.text().ok()?;
-    // 找 itemprop="image" 的 img 的 src
-    let mut idx = 0;
-    let icon_url = loop {
-        let Some(img) = page[idx..].find("<img").map(|o| idx + o) else { return None };
-        let end = page[img..].find('>').map(|e| img + e).unwrap_or(page.len() - 1);
-        let tag = &page[img..end];
-        if tag.contains("itemprop=\"image\"") {
-            if let Some(s0) = tag.find("src=\"") {
-                let rest = &tag[s0 + 5..];
-                if let Some(e0) = rest.find('"') {
-                    let u = &rest[..e0];
-                    let full = if u.starts_with("//") {
-                        format!("https:{u}")
-                    } else {
-                        u.to_string()
-                    };
-                    break full;
-                }
-            }
-        }
-        idx = end + 1;
-        if idx >= page.len() { return None }
-    };
-    let bytes = client.get(&icon_url).send().ok()?.bytes().ok()?.to_vec();
-    if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
-        Some((bytes, "image/png"))
-    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some((bytes, "image/webp"))
-    } else if bytes.len() > 3 && &bytes[..3] == b"\xff\xd8\xff" {
-        Some((bytes, "image/jpeg"))
-    } else {
-        None
-    }
-}
-
-/// 应用宝详情页按包名取图标：页内第一张 class 含 GameIcon_icon 的 img
-/// 即应用自身图标（pp.myapp.com CDN，/256 = 256px）。覆盖电视端应用
-/// （云视听/芒果 TV 等）豌豆荚没有的场景。
-pub fn icon_from_yingyongbao(pkg: &str) -> Option<(Vec<u8>, &'static str)> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .build()
-        .ok()?;
-    let resp = client
-        .get(format!("https://sj.qq.com/appdetail/{pkg}"))
-        .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None; // 404 页含推荐应用图标，必须拦掉防张冠李戴
-    }
-    let page = resp.text().ok()?;
-    let mut idx = 0;
-    let icon_url = loop {
-        let Some(img) = page[idx..].find("<img").map(|o| idx + o) else { return None };
-        let end = page[img..].find('>').map(|e| img + e).unwrap_or(page.len() - 1);
-        let tag = &page[img..end];
-        if tag.contains("GameIcon_icon") {
-            if let Some(s0) = tag.find("src=\"") {
-                let rest = &tag[s0 + 5..];
-                if let Some(e0) = rest.find('"') {
-                    let u = &rest[..e0];
-                    if u.contains("pp.myapp.com/ma_icon") {
-                        break u.to_string();
-                    }
-                }
-            }
-        }
-        idx = end + 1;
-        if idx >= page.len() {
-            return None;
-        }
-    };
-    let bytes = client.get(&icon_url).send().ok()?.bytes().ok()?.to_vec();
-    if bytes.len() > 8 && &bytes[..4] == b"\x89PNG" {
-        Some((bytes, "image/png"))
-    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some((bytes, "image/webp"))
-    } else if bytes.len() > 3 && &bytes[..3] == b"\xff\xd8\xff" {
-        Some((bytes, "image/jpeg"))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     /// 真机抓回的混淆/特殊 APK 样本（/tmp/apktest，无样本时跳过）：
@@ -862,22 +827,5 @@ mod tests {
         if checked == 0 {
             println!("无本地 APK 样本，跳过");
         }
-    }
-}
-
-
-
-
-#[cfg(test)]
-mod online_tests {
-    /// rustls TLS 实测：豌豆荚 + 应用宝在线图标源（需联网）
-    #[test]
-    fn online_icon_sources() {
-        let r = super::icon_from_wandoujia("com.tencent.mm");
-        println!("wandoujia mm: {:?}", r.as_ref().map(|(d, m)| (d.len(), m)));
-        let r2 = super::icon_from_yingyongbao("com.tencent.qqmusictv");
-        println!("yingyongbao qqmusictv: {:?}", r2.as_ref().map(|(d, m)| (d.len(), m)));
-        assert!(r.is_some(), "豌豆荚应取到微信图标");
-        assert!(r2.is_some(), "应用宝应取到QQ音乐图标");
     }
 }

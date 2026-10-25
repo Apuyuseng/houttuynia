@@ -963,3 +963,164 @@ fn local_ip() -> std::io::Result<String> {
 fn broadcast_of(ip: &str) -> Option<String> {
     ip.rsplitn(2, '.').nth(1).map(|p| format!("{p}.255"))
 }
+
+// ===================== 文件管理器：流式传输原语 =====================
+
+/// 流式拉取：sync STAT 取尺寸后 RECV 循环，DATA 块经 channel 推给消费方
+/// （不整包缓冲——大文件下载内存恒定）。返回文件尺寸（Content-Length 用）。
+/// 由 spawn_blocking 线程调用（内部用 blocking_send）。
+pub fn pull_stream(
+    serial: &str,
+    remote: &str,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> AdbResult<u64> {
+    let mut c = SmartConn::connect(5000)?;
+    c.transport(serial)?;
+    c.service("sync:")?;
+    // STAT 尺寸
+    let mut hdr = Vec::with_capacity(8 + remote.len());
+    hdr.extend_from_slice(b"STAT");
+    hdr.extend_from_slice(&(remote.len() as u32).to_le_bytes());
+    c.write_all(&hdr)?;
+    c.write_all(remote.as_bytes())?;
+    let st = c.read_exact_timeout(4, 10000)?;
+    if &st[..] != b"STAT" {
+        return err(format!("STAT 应答异常: {}", String::from_utf8_lossy(&st)));
+    }
+    let stbuf = c.read_exact_timeout(12, 10000)?;
+    let size = u32::from_le_bytes([stbuf[4], stbuf[5], stbuf[6], stbuf[7]]) as u64;
+    // RECV 循环
+    let mut rq = Vec::with_capacity(8 + remote.len());
+    rq.extend_from_slice(b"RECV");
+    rq.extend_from_slice(&(remote.len() as u32).to_le_bytes());
+    c.write_all(&rq)?;
+    c.write_all(remote.as_bytes())?;
+    let mut got: u64 = 0;
+    loop {
+        let id = c.read_exact_timeout(4, 30000)?;
+        let lenb = c.read_exact_timeout(4, 10000)?;
+        let len = u32::from_le_bytes([lenb[0], lenb[1], lenb[2], lenb[3]]) as usize;
+        match &id[..] {
+            b"DATA" => {
+                let chunk = c.read_exact_timeout(len, 60000)?;
+                got += len as u64;
+                if tx.blocking_send(chunk).is_err() {
+                    return err("下载客户端已断开");
+                }
+            }
+            b"DONE" => break,
+            b"FAIL" => {
+                let msg = c.read_exact_timeout(len.min(4096), 10000)?;
+                return err(format!("pull FAIL: {}", String::from_utf8_lossy(&msg).trim()));
+            }
+            other => return err(format!("sync RECV 异常: {}", String::from_utf8_lossy(other))),
+        }
+    }
+    if size == 0 {
+        Ok(got) // 空文件 STAT 报 0，以实际收到的为准
+    } else {
+        Ok(size)
+    }
+}
+
+/// 流式推送（sync SEND/DATA/DONE 的增量版——不整包缓冲，上传内存恒定）。
+pub struct SyncPush {
+    c: SmartConn,
+    buf: Vec<u8>,
+}
+
+impl SyncPush {
+    pub fn start(serial: &str, remote: &str) -> AdbResult<Self> {
+        let mut c = SmartConn::connect(5000)?;
+        c.transport(serial)?;
+        c.service("sync:")?;
+        let path_mode = format!("{remote},420"); // 0644
+        let mut hdr = Vec::with_capacity(8 + path_mode.len());
+        hdr.extend_from_slice(b"SEND");
+        hdr.extend_from_slice(&(path_mode.len() as u32).to_le_bytes());
+        c.write_all(&hdr)?;
+        c.write_all(path_mode.as_bytes())?;
+        Ok(SyncPush { c, buf: Vec::with_capacity(65536) })
+    }
+
+    /// 追加数据（自动按 ≤64KB DATA 帧发出，保留尾巴等后续拼帧）
+    pub fn write(&mut self, data: &[u8]) -> AdbResult<()> {
+        self.buf.extend_from_slice(data);
+        while self.buf.len() >= 65536 {
+            let chunk: Vec<u8> = self.buf.drain(..65536).collect();
+            let mut dh = Vec::with_capacity(8);
+            dh.extend_from_slice(b"DATA");
+            dh.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            self.c.write_all(&dh)?;
+            self.c.write_all(&chunk)?;
+        }
+        Ok(())
+    }
+
+    /// 收尾：剩余数据 + DONE + 等待设备侧 OKAY
+    pub fn finish(mut self) -> AdbResult<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            let mut dh = Vec::with_capacity(8);
+            dh.extend_from_slice(b"DATA");
+            dh.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            self.c.write_all(&dh)?;
+            self.c.write_all(&chunk)?;
+        }
+        let mtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let mut done = Vec::with_capacity(8);
+        done.extend_from_slice(b"DONE");
+        done.extend_from_slice(&mtime.to_le_bytes());
+        self.c.write_all(&done)?;
+        let st = self.c.read_exact_timeout(4, 30000)?;
+        match &st[..] {
+            b"OKAY" => Ok(()),
+            b"FAIL" => {
+                let lenb = self.c.read_exact_timeout(4, 10000)?;
+                let len = u32::from_le_bytes([lenb[0], lenb[1], lenb[2], lenb[3]]) as usize;
+                let msg = self.c.read_exact_timeout(len.min(4096), 10000)?;
+                err(format!("push FAIL: {}", String::from_utf8_lossy(&msg).trim()))
+            }
+            other => err(format!("sync 应答异常: {}", String::from_utf8_lossy(other))),
+        }
+    }
+}
+
+// ===================== USB 自愈（容器化 adb 的热插拔兜底） =====================
+
+/// /sys 总线上是否存在 ADB 接口（Class=ff SubClass=42 Protocol=01）。
+/// sysfs 是内核全局视图，容器内无需额外挂载即可读。
+pub fn usb_adb_iface_present() -> bool {
+    let rd = match std::fs::read_dir("/sys/bus/usb/devices") {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.contains(':') {
+            continue; // 接口目录形如 1-2:1.2
+        }
+        let base = format!("{}/", e.path().display());
+        let sc = std::fs::read_to_string(format!("{base}bInterfaceSubClass"))
+            .unwrap_or_default();
+        let pp = std::fs::read_to_string(format!("{base}bInterfaceProtocol"))
+            .unwrap_or_default();
+        if sc.trim() == "42" && pp.trim() == "01" {
+            return true;
+        }
+    }
+    false
+}
+
+/// 协议级重启本机 adb server：host:kill 关闭 5037 上的 server（无论它是
+/// 容器自己的还是外部进程占用端口），再由 ensure_server 拉起本容器的并
+/// 重扫 USB。宿主机零操作。
+pub fn restart_server() -> AdbResult<()> {
+    let mut c = SmartConn::connect(1500)?;
+    let _ = c.service("host:kill"); // server 应答 OKAY 后自行退出
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    ensure_server()
+}

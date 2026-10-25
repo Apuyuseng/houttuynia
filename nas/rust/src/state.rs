@@ -129,6 +129,49 @@ pub fn gwcfg_save(v: &Value) -> std::io::Result<()> {
     std::fs::write(path, serde_json::to_string_pretty(v)?)
 }
 
+/// 手动连接过的无线设备（回连记忆；nas.json "known_devices"）
+pub fn known_devices() -> Vec<String> {
+    gwcfg_load()
+        .get("known_devices")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// 从历史连接记忆中移除（用户主动遗忘）
+pub fn forget_device(serial: &str) {
+    let mut v = gwcfg_load();
+    let list: Vec<String> = v
+        .get("known_devices")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let kept: Vec<String> = list.into_iter().filter(|s| s != serial).collect();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("known_devices".into(), json!(kept));
+    }
+    let _ = gwcfg_save(&v);
+}
+
+pub fn remember_device(serial: &str) {
+    if serial.is_empty() {
+        return;
+    }
+    let mut v = gwcfg_load();
+    let mut list: Vec<String> = v
+        .get("known_devices")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if !list.iter().any(|s| s == serial) {
+        list.push(serial.to_string());
+        if let Some(o) = v.as_object_mut() {
+            o.insert("known_devices".into(), json!(list));
+        }
+        let _ = gwcfg_save(&v);
+    }
+}
+
 /// 用户选定的管理目标设备（真机模式多设备在线时用；nas.json "device_serial"）
 pub fn selected_serial() -> Option<String> {
     gwcfg_load()

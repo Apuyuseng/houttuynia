@@ -99,7 +99,7 @@ import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiGet, apiPost, fmtBytes } from '../api'
 
-const sources = ref([{ id: 'fdroid', name: 'F-Droid' }, { id: 'wandoujia', name: '豌豆荚' }])
+const sources = ref([{ id: 'fdroid', name: 'F-Droid' }])
 const source = ref('fdroid')
 const q = ref('')
 const list = ref([])
