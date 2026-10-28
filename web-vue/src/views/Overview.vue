@@ -145,7 +145,7 @@ let player = null
 
 const memUsed = computed(() => (perf.value.mem?.total_mb || 0) - (perf.value.mem?.available_mb || 0))
 const memPct = computed(() => perf.value.mem?.total_mb ? memUsed.value * 100 / perf.value.mem.total_mb : 0)
-const gaugeColor = (p) => p > 85 ? '#f87171' : p > 65 ? '#fbbf24' : '#4ade80'
+const gaugeColor = (p) => p > 85 ? '#f28b82' : p > 65 ? '#fdd663' : '#81c995'
 
 async function refreshPerf() {
   if (streaming.value) return

@@ -200,7 +200,15 @@ export class ScrcpyWebPlayer {
     this.running = false
     if (this.abort) this.abort.abort()
     if (this.id) {
-      try { await apiPost(`/api/stream/${this.id}/close`) } catch {}
+      // close 请求 3s 超时兜底：设备侧会话销毁可能挂起（慢链路/桥重建），
+      // 不能让 UI 的关闭/切档流程被它卡死（后端会话由服务端空闲回收兜底）
+      const id = this.id
+      try {
+        await Promise.race([
+          apiPost(`/api/stream/${id}/close`),
+          new Promise(r => setTimeout(r, 3000)),
+        ])
+      } catch {}
     }
     this._finish()
   }

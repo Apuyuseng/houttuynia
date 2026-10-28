@@ -32,6 +32,15 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"]
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 # 家长管控存储（配置/用量统计/事件；事务化防崩溃损坏，bundled 零系统依赖）
 rusqlite = { version = "0.31", features = ["bundled"] }
+# 集成 ADB 传输层：USB 设备 AUTH 签名（RSASSA-PKCS1v15-SHA1，与 adbd 协议一致）
+rsa = { version = "0.9.7", features = ["sha2"] }
+sha1 = "0.10.6"
+base64 = "0.22"
+pkcs8 = { version = "0.10", features = ["pem"] }
+
+# macOS 开发机 USB 后端（纯 Rust IOKit；NAS 生产走 Linux usbfs 直驱，不含此依赖）
+[target.'cfg(target_os = "macos")'.dependencies]
+nusb = "0.1"
 
 [profile.release]
 lto = true

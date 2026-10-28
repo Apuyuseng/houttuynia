@@ -8,6 +8,7 @@
 //!   MWINE_HEADLESS 无头启动模拟器（-no-window）
 
 mod adb;
+mod adbkeys;
 mod api;
 mod console;
 mod devices;
@@ -15,9 +16,11 @@ mod filemgr;
 mod icons;
 mod meta;
 mod pairing;
+mod usb;
 mod scrcpy;
 mod state;
 mod tls;
+mod transport;
 mod guard;
 
 use std::net::IpAddr;
@@ -72,6 +75,67 @@ fn scrcpy_audio_feeder(sock: std::net::TcpStream, tx: tokio::sync::mpsc::Sender<
 }
 
 /// 视频包 → 帧队列（客户端断开 → send 失败 → 退出并清理会话）。
+/// 传输层自检：CNXN/AUTH → shell → sync 推/拉 全链验证。
+/// --adb-test <serial|ip:port>（serial 无冒号走 USB 直驱）
+async fn adb_test_entry(target: &str) {
+    // 0) 环境准备（macOS 桥模式保证 adb server 存活；Linux 劝退外部 server）
+    let _ = adb::ensure_server();
+    // CNXN/AUTH（未授权设备会在手机弹「允许 USB 调试」，最长等 120s）
+    let tcp = if target.contains(':') { Some(target.to_string()) } else { None };
+    match transport::get_conn(target, tcp.as_deref()) {
+        Ok(c) => println!("✓ CNXN/AUTH 完成 serial={} kind={}", c.serial, c.kind),
+        Err(e) => {
+            eprintln!("✗ 连接失败: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // 1) shell
+    match adb::shell_blocking(target, "echo ADB_TEST_OK", 15000) {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out).trim().to_string();
+            println!("✓ shell: {text:?}");
+            if !text.contains("ADB_TEST_OK") {
+                eprintln!("✗ shell 输出异常");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("✗ shell 失败: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // 2) sync 推送（SEND/DATA/DONE/OKAY）
+    let payload = format!("mwine-adb-test-{}", std::process::id());
+    let remote = "/data/local/tmp/mwine_adb_test.txt";
+    if let Err(e) = adb::push_bytes(target, payload.as_bytes(), remote) {
+        eprintln!("✗ sync 推送失败: {e}");
+        std::process::exit(1);
+    }
+    println!("✓ sync 推送 {remote} ({}B)", payload.len());
+
+    // 3) 回读校验（RECV 全链）
+    match adb::pull_file(target, remote, 4096) {
+        Ok(got) => {
+            let text = String::from_utf8_lossy(&got).trim().to_string();
+            if text == payload {
+                println!("✓ sync 拉取校验一致");
+            } else {
+                eprintln!("✗ sync 拉取内容不一致: {text:?}");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("✗ sync 拉取失败: {e}");
+            std::process::exit(1);
+        }
+    }
+    let _ = adb::shell_blocking(target, &format!("rm -f {remote}"), 5000);
+
+    println!("✓ 传输层自检全部通过");
+}
+
 fn scrcpy_feeder(
     mut session: scrcpy::Session,
     tx: tokio::sync::mpsc::Sender<FrameMsg>,
@@ -212,6 +276,23 @@ async fn main() {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // 传输层自检入口：--adb-test <serial|tcp:addr>
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() > 2 && args[1] == "--adb-test" {
+            return adb_test_entry(&args[2]).await;
+        }
+        if args.len() > 3 && args[1] == "--adb-pull" {
+            return adb_pull_diag(&args[2], &args[3]).await;
+        }
+        if args.len() > 2 && args[1] == "--adb-pty" {
+            return adb_pty_diag(&args[2]).await;
+        }
+        if args.len() > 1 && args[1] == "--sig-test" {
+            return sig_test_entry().await;
+        }
+    }
 
     let _ = adb::ensure_server();
 
@@ -456,4 +537,51 @@ async fn main() {
         }
     };
     axum::serve(listener, app).await.unwrap();
+}
+
+// —— 调试辅助：--adb-pty <serial>（pty 桥字节流诊断）——
+#[allow(dead_code)]
+async fn adb_pty_diag(serial: &str) {
+    match adb::shell_pty(serial) {
+        Ok((mut proc, pty)) => {
+            println!("✓ pty 打开 pty={pty}");
+            use std::io::{Read, Write as _};
+            let mut r = proc.stream.try_clone().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let _ = proc.stream.write_all(b"echo PTY_TEST_OK
+");
+            let mut buf = [0u8; 4096];
+            r.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok();
+            match r.read(&mut buf) {
+                Ok(n) => println!("✓ 读到 {n}B: {:?}", String::from_utf8_lossy(&buf[..n])),
+                Err(e) => println!("✗ 读失败: {e}"),
+            }
+            proc.shutdown();
+        }
+        Err(e) => println!("✗ pty 打开失败: {e}"),
+    }
+}
+
+// —— 调试辅助：--sig-test（签名正确性验证：token 写 /tmp/sig_token.bin，
+// 签名写 /tmp/sig_out.bin；用 `openssl dgst -sha1 -verify pub.pem -signature
+// /tmp/sig_out.bin /tmp/sig_token.bin` 按 adbd 同款语义验签）——
+#[allow(dead_code)]
+async fn sig_test_entry() {
+    let key = adbkeys::load_or_create();
+    let token = b"SIG_TEST_TOKEN_0123"; // 20 字节
+    let sig = adbkeys::sign_token(&key, token);
+    std::fs::write("/tmp/sig_token.bin", token).unwrap();
+    std::fs::write("/tmp/sig_out.bin", &sig).unwrap();
+    println!("签名长度: {}B（应为 256）", sig.len());
+}
+
+// —— 调试辅助：--adb-pull <serial> <path>（拉取诊断）——
+#[allow(dead_code)]
+async fn adb_pull_diag(serial: &str, path: &str) {
+    match adb::pull_file(serial, path, 8 * 1024 * 1024) {
+        Ok(d) => println!("✓ pull {path}: {}B", d.len()),
+        Err(e) => println!("✗ pull {path}: {e}"),
+    }
+    let sz = adb::remote_file_size(serial, path);
+    println!("shell stat size: {sz:?}");
 }

@@ -4,6 +4,6 @@
 # 生成），用户在设备上完成一次调试授权即可；私有部署可将已授权的
 # adbkey{,.pub} 预放到 /data/.android/ 跳过授权。
 set -e
-mkdir -p /data/.android
-/opt/mwine/adb start-server
+# adb server 不再需要：网关内置集成传输层（Rust 直驱 usbfs/TCP），
+# 与设备之间无任何中间进程。
 exec /usr/local/bin/mwine-nas

@@ -6,7 +6,12 @@
       <span class="win-title">{{ title }}</span>
       <span class="win-pkg muted">{{ pkg }}</span>
       <div style="flex:1"></div>
-      <button class="win-close" @pointerdown.stop @click="close" title="关闭（销毁副屏）">✕</button>
+      <button class="win-btn" @pointerdown.stop @click="$emit('minimize')" title="最小化">
+        <MsIcon name="minimize" :size="13" />
+      </button>
+      <button class="win-btn close" @pointerdown.stop @click="close" title="关闭（销毁副屏）">
+        <MsIcon name="close" :size="13" />
+      </button>
     </div>
     <div class="win-body" :style="{ width: size.w + 'px', height: size.h + 'px' }" ref="bodyRef">
       <div class="win-placeholder muted" v-if="!ready">⏳ 正在启动应用…</div>
@@ -31,6 +36,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ScrcpyWebPlayer } from '../player'
 import { imgUrl } from '../api'
+import MsIcon from '../components/MsIcon.vue'
 
 const props = defineProps({
   app: Object,        // {package, name}（应用独立窗口）
@@ -39,11 +45,15 @@ const props = defineProps({
   offset: Number,     // 级联偏移（多窗错开）
   z: Number,
 })
-const emit = defineEmits(['close', 'front'])
+const emit = defineEmits(['close', 'front', 'minimize'])
 
-const pos = ref({ x: 120 + (props.offset || 0) * 36, y: 40 + (props.offset || 0) * 30 })
+const BAR = 36  // 顶部状态栏高度（窗口不压上去）
+const pos = ref({
+  x: Math.min(96 + (props.offset % 8) * 36, Math.max(24, window.innerWidth - 380)),
+  y: BAR + 16 + (props.offset % 8) * 28,
+})
 // 初始高度不超出视口（标题栏 + 导航栏约 76px + 边距）
-const initH = Math.min(640, Math.max(420, window.innerHeight - 160))
+const initH = Math.min(920, Math.max(420, Math.round(window.innerHeight * 0.72)))
 // 副屏尺寸按设备主屏宽高比定：TV/平板横屏给 1280×720，手机竖屏保持 720×1280
 let displayW = 720, displayH = 1280, displayDpi = 320
 const size = ref({ w: Math.round(initH * displayW / displayH), h: initH })
@@ -58,6 +68,22 @@ const title = props.titleText || props.app?.name || props.app?.package || ''
 const pkg = props.app?.package || ''
 
 async function resolveDisplaySize() {
+  if (props.deviceSerial) {
+    // 镜像模式：直接按截图真实宽高比开窗（荣耀 9:20 / 平板 4:3 / TV 16:9
+    // 各不相同，横竖二分假设 9:16 会先错后跳）
+    try {
+      const r = await fetch(imgUrl('/api/screenshot.png'))
+      if (r.ok) {
+        const img = await createImageBitmap(await r.blob())
+        if (img.width > 0 && img.height > 0) {
+          displayW = img.width; displayH = img.height
+        }
+        img.close()
+      }
+    } catch { /* 探测失败保持默认竖屏 */ }
+    size.value = { w: Math.round(initH * displayW / displayH), h: initH }
+    return
+  }
   try {
     const r = await fetch(imgUrl('/api/screenshot.png'))
     if (r.ok) {
@@ -78,8 +104,10 @@ let canvas = null
 
 onMounted(async () => {
   await resolveDisplaySize()
+  // 真机主屏镜像：原始分辨率直投（max_size=0 = scrcpy 不缩放；默认档会
+  // 把 720×1600 压到 576×1280，画面明显发糊）。USB 直连带宽足够 8M。
   const openQuery = props.deviceSerial
-    ? `&serial=${encodeURIComponent(props.deviceSerial)}`
+    ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=30`
     : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`
   player = new ScrcpyWebPlayer({
     openQuery,
@@ -154,7 +182,7 @@ function startDrag(e) {
   const move = (ev) => {
     pos.value = {
       x: Math.max(0, Math.min(window.innerWidth - 120, drag.ox + ev.clientX - drag.sx)),
-      y: Math.max(0, Math.min(window.innerHeight - 80, drag.oy + ev.clientY - drag.sy)),
+      y: Math.max(36, Math.min(window.innerHeight - 80, drag.oy + ev.clientY - drag.sy)),
     }
   }
   const up = () => {
@@ -188,22 +216,23 @@ function startResize(e) {
 <style scoped>
 .app-window {
   position: fixed;
-  background: #14171e;
-  border: 1px solid #3a4152;
-  border-radius: 12px;
-  box-shadow: 0 18px 50px #000a;
+  background: #141318;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
   overflow: hidden;
   display: flex;
   flex-direction: column;
   min-width: 240px;
 }
+/* Android 桌面模式 caption bar */
 .win-titlebar {
   display: flex; align-items: center; gap: 8px;
-  padding: 0 12px;
-  height: 34px;                    /* 固定单行高度：fps 等状态文本不再引起抖动 */
+  padding: 0 8px 0 12px;
+  height: 38px;                    /* 固定单行高度：fps 等状态文本不再引起抖动 */
   white-space: nowrap; overflow: hidden;
-  background: #1c212b;
-  border-bottom: 1px solid #2a3140;
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   cursor: move;
   user-select: none;
   touch-action: none;
@@ -211,16 +240,19 @@ function startResize(e) {
 /* 直播状态点（悬停看状态文本），不随内容变形 */
 .win-live {
   width: 8px; height: 8px; border-radius: 50%;
-  background: #4a5265; flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.25); flex-shrink: 0;
 }
-.win-live.on { background: #4ade80; box-shadow: 0 0 6px #4ade8088; }
+.win-live.on { background: #81c995; box-shadow: 0 0 6px #81c99588; }
 .win-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
 .win-pkg { font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
-.win-close {
-  background: none; border: none; color: #9aa3b2; cursor: pointer;
-  font-size: 14px; padding: 2px 6px; border-radius: 6px;
+.win-btn {
+  background: none; border: none; cursor: pointer;
+  color: rgba(255, 255, 255, 0.6);
+  width: 30px; height: 26px; border-radius: 999px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
 }
-.win-close:hover { background: #f8717122; color: #fca5a5; }
+.win-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.win-btn.close:hover { background: rgba(234, 67, 53, 0.25); color: #f6aea9; }
 .win-body {
   position: relative;
   background: #000;
@@ -237,28 +269,28 @@ function startResize(e) {
 /* 宿主 IME 组词浮层 */
 .win-preedit {
   position: absolute; left: 12px; bottom: 12px;
-  background: #1c212bee; border: 1px solid #3a4152; border-radius: 8px;
+  background: #1c212bee; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
   color: #e6e9ef; padding: 4px 10px; font-size: 13px; z-index: 3;
   pointer-events: none;
 }
 /* 底部导航栏 */
 .win-navbar {
   display: flex; align-items: center; gap: 4px;
-  background: #1c212b;
-  border-top: 1px solid #2a3140;
+  background: rgba(255, 255, 255, 0.03);
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
   padding: 4px 10px;
 }
 .nav-btn {
-  background: none; border: none; color: #cbd5e1;
-  font-size: 13px; width: 40px; height: 26px; border-radius: 7px; cursor: pointer;
+  background: none; border: none; color: rgba(255, 255, 255, 0.75);
+  font-size: 13px; width: 40px; height: 26px; border-radius: 999px; cursor: pointer;
 }
-.nav-btn:hover { background: #4a526533; }
+.nav-btn:hover { background: rgba(255, 255, 255, 0.1); }
 .win-resize {
   position: absolute; right: 0; bottom: 0;
   width: 18px; height: 18px;
   cursor: nwse-resize;
-  background: linear-gradient(135deg, transparent 50%, #4a5265 50%);
-  border-bottom-right-radius: 12px;
+  background: linear-gradient(135deg, transparent 50%, rgba(255, 255, 255, 0.22) 50%);
+  border-bottom-right-radius: 16px;
   touch-action: none;
 }
 </style>

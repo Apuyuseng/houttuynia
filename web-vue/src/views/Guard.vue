@@ -59,15 +59,15 @@
       <svg :viewBox="'0 0 ' + (chartBars.length * 22 + 10) + ' 130'" style="width:100%;height:150px;">
         <g v-for="(b, i) in chartBars" :key="b.date">
           <rect :x="5 + i * 22" :y="110 - b.h" width="16" :height="b.h" rx="3"
-                :fill="b.today ? '#4ade80' : (b.min > 0 ? '#60a5fa' : '#2a3142')">
+                :fill="b.today ? '#81c995' : (b.min > 0 ? '#a8c7fa' : 'rgba(255,255,255,0.09)')">
             <title>{{ b.date }}：{{ b.min }} 分钟</title>
           </rect>
           <text v-if="i % 5 === 0 || b.today" :x="13 + i * 22" y="126" text-anchor="middle"
-                font-size="9" :fill="b.today ? '#4ade80' : '#8b93a7'">{{ b.label }}</text>
+                font-size="9" :fill="b.today ? '#81c995' : 'rgba(255,255,255,0.45)'">{{ b.label }}</text>
           <text v-if="b.min > 0" :x="13 + i * 22" :y="Math.max(110 - b.h - 4, 10)" text-anchor="middle"
-                font-size="8" fill="#8b93a7">{{ b.min }}</text>
+                font-size="8" fill="rgba(255,255,255,0.45)">{{ b.min }}</text>
         </g>
-        <line x1="0" y1="110" x2="100%" y2="110" stroke="#3a4152" stroke-width="1" />
+        <line x1="0" y1="110" x2="100%" y2="110" stroke="rgba(255,255,255,0.12)" stroke-width="1" />
       </svg>
       <div class="small muted">只统计亮屏时间（待机不计）；绿柱为今天，蓝柱为历史，悬停看具体数值。</div>
     </el-card>

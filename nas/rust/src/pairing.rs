@@ -348,6 +348,53 @@ fn boringssl_export(
     }
 }
 
+/// 无线调试 TLS 连接（_adb._tcp）：用手机已信任的 adbkey 自签证书做
+/// 客户端证书，与 adbd 的 TLS 服务端握手后即建立加密 ADB 通道。
+/// 这是 Android 11+ 无线调试的标准连接方式，授权持久化无需重复弹窗。
+pub fn tls_adb_connect(addr: &str) -> Result<(ClientConnection, TcpStream), String> {
+    let host = addr.split(':').next().unwrap_or(addr).to_string();
+    let sock_addr = addr.to_socket_addrs()
+        .map_err(|e| format!("地址解析失败: {e}"))?
+        .next()
+        .ok_or("无可达地址")?;
+    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+        .map_err(|e| format!("TLS 端口连接失败: {e}"))?;
+    stream.set_nodelay(true).ok();
+
+    // 用持久 adbkey 生成自签证书（无线调试服务端校验这个）
+    let adbkey = crate::adbkeys::load_or_create();
+    let (cert_der, key_der) = adbkey_self_signed_cert(&adbkey)?;
+
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_client_auth_cert(vec![cert_der], key_der.into())
+        .map_err(|e| format!("TLS 客户端配置失败: {e}"))?;
+    cfg.dangerous().set_certificate_verifier(std::sync::Arc::new(AcceptAnyVerifier));
+    cfg.alpn_protocols = vec![b"adb".to_vec()];
+
+    let server_name = ServerName::try_from(host).map_err(|e| format!("SNI 失败: {e}"))?;
+    let mut tls = ClientConnection::new(std::sync::Arc::new(cfg), server_name)
+        .map_err(|e| format!("TLS 初始化失败: {e}"))?;
+    while tls.is_handshaking() {
+        tls.complete_io(&mut stream).map_err(|e| format!("TLS 握手失败: {e}"))?;
+    }
+    Ok((tls, stream))
+}
+
+/// 用 adbkey（RSA-2048）生成自签 X.509 证书（无线调试客户端证书要求）
+fn adbkey_self_signed_cert(key: &rsa::RsaPrivateKey) -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>), String> {
+    use rsa::pkcs8::EncodePrivateKey;
+    // rcgen 只支持 ECDSA/ED25519 直接生成；RSA 要走自定义 KeyPair
+    let key_der = key.to_pkcs8_der().map_err(|e| format!("PKCS8 导出失败: {e}"))?;
+    let key_der = PrivatePkcs8KeyDer::from(key_der.as_bytes().to_vec());
+    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &rcgen::PKCS_RSA_SHA256)
+        .map_err(|e| format!("RSA KeyPair 构造失败: {e}"))?;
+    let params = rcgen::CertificateParams::new(vec!["mwine-adb".to_string()])
+        .map_err(|e| format!("证书参数失败: {e}"))?;
+    let cert = params.self_signed(&key_pair).map_err(|e| format!("自签失败: {e}"))?;
+    Ok((CertificateDer::from(cert.der().to_vec()), key_der))
+}
+
 fn make_client_config(
     exporter: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 ) -> Result<ClientConfig, String> {
