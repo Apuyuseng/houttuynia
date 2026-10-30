@@ -17,16 +17,13 @@ $C append -f /tmp/layer-arm64.tar -b debian:bookworm-slim --platform linux/arm64
   -t $REG/$REPO:build-arm64
 
 echo "== 3/4 注入元数据（ENTRYPOINT/ENV/EXPOSE/VOLUME）=="
-$C mutate $REG/$REPO:build-amd64 \
-  --entrypoint /opt/mwine/entrypoint.sh \
+# 注：crane 0.20.x 的 mutate 不支持 --expose/--volume（仅元数据装饰，
+# 缺失不影响功能；端口/卷在 compose 与文档中声明）
+MUTATE_ARGS="--entrypoint /opt/mwine/entrypoint.sh \
   --env HOME=/data --env MWINE_HOST=0.0.0.0 --env MWINE_TLS_PORT=18443 \
-  --env MWINE_WEB_DIR=/opt/mwine/web --env PATH=/opt/mwine:$PATH \
-  --expose 18443 --volume /data -t $REG/$REPO:build-amd64-cfg
-$C mutate $REG/$REPO:build-arm64 \
-  --entrypoint /opt/mwine/entrypoint.sh \
-  --env HOME=/data --env MWINE_HOST=0.0.0.0 --env MWINE_TLS_PORT=18443 \
-  --env MWINE_WEB_DIR=/opt/mwine/web --env PATH=/opt/mwine:$PATH \
-  --expose 18443 --volume /data -t $REG/$REPO:build-arm64-cfg
+  --env MWINE_WEB_DIR=/opt/mwine/web"
+$C mutate $REG/$REPO:build-amd64 $MUTATE_ARGS -t $REG/$REPO:build-amd64-cfg
+$C mutate $REG/$REPO:build-arm64 $MUTATE_ARGS -t $REG/$REPO:build-arm64-cfg
 
 echo "== 4/4 合成多架构 manifest（latest）=="
 $C index append -m $REG/$REPO:build-amd64-cfg -m $REG/$REPO:build-arm64-cfg \
