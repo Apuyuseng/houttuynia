@@ -15,6 +15,17 @@
     </div>
     <div class="win-body" :style="{ width: size.w + 'px', height: size.h + 'px' }" ref="bodyRef">
       <div class="win-placeholder muted" v-if="!ready">⏳ 正在启动应用…</div>
+      <!-- 副屏无内容（设备/应用不支持虚拟屏独立窗口）→ 提供主屏回退 -->
+      <div class="win-fallback" v-if="noDisplay">
+        <div class="wf-icon"><MsIcon name="smartphone" :size="26" /></div>
+        <div class="wf-title">{{ noDisplayReason }}</div>
+        <div class="wf-sub muted small">并非所有设备/应用都支持独立窗口（虚拟屏）：Android 10 以下、
+          部分厂商 ROM 及强制主屏的应用（如银行类）会受限</div>
+        <div class="wf-actions">
+          <el-button size="small" type="primary" @click="runOnMainDisplay">在手机主屏打开</el-button>
+          <el-button size="small" text @click="noDisplay = false">继续等待</el-button>
+        </div>
+      </div>
       <input ref="imeRef" class="win-ime" autocomplete="off" autocapitalize="off"
              autocorrect="off" spellcheck="false" aria-label="输入法捕获">
       <div class="win-preedit" v-if="preedit">{{ preedit }}</div>
@@ -35,7 +46,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ScrcpyWebPlayer } from '../player'
-import { imgUrl } from '../api'
+import { imgUrl, apiPost } from '../api'
 import { getFlags } from '../flags'
 import { onDeviceEvent } from '../sseDevice'
 import MsIcon from '../components/MsIcon.vue'
@@ -105,6 +116,53 @@ let player = null
 let canvas = null
 let offClip = null
 
+// ---- 独立窗口兼容性检测：并非所有设备都支持虚拟屏（Android<10 / 部分 ROM /
+// ---- 应用强制主屏）。两种失败形态：a) 首帧迟迟不来 b) 副屏全黑（创建成功
+// ---- 但应用没落上去）。检测到即给「在手机主屏打开」回退
+const noDisplay = ref(false)
+const noDisplayReason = ref('')
+let detectTimer = null
+function armNoDisplayDetect() {
+  if (props.deviceSerial) return // 主屏镜像不需要
+  // a) 12s 无首帧
+  detectTimer = setTimeout(() => {
+    if (!ready.value) {
+      noDisplayReason.value = '独立窗口长时间无画面'
+      noDisplay.value = true
+    }
+  }, 12000)
+}
+function checkBlackFrame() {
+  if (props.deviceSerial || !canvas) return
+  // b) 副屏内容均匀（全黑/纯壁纸无差异）：缩到 16×32 采样方差
+  try {
+    const c = document.createElement('canvas')
+    c.width = 16; c.height = 32
+    const g = c.getContext('2d', { willReadFrequently: true })
+    g.drawImage(canvas, 0, 0, 16, 32)
+    const d = g.getImageData(0, 0, 16, 32).data
+    let sum = 0, sum2 = 0, n = d.length / 4
+    for (let i = 0; i < d.length; i += 4) {
+      const v = (d[i] + d[i + 1] + d[i + 2]) / 3
+      sum += v; sum2 += v * v
+    }
+    const variance = sum2 / n - (sum / n) * (sum / n)
+    if (variance < 4) { // 近乎纯色（虚拟屏空内容典型表现）
+      noDisplayReason.value = '副屏无内容（应用未在独立窗口中打开）'
+      noDisplay.value = true
+    }
+  } catch { /* 采样失败忽略 */ }
+}
+async function runOnMainDisplay() {
+  try {
+    await apiPost(`/api/apps/${encodeURIComponent(pkg)}/run`, {})
+    ElMessage.success(`已在手机主屏打开 ${title}（可用「屏幕镜像」远程操作）`)
+    emit('close')
+  } catch (e) {
+    ElMessage.error(`主屏启动失败：${e.message || e}`)
+  }
+}
+
 onMounted(async () => {
   await resolveDisplaySize()
   // 真机主屏镜像：原始分辨率直投（max_size=0 = scrcpy 不缩放；默认档会
@@ -120,6 +178,9 @@ onMounted(async () => {
     onFirstFrame: () => {
       ready.value = true
       liveOn.value = true
+      if (detectTimer) { clearTimeout(detectTimer); detectTimer = null }
+      // 首帧后再等 4s 采样：应用正常落屏需要启动时间，太早会误判
+      setTimeout(checkBlackFrame, 4000)
       // 内容实际比例与窗口体不一致时（旋转/服务端约束）自适应贴合
       const cw = player.canvas.width, ch = player.canvas.height
       if (cw > 0 && ch > 0) {
@@ -153,8 +214,10 @@ onMounted(async () => {
     ElMessage.error(`${title}：投屏失败 ${e.message}`)
     emit('close')
   })
+  armNoDisplayDetect()
 })
 onUnmounted(() => {
+  if (detectTimer) { clearTimeout(detectTimer); detectTimer = null }
   stopClipboardSync()
   if (offClip) { offClip(); offClip = null }
   if (player) { const p = player; player = null; p.stop() }
@@ -338,6 +401,17 @@ function startResize(e) {
   color: #e6e9ef; padding: 4px 10px; font-size: 13px; z-index: 3;
   pointer-events: none;
 }
+/* 独立窗口不支持时的回退提示层 */
+.win-fallback {
+  position: absolute; inset: 0; z-index: 4;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 20px; text-align: center;
+  background: rgba(16, 18, 24, 0.82); backdrop-filter: blur(6px);
+}
+.wf-icon { opacity: 0.6; }
+.wf-title { font-size: 14px; font-weight: 600; color: #e6e9ef; }
+.wf-sub { max-width: 320px; line-height: 1.5; }
+.wf-actions { display: flex; gap: 8px; margin-top: 4px; }
 /* 底部导航栏 */
 .win-navbar {
   display: flex; align-items: center; gap: 4px;
