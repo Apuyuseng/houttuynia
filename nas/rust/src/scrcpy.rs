@@ -177,6 +177,7 @@ fn read_exact(s: &mut TcpStream, buf: &mut [u8], timeout_ms: u64) -> AdbResult<b
     Ok(true)
 }
 
+#[derive(Clone)]
 pub struct StartParams {
     pub max_size: u32,
     pub bit_rate: u32,
@@ -203,6 +204,25 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     if remote_size != Some(local.len() as u64) {
         tracing::info!("推送 scrcpy server jar（{}B，远端缺失/不符）", local.len());
         adb::push_bytes(serial, &local, &remote)?;
+        // sync 流 → shell 流快速连续建链时，server 桥上偶发假流（新链读到
+        // 上一链的 FIN 时序残留，实测 ~30% 概率）。推完探测确认落盘（荣耀
+        // MagicOS 会即时清外来 jar，探测也兜住"推了即被清"的极端时序），
+        // 最多 3 次；每次探测间隔 300ms 让前链完全收尾。
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(300));
+            let ok = adb::shell_blocking(
+                serial,
+                &format!("ls {remote} >/dev/null 2>&1 && echo Y"),
+                5000,
+            )
+            .map(|o| String::from_utf8_lossy(&o).contains('Y'))
+            .unwrap_or(false);
+            if ok {
+                break;
+            }
+            tracing::debug!("jar 落盘探测未过，重推");
+            adb::push_bytes(serial, &local, &remote)?;
+        }
     }
 
     let scid: u32 = rand_scid();
@@ -222,6 +242,10 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
     } else {
         "audio=false"
     };
+    // 编码参数（质量+低延迟）：
+    //   i-frame-interval=2s —— 关键帧更密，卡顿/丢帧后画面恢复更快（默认 10s）
+    //   repeat-previous-sps —— 静止画面省带宽，动起来立刻有 SPS 可解码
+    //   android:video_bit_rate 由调用方按链路给（USB 20M）
     let mut args = format!(
         "scid={scid:08x} log_level=info video=true control=true {audio_args} \
          video_codec=h264 video_bit_rate={} max_size={} scid={scid:x} max_fps={} \
@@ -241,7 +265,7 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
 
     // 连 video socket：forward 在 server 未监听时也会接受 TCP 后立即关闭，
     // 以「读到 dummy 字节」为就绪判据；首探放宽（server 冷启 + dexopt 数秒）。
-    std::thread::sleep(Duration::from_millis(400));
+    // 去掉固定 400ms sleep——connect 失败/立即关闭本身就有 200ms 重试节奏。
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut video: Option<TcpStream> = None;
     let mut first = true;

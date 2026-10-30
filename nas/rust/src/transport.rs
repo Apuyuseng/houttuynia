@@ -27,6 +27,7 @@ pub const A_OPEN: u32 = 0x4e45504f; // "OPEN"
 pub const A_OKAY: u32 = 0x59414b4f; // "OKAY"
 pub const A_CLSE: u32 = 0x45534c43; // "CLSE"
 pub const A_WRTE: u32 = 0x45545257; // "WRTE"
+pub const A_STLS: u32 = 0x534c5453; // "STLS"（新版 adbd 无线调试 START-TLS 升级）
 pub const A_VERSION: u32 = 0x01000001;
 pub const MAX_PAYLOAD: u32 = 1024 * 1024; // AOSP MAX_PAYLOAD_SIZE（现代 adb）
 /// 每流未确认 WRTE 上限（协议流控：发送方等 OKAY 再发）。
@@ -364,31 +365,51 @@ impl DeviceConn {
         }
     }
 
-    /// TCP 连接：先试 TLS（无线调试标准 _adb._tcp，授权持久化免弹窗）；
-    /// TLS 不可达/失败则回落明文（5555 tcpip 模式，需每次授权）。
+    /// TCP 连接。新版 adbd 无线调试端口用 START-TLS 升级：明文发 CNXN，
+    /// 设备回 STLS → 发 STLS(cmd,arg0=1) → OKAY → 同一连接升级 TLS →
+    /// 在 TLS 上重新走 CNXN/AUTH 握手（授权持久化免弹窗）。
+    /// 旧 tcpip 5555 则明文直连；个别老固件 TLS 原生直连，保留首试。
     fn connect_tcp(serial: &str, addr: &str) -> Result<Arc<DeviceConn>, String> {
-        // TLS 端口探测：无线调试默认监听 5555 之外的 TLS 端口，
-        // mDNS 会通告真实端口；这里先试 adb 惯例 5555，失败由上层 fallback。
-        match crate::pairing::tls_adb_connect(addr) {
-            Ok((tls, stream)) => {
-                tracing::info!("TLS 无线调试通道建立: {addr}");
-                let w = stream.try_clone().map_err(|e| format!("TLS 半分离失败: {e}"))?;
-                let tls = Arc::new(std::sync::Mutex::new(tls));
-                let mut rh = ReadHalf::Tls { conn: Arc::clone(&tls), stream };
-                let mut wh = WriteHalf::Tls { conn: tls, stream: w };
-                let max_payload = handshake(&mut rh, &mut wh, serial)?;
+        if let Ok((tls, stream)) = crate::pairing::tls_adb_connect(addr) {
+            let w = stream.try_clone().map_err(|e| format!("TLS 半分离失败: {e}"))?;
+            let tls = Arc::new(std::sync::Mutex::new(tls));
+            let mut rh = ReadHalf::Tls { conn: Arc::clone(&tls), stream };
+            let mut wh = WriteHalf::Tls { conn: tls, stream: w };
+            if let Ok(max_payload) = handshake(&mut rh, &mut wh, serial, None) {
                 return Ok(Self::finalize(serial, "tcp", rh, wh, max_payload));
             }
-            Err(e) => {
-                tracing::debug!("TLS 无线调试不可达（{e}），回落明文 TCP");
-            }
         }
-        let s = TcpStream::connect(addr).map_err(|e| format!("TCP 连接 {addr} 失败: {e}"))?;
+        let mut s = TcpStream::connect(addr).map_err(|e| format!("TCP 连接 {addr} 失败: {e}"))?;
+        s.set_nonblocking(false).ok();
         s.set_nodelay(true).ok();
+        s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        // 明文 CNXN 预检
+        let mut prh = ReadHalf::Tcp(s.try_clone().map_err(|e| e.to_string())?);
+        let mut pwh = WriteHalf::Tcp(s.try_clone().map_err(|e| e.to_string())?);
+        prh.set_read_timeout(Some(Duration::from_secs(8)));
+        use std::io::Write as _;
+        let _ = pwh_write(&mut pwh, &build_cnxn().encode());
+        let first = read_message_with(&mut prh, Some(Instant::now() + Duration::from_secs(8)))?
+            .ok_or("连接预检无响应")?;
+        if first.cmd == A_STLS {
+            // STLS 升级（真机抓包对齐官方时序）：收到 STLS 后回发 STLS(arg0=1)
+            // 并立即发起 TLS 握手——官方客户端不等任何应答。TLS 客户端证书
+            // 即认证（adbkey 自签；未配对密钥在 TLS 层被拒），TLS 后重走 CNXN/AUTH
+            let _ = pwh_write(&mut pwh, &Message { cmd: A_STLS, arg0: 1, arg1: 0, data: vec![] }.encode());
+            let host = addr.split(':').next().unwrap_or(addr).to_string();
+            let (tls, stream) = crate::pairing::tls_wrap(s, &host)?;
+            let w = stream.try_clone().map_err(|e| format!("TLS 半分离失败: {e}"))?;
+            let tls = Arc::new(std::sync::Mutex::new(tls));
+            let mut rh = ReadHalf::Tls { conn: Arc::clone(&tls), stream };
+            let mut wh = WriteHalf::Tls { conn: tls, stream: w };
+            let max_payload = handshake(&mut rh, &mut wh, serial, None)?;
+            return Ok(Self::finalize(serial, "tcp", rh, wh, max_payload));
+        }
+        // 明文路径：注入首帧继续握手
         let w = s.try_clone().map_err(|e| format!("TCP 半分离失败: {e}"))?;
         let mut rh = ReadHalf::Tcp(s);
         let mut wh = WriteHalf::Tcp(w);
-        let max_payload = handshake(&mut rh, &mut wh, serial)?;
+        let max_payload = handshake(&mut rh, &mut wh, serial, Some(first))?;
         Ok(Self::finalize(serial, "tcp", rh, wh, max_payload))
     }
 
@@ -416,7 +437,7 @@ impl DeviceConn {
                     Ok(w) => {
                         let mut rh = ReadHalf::Usb(h);
                         let mut wh = WriteHalf::Usb(w);
-                        match handshake(&mut rh, &mut wh, serial) {
+                        match handshake(&mut rh, &mut wh, serial, None) {
                             Ok(max_payload) => {
                                 if attempt > 1 {
                                     tracing::info!("USB 第 {attempt} 轮连接成功（kick 自愈）");
@@ -852,15 +873,33 @@ fn read_message_with(rh: &mut ReadHalf, deadline: Option<Instant>) -> Result<Opt
 /// CNXN/AUTH 握手。返回设备侧最大负载（arg1）。
 /// 已授权密钥：TOKEN→SIGN→CNXN 秒过；新密钥：TOKEN→SIGN→TOKEN→PUBKEY→
 /// （手机弹「允许 USB 调试」，最长等 120s）→CNXN；拒绝→连接被设备关闭。
-fn handshake(rh: &mut ReadHalf, wh: &mut WriteHalf, serial: &str) -> Result<u32, String> {
-    let cnxn = Message {
+/// 预检阶段简单写（WriteHalf 私有方法的裸版）。
+fn pwh_write(wh: &mut WriteHalf, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match wh {
+        WriteHalf::Tcp(s) => s.write_all(data),
+        _ => unreachable!(),
+    }
+}
+
+fn build_cnxn() -> Message {
+    Message {
         cmd: A_CNXN,
         arg0: A_VERSION,
         arg1: MAX_PAYLOAD,
         data: b"host::features=shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir,apex,abb_exec,sendrecv_v2,track_app,sendrecv_v2_brotli,openscreen_mdns,remount_shell,track_app,abb,fixed_push_symlink_timestamp,abb_exec,apex,can_reboot_bootloader,fixed_push_mkdir".to_vec(),
-    };
-    wh.write_all_bytes(&cnxn.encode())
-        .map_err(|e| format!("CNXN 发送失败: {e}"))?;
+    }
+}
+
+/// prefix：调用方已明文发过 CNXN 并读到的首帧（STLS 预检的明文路径），
+/// 此时不再重发 CNXN，直接从该帧继续。
+fn handshake(rh: &mut ReadHalf, wh: &mut WriteHalf, serial: &str, prefix: Option<Message>) -> Result<u32, String> {
+    if prefix.is_none() {
+        let cnxn = build_cnxn();
+        wh.write_all_bytes(&cnxn.encode())
+            .map_err(|e| format!("CNXN 发送失败: {e}"))?;
+    }
+    let mut prefix = prefix;
 
     let key = crate::adbkeys::load_or_create();
     // 未授权设备等用户在手机上点「允许 USB 调试」——弹窗可能被忽略/熄屏，
@@ -869,7 +908,10 @@ fn handshake(rh: &mut ReadHalf, wh: &mut WriteHalf, serial: &str) -> Result<u32,
     let mut tokens = 0u32;
     let mut auth_announced = false;
     loop {
-        let msg = read_message_with(rh, Some(deadline))?.ok_or("设备在握手期间断开")?;
+        let msg = match prefix.take() {
+            Some(m) => m,
+            None => read_message_with(rh, Some(deadline))?.ok_or("设备在握手期间断开")?,
+        };
         match msg.cmd {
             A_CNXN => {
                 // 设备最大负载在 arg1（payload 是 ASCII 身份串）；过老的
@@ -1092,6 +1134,57 @@ pub fn server_devices() -> Vec<(String, String)> {
     out
 }
 
+/// 官方 adb server 的 mDNS 发现结果（host:mdns:services 输出）。
+/// 返回 (实例名, 服务类型, ip:port)；server 不可达/不支持时 None（走本地兜底）。
+/// 行格式：`实例名\t类型\tip:port`（个别版本实例与类型连写：`实例.类型 ip:port`）。
+pub fn server_mdns_services() -> Option<Vec<(String, String, String)>> {
+    // 唤醒 mDNS 后端（幂等；旧版本未初始化时 services 输出为空）——失败不致命
+    {
+        let mut s = TcpStream::connect("127.0.0.1:5037").ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(4))).ok();
+        s.set_write_timeout(Some(Duration::from_secs(4))).ok();
+        if smart_service(&mut s, "host:mdns:check").is_ok() {
+            let _ = smart_payload(&mut s);
+        }
+    }
+    let mut s = TcpStream::connect("127.0.0.1:5037").ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(4))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(4))).ok();
+    smart_service(&mut s, "host:mdns:services").ok()?;
+    let raw = smart_payload(&mut s).ok()?;
+    Some(parse_mdns_services_output(&String::from_utf8_lossy(&raw)))
+}
+
+/// 解析 `host:mdns:services` 输出。行格式：`实例名\t类型\tip:port`
+/// （个别版本实例与类型连写：`实例.类型 ip:port`）；按 (实例, 类型) 去重。
+pub fn parse_mdns_services_output(text: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut push = |instance: &str, ty: &str, addr: &str| {
+        // ip:port 尾段必须是合法非零端口
+        let Some(colon) = addr.rfind(':') else { return };
+        let Ok(port) = addr[colon + 1..].parse::<u16>() else { return };
+        if port == 0 || colon == 0 {
+            return;
+        }
+        if !out.iter().any(|(i, t, _)| i == instance && t == ty) {
+            out.push((instance.to_string(), ty.to_string(), addr.to_string()));
+        }
+    };
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() >= 3 && toks[1].starts_with("_adb") {
+            push(toks[0], toks[1], toks[2]);
+        } else if toks.len() >= 2 {
+            if let Some(split) = toks[0].find("._adb") {
+                if split > 0 {
+                    push(&toks[0][..split], &toks[0][split + 1..], toks[1]);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn list_connected() -> Vec<(String, &'static str)> {
     REGISTRY
         .lock()
@@ -1100,4 +1193,41 @@ pub fn list_connected() -> Vec<(String, &'static str)> {
         .filter(|(_, e)| e.conn.alive())
         .map(|(k, e)| (k.clone(), e.kind))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mdns_services_three_field() {
+        // 本机实测格式（platform-tools 35，openscreen 后端）
+        let out = parse_mdns_services_output(
+            "studio-f6dd9f\t_adb-tls-pairing._tcp\t192.168.31.111:40635\n\
+             adb-582QUGHG2277L-dJgO5y\t_adb-tls-connect._tcp\t192.168.31.111:46573\n",
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], ("studio-f6dd9f".into(), "_adb-tls-pairing._tcp".into(), "192.168.31.111:40635".into()));
+        assert_eq!(out[1].0, "adb-582QUGHG2277L-dJgO5y");
+    }
+
+    #[test]
+    fn parse_mdns_services_joined_form() {
+        // 旧版连写形态：实例.类型 ip:port（桌面版 devices.cpp 同款兼容）
+        let out = parse_mdns_services_output(
+            "studio-f6dd9f._adb-tls-pairing._tcp 192.168.31.111:40635\n",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], ("studio-f6dd9f".into(), "_adb-tls-pairing._tcp".into(), "192.168.31.111:40635".into()));
+    }
+
+    #[test]
+    fn parse_mdns_services_dedup_and_junk() {
+        let out = parse_mdns_services_output(
+            "a\t_adb._tcp\t10.0.0.1:5555\na\t_adb._tcp\t10.0.0.1:5555\n\
+             junk\t_adb._tcp\t10.0.0.1:0\njunk2\t_adb._tcp\tnoport\n乱行\n",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].2, "10.0.0.1:5555");
+    }
 }

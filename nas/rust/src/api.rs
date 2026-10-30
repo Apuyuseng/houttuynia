@@ -764,6 +764,7 @@ pub async fn stream_open(
     let fps: u32 = q.get("fps").and_then(|s| s.parse().ok()).unwrap_or(30);
     // 应用独立窗口：app= 包名 + 可选 w/h/dpi 副屏尺寸（默认 720×1280@320 竖屏手机）
     let start_app = q.get("app").cloned().filter(|s| !s.is_empty());
+    let audio = q.get("audio").and_then(|s| s.parse().ok()).unwrap_or(true);
     let new_display = if start_app.is_some() {
         let w: u32 = q.get("w").and_then(|s| s.parse().ok()).unwrap_or(720);
         let h: u32 = q.get("h").and_then(|s| s.parse().ok()).unwrap_or(1280);
@@ -779,24 +780,94 @@ pub async fn stream_open(
         max_size
     };
     // 音频始终请求：设备不支持时 server 下发 disable 码自动回退纯视频
-    let params = scrcpy::StartParams { max_size, bit_rate, fps, audio: true, new_display, start_app };
+    let params = scrcpy::StartParams { max_size, bit_rate, fps, audio, new_display, start_app };
 
     // TV/大屏设备待机（Dreaming）时 scrcpy 抓的是黑缓冲——开流前先唤醒
     // （不影响手机：已亮屏的设备 wake_up 是 no-op；scrcpy stay_awake=true 接管保活）
+    // 唤醒：先查屏幕状态，仅在熄屏时才 wake+等管线（多数时候已亮屏，省 800ms+一次 shell 往返）
     let serial_wake = serial.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = adb::shell_blocking(&serial_wake, "input keyevent KEYCODE_WAKEUP", 5000);
+    let woke = tokio::task::spawn_blocking(move || {
+        let awake = adb::shell_blocking(&serial_wake, "dumpsys power | grep -q 'mWakefulness=Awake' && echo Y", 5000)
+            .map(|o| String::from_utf8_lossy(&o).contains('Y'))
+            .unwrap_or(true); // 查询失败按已亮屏处理（不白等）
+        if awake {
+            false
+        } else {
+            let _ = adb::shell_blocking(&serial_wake, "input keyevent KEYCODE_WAKEUP", 5000);
+            true
+        }
     })
-    .await;
-    // 唤醒后给 SurfaceFlinger 一点时间建立新帧（TV 的管线启动比手机慢）
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    .await
+    .unwrap_or(false);
+    if woke {
+        // 唤醒后给 SurfaceFlinger 一点时间建立新帧（TV 的管线启动比手机慢）
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
 
-    let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial, &jar, &params)).await;
-    let mut session = match r {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return err(500, format!("投屏会话启动失败: {e}")),
-        Err(e) => return err(500, format!("投屏任务失败: {e}")),
+    // 会话空闲回收看门狗（独立线程，每 15s 扫描）：
+    //   A) 从未被观看（!attached）超 90s —— 页面打开失败/忘记关
+    //   B) 已结束（ended）超 30s —— 流断开后残留
+    //   C) 帧停滞超 180s（页面关闭后 video pump 断开 → feeder 发送失败自退 → ended，B 已覆盖；
+    //      此项兜底 pump 存活但无人消费的极端态）
+    {
+        let st_w = st.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let created_ms = now_ms; // 会话创建即开始计时（attached=false 判定用）
+            let victims: Vec<Arc<StreamSession>> = {
+                let mut m = st_w.streams.lock().unwrap();
+                let mut kill = Vec::new();
+                m.retain(|_, s| {
+                    let attached = s.attached.load(Ordering::SeqCst);
+                    let ended = s.ended.load(Ordering::SeqCst);
+                    let last = s.last_frame_ms.load(Ordering::Relaxed);
+                    let idle_ms = if last > 0 { now_ms.saturating_sub(last) } else { 0 };
+                    let dead = (!attached && now_ms.saturating_sub(created_ms) > 90_000)
+                        || (ended && idle_ms > 30_000)
+                        || (!ended && last > 0 && idle_ms > 180_000);
+                    if dead {
+                        kill.push(s.clone());
+                        false // retain 移除
+                    } else {
+                        true
+                    }
+                });
+                kill
+            };
+            for s in victims {
+                tracing::info!("投屏会话空闲回收 id={} serial={}", s.id, s.serial);
+                s.stop();
+            }
+        });
+    }
+
+    // 开流（含一次整体重试）：server 桥上「推 jar（sync 流）→ 启动 server
+    // （shell 流）」快速连续建链偶发假流（HTTP200 但 0 字节，实测 ~30% 概率
+    // 连续开关时出现）。重试路径 jar 已在（stat 命中快路径），第二轮稳定。
+    let mut attempt = 0;
+    let session = loop {
+        attempt += 1;
+        let serial_c = serial.clone();
+        let jar_c = jar.clone();
+        let params_c = params.clone();
+        let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial_c, &jar_c, &params_c)).await;
+        match r {
+            Ok(Ok(s)) => break s,
+            Ok(Err(e)) => {
+                if attempt >= 2 {
+                    return err(500, format!("投屏会话启动失败: {e}"));
+                }
+                tracing::warn!("投屏开流第 {attempt} 次失败（{e}），重试");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return err(500, format!("投屏任务失败: {e}")),
+        }
     };
+    let mut session = session;
 
     let id = st.alloc_id();
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -827,6 +898,7 @@ pub async fn stream_open(
         frame_rx: Mutex::new(Some(rx)),
         attached: std::sync::atomic::AtomicBool::new(false),
         clipboard: Mutex::new(String::new()),
+        last_frame_ms: std::sync::atomic::AtomicU64::new(0),
         stop_fn: Mutex::new(Some(Box::new(move || {
             if let Some(c) = &control_for_stop {
                 let _ = c.lock().unwrap().shutdown(std::net::Shutdown::Both);
@@ -1263,6 +1335,51 @@ pub async fn devices_known_remove(Json(v): Json<Value>) -> (StatusCode, Json<Val
 }
 
 /// POST /api/devices/select {serial} —— 多设备在线时选定管理目标（持久化到 nas.json）
+/// 设备运维操作（设置页开关）：action ∈
+///   restart_adb    重启本容器 adb server（USB 自愈/会话清零）
+///   kill_foreground 杀当前前台应用（模拟"关闭应用"）
+///   wake           唤醒屏幕
+///   sleep          熄屏
+///   home           回主页
+///   force_stop_all 强制停止全部第三方应用（清理后台）
+///   grant_all_perm 给网关桥 APK 授权（如已安装）
+pub async fn device_op(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+    let Some(serial) = state::selected_serial().or_else(state::online_real_devices_first) else {
+        return err(503, "设备未连接");
+    };
+    let (cmd, ok_msg) = match action {
+        "restart_adb" => {
+            // 重启 adb server：杀设备侧残留 server 进程 + host:kill 拉起重扫
+            let _ = adb::shell_blocking(&serial, "pkill -f app_process", 5000);
+            match adb::restart_server() {
+                Ok(()) => (None, "adb server 已重启（USB 重扫完成）"),
+                Err(e) => return err(500, format!("重启失败: {e}")),
+            }
+        }
+        "kill_foreground" => (
+            Some("am force-stop $(dumpsys window | grep mCurrentFocus | grep -oE 'com[[:alnum:]._]+') | head -1".to_string()),
+            "已停止前台应用",
+        ),
+        "wake" => (Some("input keyevent KEYCODE_WAKEUP".into()), "已唤醒"),
+        "sleep" => (Some("input keyevent KEYCODE_SLEEP".into()), "已熄屏"),
+        "home" => (Some("input keyevent KEYCODE_HOME".into()), "已回主页"),
+        "force_stop_all" => (
+            Some("for p in $(pm list packages -3 | sed 's/package://'); do am force-stop $p; done".into()),
+            "已停止全部第三方应用",
+        ),
+        _ => return err(400, "未知操作"),
+    };
+    if let Some(c) = cmd {
+        let s = serial.clone();
+        let r = tokio::task::spawn_blocking(move || adb::shell_blocking(&s, &c, 30000)).await;
+        if let Ok(Err(e)) = r {
+            return err(500, format!("操作失败: {e}"));
+        }
+    }
+    ok(json!({ "ok": true, "message": ok_msg }))
+}
+
 pub async fn devices_select(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
     let serial = v
         .get("serial")
@@ -1459,30 +1576,48 @@ pub async fn guard_set(
 /// POST /api/devices/pair {host, port, code, connect_port?}
 pub async fn devices_pair(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
     let host = v.get("host").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+    // port 兼容数字与字符串（表单控件可能给字符串数字）
+    let num = |x: Option<&Value>| -> Option<u64> {
+        x.and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+    };
+    let port = num(v.get("port")).unwrap_or(0) as u16;
     let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    let connect_port = v.get("connect_port").and_then(|x| x.as_u64()).map(|p| p as u16);
+    let connect_port = num(v.get("connect_port")).map(|p| p as u16);
     if host.is_empty() || port == 0 || code.is_empty() {
         return err(400, "缺少 host/port/code");
     }
     let r = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let pair_addr = format!("{host}:{port}");
-        adb::adb_pair(&pair_addr, &code).map_err(|e| e.to_string())?;
-        // 连接：显式 connect_port > mDNS 同 IP 发现 > 同 IP:5555
-        let target = if let Some(cp) = connect_port {
-            format!("{host}:{cp}")
-        } else {
-            let found = adb::mdns_services()
-                .into_iter()
-                .find(|s| {
-                    s.svc_type.starts_with("_adb._tcp")
-                        && s.addr.split(':').next() == Some(host.as_str())
-                })
-                .map(|s| s.addr);
-            found.unwrap_or_else(|| format!("{host}:5555"))
-        };
-        adb::adb_connect(&target).map_err(|e| e.to_string())?;
-        Ok(target)
+        // 配对返回 paired:<GUID>，用于跨网段匹配连接服务
+        let paired = adb::adb_pair(&pair_addr, &code).map_err(|e| e.to_string())?;
+        let guid = paired.strip_prefix("paired:").map(|s| s.to_string());
+        // 连接：显式 connect_port > mDNS 候选（TLS connect > _adb._tcp > 5555）。
+        // 配对后 adbd 要几秒才重新通告 connect 服务，重试等待
+        if let Some(cp) = connect_port {
+            let t = format!("{host}:{cp}");
+            return match adb::adb_connect(&t) {
+                Ok(_) => Ok(t),
+                Err(e) => Err(format!("配对成功但连接失败（{t}: {e}）")),
+            };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(18);
+        let mut last_err = String::new();
+        loop {
+            for t in adb::wireless_connect_candidates(&host, &[], guid.as_deref()) {
+                match adb::adb_connect(&t) {
+                    Ok(_) => return Ok(t),
+                    Err(e) => last_err = format!("{t}: {e}"),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+        Err(format!("配对成功但连接失败（{last_err}）"))
     })
     .await;
     match r {
@@ -1591,6 +1726,174 @@ pub async fn events_status(
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+/// GET /api/events/device —— 设备事件合流 SSE：
+///   {type:"notification", pkg,title,text,key,postTime}  桥 APK 实时推送
+///   {type:"clipboard", text}                             活跃投屏会话的剪贴板（scrcpy 自动同步）
+/// 剪贴板每 2s 采样比对（有投屏会话才有源）；通知为纯事件驱动零轮询。
+/// GET /api/sms/list?box=inbox|sent|draft|all&limit= —— 设备短信（content://sms 经 shell content query）。
+/// 输出 JSON 行解析：Row: address=..., body=..., date=..., type=...
+pub async fn sms_list(Query(q): Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+    let box_ = q.get("box").cloned().unwrap_or_else(|| "all".into());
+    let limit = q.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(200).min(500);
+    let uri = match box_.as_str() {
+        "inbox" => "content://sms/inbox",
+        "sent" => "content://sms/sent",
+        "draft" => "content://sms/draft",
+        _ => "content://sms",
+    };
+    let serial = match state::selected_serial().or_else(state::online_real_devices_first) {
+        Some(s) => s,
+        None => return err(503, "设备未连接"),
+    };
+    let cmd = format!(
+        "content query --uri {uri} --projection _id:thread_id:address:person:body:date:type:read --sort date DESC 2>/dev/null | head -{limit}"
+    );
+    let r = tokio::task::spawn_blocking(move || adb::shell_blocking(&serial, &cmd, 20000)).await;
+    let out = match r {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return err(500, format!("读取短信失败: {e}")),
+        Err(e) => return err(500, format!("任务失败: {e}")),
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut msgs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("Row:") {
+            continue;
+        }
+        let mut m = serde_json::Map::new();
+        for kv in line[4..].split(", ") {
+            if let Some((k, v)) = kv.split_once('=') {
+                m.insert(k.trim().to_string(), json!(v));
+            }
+        }
+        if m.contains_key("_id") {
+            msgs.push(Value::Object(m));
+        }
+    }
+    ok(json!({ "msgs": msgs, "box": box_ }))
+}
+
+/// POST /api/sms/send {to, body} —— 发送短信：调起设备短信 App 预填（smsto: 意图），
+/// 用户在设备上点发送键确认（adb 无法跨过系统发送确认，属安全设计）。
+pub async fn sms_send(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+    let to = v.get("to").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if to.is_empty() {
+        return err(400, "缺少收件人");
+    }
+    let serial = match state::selected_serial().or_else(state::online_real_devices_first) {
+        Some(s) => s,
+        None => return err(503, "设备未连接"),
+    };
+    // shell 转义（单引号包裹，内部单引号成对）
+    let esc = |s: &str| s.replace('\'', "'\''");
+    let cmd = format!(
+        "am start -a android.intent.action.SENDTO -d 'smsto:{}' --es sms_body '{}'",
+        esc(&to),
+        esc(&body)
+    );
+    let r = tokio::task::spawn_blocking(move || adb::shell_blocking(&serial, &cmd, 10000)).await;
+    match r {
+        Ok(Ok(_)) => ok(json!({ "ok": true, "message": "已在设备上打开短信编辑（请在设备上点发送确认）" })),
+        Ok(Err(e)) => err(500, format!("拉起短信失败: {e}")),
+        Err(e) => err(500, format!("任务失败: {e}")),
+    }
+}
+
+/// GET /api/about —— 关于信息：版本/项目地址/开源组件清单（编译期从
+/// Cargo.lock 嵌入，随镜像走，无需运行时读文件）
+pub async fn about() -> Json<Value> {
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "project": "https://github.com/Apuyuseng/houttuynia",
+        "license": "MIT",
+        "components": ABOUT_COMPONENTS,
+    }).into()
+}
+
+/// 编译期嵌入的开源组件清单（name version license）
+static ABOUT_COMPONENTS: &[(&str, &str, &str)] = &[
+    ("axum", "0.8", "MIT"),
+    ("tokio", "1", "MIT"),
+    ("tower-http", "0.6", "MIT"),
+    ("rustls", "0.23", "Apache-2.0/ISC/MIT"),
+    ("rusqlite", "0.31", "MIT"),
+    ("rsa", "0.9", "MIT/Apache-2.0"),
+    ("nusb (macOS)", "0.1", "MIT/Apache-2.0"),
+    ("scrcpy server", "4.1", "Apache-2.0"),
+    ("xterm.js", "5", "MIT"),
+    ("vue", "3", "MIT"),
+    ("element-plus", "2", "MIT"),
+    ("material-design-icons", "-", "Apache-2.0"),
+];
+
+pub async fn events_device(
+    State(st): State<SharedState>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    tracing::info!("[events_device] handler 进入");
+    crate::bridge::ensure_started();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(16);
+    let mut bus_rx = crate::bridge::BUS.subscribe();
+    let tx_n = tx.clone();
+    let st2 = st.clone();
+    // 通知转发
+    tokio::spawn(async move {
+        let tx = tx_n;
+        loop {
+            match bus_rx.recv().await {
+                Ok(line) => {
+                    let mut v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                    if v.is_object() {
+                        v["type"] = json!("notification");
+                        if tx.send(Ok(SseEvent::default().data(v.to_string()))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+    // 剪贴板采样（hello 作为该任务首帧下行）
+    let tx_c = tx.clone();
+    tokio::spawn(async move {
+        let tx = tx_c;
+        tx.send(Ok(SseEvent::default().data(
+            json!({ "type": "hello" }).to_string(),
+        )))
+        .await
+        .ok();
+        let mut last = String::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut text = String::new();
+            if let Ok(streams) = st2.streams.try_lock() {
+                for s in streams.values() {
+                    if let Ok(c) = s.clipboard.try_lock() {
+                        if !c.is_empty() {
+                            text = c.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+            if !text.is_empty() && text != last {
+                last = text.clone();
+                let body = json!({ "type": "clipboard", "text": text }).to_string();
+                if tx.send(Ok(SseEvent::default().data(body))).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    // hello 在剪贴板任务里作为首帧下行（handler 返回后 axum 才开始消费流——
+    // handler 同步段 send 的帧会丢失，教训：SSE 首帧必须在 spawn 内发）
     Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }

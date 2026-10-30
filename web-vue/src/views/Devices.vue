@@ -153,6 +153,7 @@
             <el-empty v-if="!discovered.length" description="未发现" :image-size="40" />
             <div v-for="s in discovered" :key="s.addr" class="disc-row">
               <span class="mono small">{{ s.addr }}</span>
+              <el-tag size="small" type="info" style="margin-left:6px">{{ s.type.startsWith('_adb-tls-connect') ? '无线调试' : 'tcpip' }}</el-tag>
               <div style="flex:1"></div>
               <el-button size="small" @click="connectTo(s.addr)">连接</el-button>
             </div>
@@ -230,7 +231,7 @@ function battType(row) {
 async function loadDiscovered() {
   try {
     const d = await apiGet('/api/devices/discovered')
-    discovered.value = (d.services || []).filter(s => s.type.startsWith('_adb._tcp'))
+    discovered.value = (d.services || []).filter(s => s.type.startsWith('_adb._tcp') || s.type.startsWith('_adb-tls-connect'))
   } catch { /* adb 缺失时静默 */ }
 }
 
@@ -265,8 +266,8 @@ async function doPair() {
   pairing.value = true
   try {
     const r = await apiPost('/api/devices/pair', {
-      host: f.host, port: f.port, code: f.code,
-      connect_port: f.connect_port || undefined,
+      host: f.host, port: Number(f.port), code: f.code,
+      connect_port: f.connect_port ? Number(f.connect_port) : undefined,
     })
     ElMessage.success('已配对并连接 ' + (r.device || ''))
     load()

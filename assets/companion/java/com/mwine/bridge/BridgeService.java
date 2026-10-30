@@ -53,22 +53,35 @@ public class BridgeService extends NotificationListenerService {
     }
 
     private static void serve() {
-        try {
-            android.util.Log.i("mwine", "bridge server listening on 127.0.0.1:" + PORT);
-            while (true) {
-                final Socket s = server.accept();
-                android.util.Log.i("mwine", "host connected: " + s);
-                io.execute(() -> {
-                    sendToOne(s, eventJson("hello"));
-                    synchronized (clients) {
-                        clients.add(s);
+        // 自愈循环：accept 异常（如 backlog 占满后文件描述符问题）不永久杀死监听，
+        // 关闭旧 ServerSocket 重建再收（荣耀 MagicOS 长时间运行实测会偶发 accept 失败）
+        while (true) {
+            try {
+                android.util.Log.i("mwine", "bridge server listening on 127.0.0.1:" + PORT);
+                while (true) {
+                    final Socket s = server.accept();
+                    android.util.Log.i("mwine", "host connected: " + s);
+                    io.execute(() -> {
+                        sendToOne(s, eventJson("hello"));
+                        synchronized (clients) {
+                            clients.add(s);
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                android.util.Log.w("mwine", "bridge server died, rebuilding: " + e);
+                synchronized (LOCK) {
+                    try { if (server != null) server.close(); } catch (Exception ignored) {}
+                    server = null;
+                    try {
+                        server = new ServerSocket(PORT, 8, InetAddress.getByName("127.0.0.1"));
+                        android.util.Log.i("mwine", "bridge server rebuilt");
+                    } catch (Exception e2) {
+                        android.util.Log.w("mwine", "rebuild failed: " + e2);
                     }
-                });
-            }
-        } catch (Exception e) {
-            android.util.Log.w("mwine", "bridge server died: " + e);
-            synchronized (LOCK) {
-                server = null;
+                }
+                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                if (server == null) return; // 重建也失败：等下次 onCreate/重绑
             }
         }
     }

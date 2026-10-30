@@ -2,7 +2,7 @@
 //! 流程对齐桌面版 devmgr.cpp hostpair：
 //!   出码 WIFI:T:ADB;S:<service>;P:<password>;; → 手机扫码后以该服务名通告
 //!   _adb-tls-pairing._tcp → 发现后 adb pair（手机是配对服务端）→
-//!   等新的 _adb._tcp 出现 → adb connect。
+//!   连接 _adb-tls-connect._tcp（无线调试标准）/ _adb._tcp（tcpip 模式）。
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,7 +128,8 @@ fn hostpair_worker(hs: Arc<HostPairState>, service: String, password: String, wa
     let t0 = std::time::Instant::now();
     let deadline = t0 + std::time::Duration::from_millis(wait_ms);
 
-    // 配对前已在的 _adb._tcp 地址（配对后新出现的才是本机手机）
+    // 配对前已在的 _adb._tcp 地址（tcpip 模式下配对后新出现的才是本机手机；
+    // 无线调试的 _adb-tls-connect 不在此列——它配对前就一直在通告）
     let before: Vec<String> = adb::mdns_services()
         .into_iter()
         .filter(|s| s.svc_type.starts_with("_adb._tcp"))
@@ -160,48 +161,30 @@ fn hostpair_worker(hs: Arc<HostPairState>, service: String, password: String, wa
 
     // 2) adb pair（手机是配对服务端，密码即 QR 的 P 字段）
     set_state(&hs, "pairing", &format!("发现配对服务 {addr}，配对中…"), &[]);
-    if let Err(e) = adb::adb_pair(&addr, &password) {
-        set_state(&hs, "failed", &e.to_string(), &[]);
-        return;
-    }
+    let paired = match adb::adb_pair(&addr, &password) {
+        Ok(info) => info,
+        Err(e) => {
+            set_state(&hs, "failed", &e.to_string(), &[]);
+            return;
+        }
+    };
+    let guid = paired.strip_prefix("paired:").map(|s| s.to_string());
 
-    // 3) 等 _adb._tcp 新地址 → connect
+    // 3) 找连接端口 → connect。无线调试（Android 11+）的连接服务是
+    //    _adb-tls-connect._tcp（无线调试开着就一直在，并非配对后才出现，
+    //    所以不能只认"新增"）；老 tcpip 模式才是 _adb._tcp / 5555
     set_state(&hs, "connecting", "配对成功，连接设备…", &[]);
     let phone_ip = addr.split(':').next().unwrap_or("").to_string();
     let cdeadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
     while std::time::Instant::now() < cdeadline {
-        for svc in adb::mdns_services() {
-            if !svc.svc_type.starts_with("_adb._tcp") || before.contains(&svc.addr) {
-                continue;
-            }
-            let host = svc.addr.split(':').next().unwrap_or("");
-            if host != phone_ip {
-                continue;
-            }
-            match adb::adb_connect(&svc.addr) {
-                Ok(_) => {
-                    set_state(
-                        &hs,
-                        "connected",
-                        &format!("已连接 {}", svc.addr),
-                        &[("device", json!(svc.addr))],
-                    );
-                    return;
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1500)),
+        let candidates = crate::adb::wireless_connect_candidates(&phone_ip, &before, guid.as_deref());
+        for target in &candidates {
+            if let Ok(_) = adb::adb_connect(target) {
+                set_state(&hs, "connected", &format!("已连接 {target}"), &[("device", json!(target))]);
+                return;
             }
         }
-        // 兜底：同 IP 5555
-        if let Ok(_) = adb::adb_connect(&format!("{phone_ip}:5555")) {
-            set_state(
-                &hs,
-                "connected",
-                &format!("已连接 {phone_ip}:5555"),
-                &[("device", json!(format!("{phone_ip}:5555")))],
-            );
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     set_state(&hs, "failed", "配对成功但连接超时（在手机上打开「无线调试」主界面看端口后用手动连接）", &[]);
 }

@@ -5,9 +5,9 @@
 //! 长驻流（终端 pty / scrcpy server / 端口转发）经 transport::Stream 的
 //! 环回 TCP 桥暴露 TcpStream，复用原有读 写/超时/分帧代码。
 //!
-//! 仍保留的能力：mDNS DNS-SD 发现（组播+广播双通道）、无线配对
-//! （pairing.rs 纯 Rust SPAKE2+TLS）、外部 adb server 劝退（host:kill，
-//! 释放 USB 接口占用）。
+//! 仍保留的能力：mDNS DNS-SD 发现（主通道官方 adb server host:mdns:services，
+//! 兜底自研标准 mDNS 查询）、无线配对（pairing.rs 纯 Rust SPAKE2+TLS）、
+//! 外部 adb server 劝退（host:kill，释放 USB 接口占用）。
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -518,6 +518,11 @@ static FORWARDS: LazyLock<Mutex<std::collections::HashMap<(String, u16), Arc<For
 /// 自托管监听（原 adb server 的 host:forward 等价物）：每个进来的 TCP 连接
 /// 对应一路 `localabstract:` 流双向泵接。
 pub fn forward_abstract(serial: &str, tcp_port: u16, abstract_name: &str) -> AdbResult<()> {
+    forward_service(serial, tcp_port, &format!("localabstract:{abstract_name}"))
+}
+
+/// 泛化版：设备侧服务串任意（"localabstract:x" / "tcp:27185" 等）
+pub fn forward_service(serial: &str, tcp_port: u16, service: &str) -> AdbResult<()> {
     // 同端口旧转发先撤
     let _ = remove_forward(serial, tcp_port);
     let stop = Arc::new(AtomicBool::new(false));
@@ -526,7 +531,7 @@ pub fn forward_abstract(serial: &str, tcp_port: u16, abstract_name: &str) -> Adb
         .unwrap()
         .insert((serial.to_string(), tcp_port), Arc::new(ForwardEntry { stop: Arc::clone(&stop) }));
     let serial_c = serial.to_string();
-    let svc = format!("localabstract:{abstract_name}");
+    let svc = service.to_string();
     std::thread::spawn(move || {
         let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", tcp_port)) else {
             return;
@@ -599,6 +604,51 @@ pub fn adb_disconnect(serial: &str) -> AdbResult<String> {
     Ok(format!("disconnected {serial}"))
 }
 
+/// 无线连接候选（配对成功后按序尝试）：
+///   1. 同 IP 的 _adb-tls-connect._tcp —— Android 11+ 无线调试的连接端口
+///      （无线调试开着就一直在通告，并非配对后才出现，不能只认"新增"）；
+///   2. 同 IP 新出现的 _adb._tcp —— 老 `adb tcpip 5555` 模式
+///      （exclude 传配对前快照，避免连上同网其它设备）；
+///   3. {ip}:5555 兜底。
+pub fn wireless_connect_candidates(
+    host: &str,
+    exclude_adb_tcp: &[String],
+    guid: Option<&str>,
+) -> Vec<String> {
+    let svcs = mdns_services();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |a: String| {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    };
+    // _adb-tls-connect：同 IP 或 GUID 匹配（手机多网段时通告 IP 可能与配对
+    // IP 不同，GUID 才是身份；同端口跨接口监听，配对 host + 该端口也可达）
+    let mut connect_ports: Vec<u16> = Vec::new();
+    for s in svcs.iter().filter(|s| s.svc_type.starts_with("_adb-tls-connect")) {
+        let matched = s.addr.split(':').next() == Some(host)
+            || guid.map_or(false, |g| !g.is_empty() && s.name.contains(g));
+        if matched {
+            push(s.addr.clone());
+            if let Some(p) = s.addr.rsplit(':').next().and_then(|p| p.parse().ok()) {
+                if !connect_ports.contains(&p) {
+                    connect_ports.push(p);
+                }
+            }
+        }
+    }
+    for p in connect_ports {
+        push(format!("{host}:{p}"));
+    }
+    for s in svcs.iter().filter(|s| s.svc_type.starts_with("_adb._tcp")) {
+        if s.addr.split(':').next() == Some(host) && !exclude_adb_tcp.contains(&s.addr) {
+            push(s.addr.clone());
+        }
+    }
+    push(format!("{host}:5555"));
+    out
+}
+
 /// mDNS 发现的 _adb._tcp / _adb-tls-pairing._tcp 服务（adb mdns services 输出）
 #[derive(Debug, Clone)]
 pub struct MdnsService {
@@ -608,15 +658,23 @@ pub struct MdnsService {
 }
 
 pub fn mdns_services() -> Vec<MdnsService> {
-    // 组播 + 广播双通道（多接口主机上组播常因默认路由黑洞）
-    let mut list = mdns_services_broadcast();
+    // 主通道：官方 adb server 的 mDNS 栈（openscreen 后端，与桌面版同源）。
+    // 手机侧 Android mDNS 只应答标准 mDNS 查询（源端口 5353 + 组播响应），
+    // 自研临时端口查询实测收不到手机回包，故 server 在线时以它为准。
+    if let Some(list) = transport::server_mdns_services() {
+        return list
+            .into_iter()
+            .map(|(name, svc_type, addr)| MdnsService { name, svc_type, addr })
+            .collect();
+    }
+    // 兜底：server 不在（桥模式被关）时自研标准 mDNS 查询
+    let mut list = Vec::new();
     for (svc_fqdn, kind) in [
         ("_adb._tcp.local", "_adb._tcp"),
         ("_adb-tls-pairing._tcp.local", "_adb-tls-pairing._tcp"),
         ("_adb-tls-connect._tcp.local", "_adb-tls-connect._tcp"),
     ] {
-        for (name, host, port) in mdns_discover(svc_fqdn) {
-            let ip = mdns_resolve_a(&host).unwrap_or_else(|| host.clone());
+        for (name, ip, port) in mdns_discover(svc_fqdn) {
             list.push(MdnsService {
                 name,
                 svc_type: kind.to_string(),
@@ -627,51 +685,102 @@ pub fn mdns_services() -> Vec<MdnsService> {
     list
 }
 
-/// DNS-SD 发现：组播 224.0.0.251:5353 PTR 查询，收 SRV 记录拿主机名+端口。
+/// 标准 mDNS 发现（兜底，仅 adb server 不在时启用）：绑定 5353（REUSE，与
+/// mDNSResponder/avahi 共存）+ 加入组播组，按接口定向发 PTR 查询，从
+/// PTR/SRV/A 记录还原 (实例名, ip, 端口)。
+/// 要点：
+///   - 实例名在 PTR 记录里（SRV target 是设备主机名，与实例名无关——早期
+///     版本从 SRV target 推实例名导致扫码配对永远匹配不上）；
+///   - 必须从 5353 发标准查询：Android 的 mDNS 不应答临时端口的 one-shot
+///     查询；应答走组播，所以本端也必须是组成员；
+///   - macOS 上若 adb server（openscreen）同时占着 5353，组播应答会被分发
+///     到它那个套接字而非本端（实测）——这正是本函数只做兜底的原因：server
+///     在线时走 host:mdns:services，不在线时 5353 自然空出来。
 fn mdns_discover(service: &str) -> Vec<(String, String, u16)> {
-    use std::net::UdpSocket;
-    let mut out = Vec::new();
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return out };
-    sock.set_read_timeout(Some(Duration::from_millis(1200))).ok();
-    // 组播 TTL=255（DNS-SD 规范）+ 回环（本机手机也在发）
-    let s2 = socket2::SockRef::from(&sock);
-    let _ = s2.set_ttl(255);
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        let on: libc::c_int = 1;
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_MULTICAST_LOOP,
-            &on as *const libc::c_int as *const libc::c_void,
-            4,
-        );
+    let group = std::net::Ipv4Addr::new(224, 0, 0, 251);
+    let Ok(sock) = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) else {
+        return Vec::new();
+    };
+    if sock.set_reuse_address(true).is_err() {
+        return Vec::new();
     }
+    // 与系统 mDNS 守护进程共存必须 REUSE_PORT（macOS mDNSResponder /
+    // Linux avahi 均已占 5353）
+    #[cfg(unix)]
+    {
+        let _ = sock.set_reuse_port(true);
+    }
+    if sock
+        .bind(&socket2::SockAddr::from(std::net::SocketAddr::from((
+            [0, 0, 0, 0],
+            5353,
+        ))))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let ifaces = ipv4_interfaces();
+    if ifaces.is_empty() {
+        // 拿不到接口列表时按默认路由组播（内核自选出口）
+        let _ = sock.join_multicast_v4(&group, &std::net::Ipv4Addr::UNSPECIFIED);
+    } else {
+        for ip in &ifaces {
+            let _ = sock.join_multicast_v4(&group, ip);
+        }
+    }
+    let _ = sock.set_multicast_ttl_v4(255);
+
+    // 标准查询：id=0、一问 PTR（响应走组播到 5353，全组成员都能收）
     let qname = dns_encode_name(service);
     let mut query = Vec::with_capacity(12 + qname.len() + 4);
-    query.extend_from_slice(&0x1234u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
     query.extend_from_slice(&0u16.to_be_bytes());
     query.extend_from_slice(&1u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&[0u8; 6]);
     query.extend_from_slice(&qname);
     query.extend_from_slice(&0x000Cu16.to_be_bytes());
     query.extend_from_slice(&1u16.to_be_bytes());
-    let _ = sock.send_to(&query, ("224.0.0.251", 5353));
+    for ip in &ifaces {
+        let _ = sock.set_multicast_if_v4(ip);
+        let _ = sock.send_to(&query, &socket2::SockAddr::from(std::net::SocketAddr::new(
+            group.into(),
+            5353,
+        )));
+    }
+    if ifaces.is_empty() {
+        let _ = sock.send_to(&query, &socket2::SockAddr::from(std::net::SocketAddr::new(
+            group.into(),
+            5353,
+        )));
+    }
 
-    let deadline = Instant::now() + Duration::from_millis(1500);
+    // 收包：同一轮里把 PTR（实例名）、SRV（端口+主机名）、A（主机名→ip）
+    // 全部摊开成三张表再拼装
+    let deadline = Instant::now() + Duration::from_millis(1600);
     let mut buf = [0u8; 9000];
-    let mut srv_seen: Vec<(String, u16)> = Vec::new();
+    let mut ptrs: Vec<String> = Vec::new(); // 实例全名 <inst>.<svc>.local
+    let mut srvs: Vec<(String, u16, String)> = Vec::new(); // (实例全名, port, target)
+    let mut addrs: Vec<(String, String)> = Vec::new(); // (主机名, ip)
+    let sock = std::net::UdpSocket::from(sock);
+    // 短超时 + 到截止时间为止持续收：应答器有抖动延迟，中途一次空等不能提前退出
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(400)));
     while Instant::now() < deadline {
         let (n, _) = match sock.recv_from(&mut buf) {
             Ok(v) => v,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
             Err(_) => break,
         };
         let pkt = &buf[..n];
         if n < 12 {
             continue;
+        }
+        let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+        if flags & 0x8000 == 0 {
+            continue; // 查询包（含我们自己的）
         }
         let qd = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
         let mut off = 12;
@@ -686,86 +795,89 @@ fn mdns_discover(service: &str) -> Vec<(String, String, u16)> {
             if off + 10 > n {
                 break;
             }
-            let (name_end, _) = dns_read_name(pkt, off);
+            let (name_end, owner) = dns_read_name(pkt, off);
             off = name_end;
             let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
             let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
             let rdata_off = off + 10;
-            if rtype == 33 && rdata_off + 6 <= n {
+            if rtype == 12 && rdata_off + rdlen <= n {
+                // PTR：owner 是服务名，rdata 是 <实例>.<服务>.local
+                let (_, target) = dns_read_name(pkt, rdata_off);
+                if owner == service && !ptrs.contains(&target) {
+                    ptrs.push(target);
+                }
+            } else if rtype == 33 && rdata_off + 6 <= n && rdata_off + rdlen <= n {
+                // SRV：owner 是实例全名，rdata 带端口与设备主机名
                 let port = u16::from_be_bytes([pkt[rdata_off + 4], pkt[rdata_off + 5]]);
                 let (_, target) = dns_read_name(pkt, rdata_off + 6);
-                srv_seen.push((target, port));
+                if !srvs.iter().any(|(o, _, _)| *o == owner) {
+                    srvs.push((owner, port, target));
+                }
+            } else if rtype == 1 && rdlen == 4 && rdata_off + 4 <= n {
+                // A：设备主机名 → ip
+                let ip = format!(
+                    "{}.{}.{}.{}",
+                    pkt[rdata_off], pkt[rdata_off + 1], pkt[rdata_off + 2], pkt[rdata_off + 3]
+                );
+                if !addrs.iter().any(|(h, _)| *h == owner) {
+                    addrs.push((owner, ip));
+                }
             }
             off = rdata_off + rdlen;
         }
     }
-    for (target, port) in srv_seen {
-        let ip = mdns_resolve_a(&target)
-            .or_else(|| {
-                target
-                    .trim_end_matches(".local")
-                    .parse::<std::net::Ipv4Addr>()
-                    .ok()
-                    .map(|i| i.to_string())
-            });
-        if let Some(ip) = ip {
-            let inst = target.trim_end_matches(service).trim_end_matches('.').to_string();
-            out.push((inst, format!("{ip}"), port));
+
+    let mut out = Vec::new();
+    for inst_fqdn in ptrs {
+        let Some((_, port, target)) = srvs.iter().find(|(o, _, _)| *o == inst_fqdn) else {
+            continue;
+        };
+        // ip：SRV target 的 A 记录（响应附加段通常自带）；没有则跳过该实例
+        let Some((_, ip)) = addrs.iter().find(|(h, _)| h == target) else {
+            continue;
+        };
+        let suffix = format!(".{service}");
+        let name = inst_fqdn.strip_suffix(&suffix).unwrap_or(&inst_fqdn).to_string();
+        if !out.iter().any(|(n, _, _)| *n == name) {
+            out.push((name, ip.clone(), *port));
         }
     }
     out
 }
 
-fn mdns_resolve_a(host: &str) -> Option<String> {
-    use std::net::UdpSocket;
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.set_read_timeout(Some(Duration::from_millis(800))).ok();
-    let qname = dns_encode_name(host);
-    let mut q = Vec::with_capacity(12 + qname.len() + 4);
-    q.extend_from_slice(&0x4321u16.to_be_bytes());
-    q.extend_from_slice(&0u16.to_be_bytes());
-    q.extend_from_slice(&1u16.to_be_bytes());
-    q.extend_from_slice(&0u16.to_be_bytes());
-    q.extend_from_slice(&0u16.to_be_bytes());
-    q.extend_from_slice(&0u16.to_be_bytes());
-    q.extend_from_slice(&qname);
-    q.extend_from_slice(&1u16.to_be_bytes());
-    q.extend_from_slice(&1u16.to_be_bytes());
-    sock.send_to(&q, ("224.0.0.251", 5353)).ok()?;
-    let deadline = Instant::now() + Duration::from_millis(900);
-    let mut buf = [0u8; 4096];
-    while Instant::now() < deadline {
-        let (n, _) = sock.recv_from(&mut buf).ok()?;
-        let pkt = &buf[..n];
-        if n < 12 {
-            continue;
+/// 主机全部 IPv4 接口地址（组播按接口加入/发送；排除回环）。
+#[cfg(unix)]
+fn ipv4_interfaces() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut ifs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifs) != 0 {
+            return out;
         }
-        let qd = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
-        let mut off = 12;
-        for _ in 0..qd {
-            off = dns_skip_name(pkt, off);
-            off += 4;
-        }
-        let an = u16::from_be_bytes([pkt[6], pkt[7]]) as usize;
-        for _ in 0..an {
-            if off + 10 > n {
-                break;
+        let mut cur = ifs;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null()
+                && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
+            {
+                let sa = ifa.ifa_addr as *const libc::sockaddr_in;
+                let ip = std::net::Ipv4Addr::from(u32::from_be((*sa).sin_addr.s_addr));
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    if !out.contains(&ip) {
+                        out.push(ip);
+                    }
+                }
             }
-            let (ne, _) = dns_read_name(pkt, off);
-            off = ne;
-            let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
-            let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
-            let rdata_off = off + 10;
-            if rtype == 1 && rdlen == 4 && rdata_off + 4 <= n {
-                return Some(format!(
-                    "{}.{}.{}.{}",
-                    pkt[rdata_off], pkt[rdata_off + 1], pkt[rdata_off + 2], pkt[rdata_off + 3]
-                ));
-            }
-            off = rdata_off + rdlen;
+            cur = ifa.ifa_next;
         }
+        libc::freeifaddrs(ifs);
     }
-    None
+    out
+}
+
+#[cfg(not(unix))]
+fn ipv4_interfaces() -> Vec<std::net::Ipv4Addr> {
+    Vec::new()
 }
 
 fn dns_encode_name(name: &str) -> Vec<u8> {
@@ -840,123 +952,6 @@ fn dns_read_name(pkt: &[u8], mut off: usize) -> (usize, String) {
 }
 
 /// 组播发现：用广播 255.255.255.255 + 常见网段定向，补偿多接口默认路由下
-/// 224.0.0.251 出不去的问题。同样收 SRV。
-pub fn mdns_services_broadcast() -> Vec<MdnsService> {
-    let mut list = Vec::new();
-    for (svc_fqdn, kind) in [
-        ("_adb._tcp.local", "_adb._tcp"),
-        ("_adb-tls-pairing._tcp.local", "_adb-tls-pairing._tcp"),
-        ("_adb-tls-connect._tcp.local", "_adb-tls-connect._tcp"),
-    ] {
-        for (name, host, port) in mdns_broadcast_query(svc_fqdn) {
-            let ip = mdns_resolve_a(&host)
-                .or_else(|| {
-                    host.trim_end_matches(".local")
-                        .parse::<std::net::Ipv4Addr>()
-                        .ok()
-                        .map(|i| i.to_string())
-                })
-                .unwrap_or(host.clone());
-            list.push(MdnsService {
-                name,
-                svc_type: kind.to_string(),
-                addr: format!("{ip}:{port}"),
-            });
-        }
-    }
-    list
-}
-
-fn mdns_broadcast_query(service: &str) -> Vec<(String, String, u16)> {
-    use std::net::UdpSocket;
-    let mut out = Vec::new();
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return out };
-    sock.set_read_timeout(Some(Duration::from_millis(1200))).ok();
-    sock.set_broadcast(true).ok();
-    let qname = dns_encode_name(service);
-    let mut query = Vec::with_capacity(12 + qname.len() + 4);
-    query.extend_from_slice(&0x5678u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&1u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&qname);
-    query.extend_from_slice(&0x000Cu16.to_be_bytes());
-    query.extend_from_slice(&1u16.to_be_bytes());
-    // 广播到 5353 与本网段广播
-    let _ = sock.send_to(&query, ("255.255.255.255", 5353));
-    if let Ok(ip) = local_ip() {
-        if let Some(bcast) = broadcast_of(&ip) {
-            let _ = sock.send_to(&query, (bcast.as_str(), 5353));
-        }
-    }
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    let mut buf = [0u8; 9000];
-    let mut seen: Vec<(String, u16)> = Vec::new();
-    while Instant::now() < deadline {
-        let (n, _) = match sock.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        let pkt = &buf[..n];
-        if n < 12 {
-            continue;
-        }
-        let qd = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
-        let mut off = 12;
-        for _ in 0..qd {
-            off = dns_skip_name(pkt, off);
-            off += 4;
-        }
-        let total_rr = u16::from_be_bytes([pkt[6], pkt[7]]) as usize
-            + u16::from_be_bytes([pkt[8], pkt[9]]) as usize
-            + u16::from_be_bytes([pkt[10], pkt[11]]) as usize;
-        for _ in 0..total_rr {
-            if off + 10 > n {
-                break;
-            }
-            let (ne, _) = dns_read_name(pkt, off);
-            off = ne;
-            let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
-            let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
-            let rdata_off = off + 10;
-            if rtype == 33 && rdata_off + 6 <= n {
-                let port = u16::from_be_bytes([pkt[rdata_off + 4], pkt[rdata_off + 5]]);
-                let (_, target) = dns_read_name(pkt, rdata_off + 6);
-                seen.push((target, port));
-            }
-            off = rdata_off + rdlen;
-        }
-    }
-    for (target, port) in seen {
-        let ip = mdns_resolve_a(&target)
-            .or_else(|| {
-                target
-                    .trim_end_matches(".local")
-                    .parse::<std::net::Ipv4Addr>()
-                    .ok()
-                    .map(|i| i.to_string())
-            });
-        if let Some(ip) = ip {
-            let inst = target.trim_end_matches(service).trim_end_matches('.').to_string();
-            out.push((inst, format!("{ip}"), port));
-        }
-    }
-    out
-}
-
-fn local_ip() -> std::io::Result<String> {
-    // UDP 连接一个公网地址让内核选出本机出口 IP（不实际发包）
-    let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    s.connect(("8.8.8.8", 80))?;
-    Ok(s.local_addr()?.ip().to_string())
-}
-
-fn broadcast_of(ip: &str) -> Option<String> {
-    ip.rsplitn(2, '.').nth(1).map(|p| format!("{p}.255"))
-}
-
 // ===================== 外部 adb server 劝退 / USB 自愈 =====================
 
 
@@ -1030,4 +1025,36 @@ pub fn usb_adb_iface_present() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "真机环境：需本机 adb server 与同网开着无线调试的手机"]
+    fn live_mdns_discovery() {
+        let t0 = std::time::Instant::now();
+        let svcs = super::mdns_services();
+        eprintln!("mdns_services() 用时 {:?}：", t0.elapsed());
+        for s in &svcs {
+            eprintln!("  {}  {}  {}", s.name, s.svc_type, s.addr);
+        }
+        assert!(
+            svcs.iter().any(|s| s.svc_type.starts_with("_adb")),
+            "应至少发现一个 _adb 系服务（手机无线调试页需保持打开）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mdns_local_tests {
+    #[test]
+    #[ignore = "需先注册假服务：dns-sd -R studio-test123 _adb-tls-pairing._tcp local 40635"]
+    fn live_mdns_discover_local() {
+        let out = super::mdns_discover("_adb-tls-pairing._tcp.local");
+        eprintln!("mdns_discover: {out:?}");
+        assert!(
+            out.iter().any(|(n, _, p)| n == "studio-test123" && *p == 40635),
+            "应解析出实例名与端口（got {out:?}）"
+        );
+    }
 }

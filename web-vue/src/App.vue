@@ -9,7 +9,6 @@
     <header class="statusbar" @pointerdown.self="showDesktop">
       <div class="sb-left" @click="showDesktop" title="回到桌面">
         <img class="sb-logo" src="/logo.svg" alt="Houttuynia" />
-        <span class="sb-brand">鱼腥草</span>
         <span class="sb-app muted" v-if="topWin">· {{ topWin.title }}</span>
       </div>
       <div class="sb-right">
@@ -37,12 +36,62 @@
             <MsIcon name="smartphone" :size="14" />
           </span>
         </template>
-        <span class="si" :class="{ warn: !connected }"
-              :title="connected ? '网关已连接' : '网关离线'">
-          <MsIcon :name="connected ? 'biz_wifi' : 'biz_wifi_off'" :size="14" />
-        </span>
+        <button class="si sb-bell" :class="{ has: unread > 0 }" title="通知"
+                @click.stop="notifOpen = !notifOpen">
+          <MsIcon :name="unread > 0 ? 'notifications_active' : 'notifications'" :size="15" />
+          <span class="bell-badge" v-if="unread > 0">{{ unread > 99 ? '99+' : unread }}</span>
+        </button>
         <span class="sb-clock">{{ clock }}</span>
       </div>
+
+      <!-- 通知中心（macOS 风格：右侧滑出卡片列表，按时间倒序） -->
+      <transition name="nc">
+        <div class="notif-center" v-if="notifOpen" @click.stop>
+          <div class="nc-head">
+            <span class="nc-title">通知</span>
+            <button class="nc-clear" v-if="notifications.length" @click="clearNotifs">全部清除</button>
+          </div>
+          <div class="nc-list" v-if="notifGroups.length">
+            <div class="nc-group" v-for="g in notifGroups" :key="g.pkg">
+              <!-- 组头：应用图标 + 应用名 + 计数，点击折叠/展开 -->
+              <div class="nc-item nc-group-head" @click="toggleGroup(g.pkg)">
+                <div class="nc-ico" :class="{ fallback: !g.hasIcon }">
+                  <img v-if="g.hasIcon" :src="iconUrl(g.pkg)" @error="iconFailed = { ...iconFailed, [g.pkg]: true }" alt="">
+                  <span v-else class="nc-letter">{{ letterOf(g) }}</span>
+                </div>
+                <div class="nc-main">
+                  <div class="nc-row1">
+                    <span class="nc-title2">{{ g.appName || shortPkg(g.pkg) }}</span>
+                    <span class="nc-time">{{ g.last.timeAgo }}</span>
+                  </div>
+                  <div class="nc-text">{{ g.last.text || (g.last.title ? '' : '新通知') }}</div>
+                </div>
+                <span class="nc-count" v-if="g.items.length > 1">{{ g.items.length }}</span>
+                <MsIcon name="chevron_right" :size="16" class="nc-fold"
+                        :class="{ open: !folded[g.pkg] }" />
+              </div>
+              <!-- 展开的组内通知（点击 = 打开应用） -->
+              <template v-if="!folded[g.pkg]">
+                <div class="nc-item nc-sub" v-for="n in g.items" :key="n.id"
+                     @click="openApp(n.pkg)" :title="'在设备上打开 ' + (n.appName || n.pkg)">
+                  <div class="nc-ico" :class="{ fallback: !g.hasIcon }" style="width:22px;height:22px">
+                    <img v-if="g.hasIcon" :src="iconUrl(g.pkg)" @error="iconFailed = { ...iconFailed, [g.pkg]: true }" alt="">
+                    <span v-else class="nc-letter sm">{{ letterOf(g) }}</span>
+                  </div>
+                  <div class="nc-main">
+                    <div class="nc-row1">
+                      <span class="nc-title2">{{ n.title || g.appName || shortPkg(g.pkg) }}</span>
+                      <span class="nc-time">{{ n.timeAgo }}</span>
+                    </div>
+                    <div class="nc-text">{{ n.text || '（无内容）' }}</div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+          <div class="nc-empty" v-else>暂无通知</div>
+        </div>
+      </transition>
     </header>
 
     <!-- 桌面（应用网格 + 窗口层） -->
@@ -61,10 +110,12 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
-import { apiGet, authState, saveToken, imgUrl } from './api'
+import { apiGet, apiPost, authState, saveToken, imgUrl } from './api'
 import MsIcon from './components/MsIcon.vue'
 import Desktop from './components/Desktop.vue'
+import { ElMessage, ElNotification } from 'element-plus'
 import { topWin, showDesktop } from './windows'
+import { onDeviceEvent } from './sseDevice'
 
 const connected = ref(false)
 const version = ref('')
@@ -117,6 +168,93 @@ const fmtUptime = computed(() => {
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60)
   return d > 0 ? `${d}天${h}时` : h > 0 ? `${h}时${m}分` : `${m}分`
 })
+
+// ---- 通知中心：SSE 设备通知 → 按应用分组卡片（最多 50 条，新在上） ----
+const notifOpen = ref(false)
+const notifications = ref([])
+const unread = ref(0)
+const folded = ref({})       // pkg → true 折叠
+let notifSeq = 0
+const appNameCache = ref({}) // pkg → 应用名（/api/apps 取）
+const iconFailed = ref({})   // pkg → true（图标 404 后回退字母块）
+
+const notifOff = onDeviceEvent('notification', (n) => {
+  // 空通知（握手帧/无内容系统事件）直接忽略
+  if (!n.title && !n.text && !n.pkg) return
+  notifSeq += 1
+  notifications.value.unshift({
+    id: notifSeq,
+    pkg: n.pkg || '',
+    title: n.title || '',
+    text: n.text || '',
+    at: Date.now(),
+    timeAgo: '刚刚',
+  })
+  if (notifications.value.length > 50) notifications.value.pop()
+  if (!notifOpen.value) unread.value += 1
+  if (n.pkg) ensureAppName(n.pkg)
+})
+
+// 按应用分组（组内时间倒序已由 unshift 保证）
+const notifGroups = computed(() => {
+  const map = new Map()
+  for (const n of notifications.value) {
+    if (!map.has(n.pkg)) map.set(n.pkg, [])
+    map.get(n.pkg).push(n)
+  }
+  return [...map.entries()].map(([pkg, items]) => ({
+    pkg,
+    items,
+    last: items[0],
+    appName: appNameCache.value[pkg] || '',
+    hasIcon: !iconFailed.value[pkg],
+  }))
+})
+function toggleGroup(pkg) {
+  folded.value = { ...folded.value, [pkg]: !folded.value[pkg] }
+}
+function iconUrl(pkg) {
+  return `/api/apps/icon?pkg=${encodeURIComponent(pkg)}`
+}
+// 应用展示名（组头用）：无应用名时取包名尾段（com.android.shell → shell）
+function shortPkg(pkg) {
+  if (!pkg) return '设备通知'
+  const parts = pkg.split('.')
+  return parts[parts.length - 1] || pkg
+}
+// 字母块内容：应用名/包名尾段首字母大写
+function letterOf(g) {
+  const name = g.appName || shortPkg(g.pkg)
+  return (name[0] || '?').toUpperCase()
+}
+async function ensureAppName(pkg) {
+  if (appNameCache.value[pkg] !== undefined) return
+  try {
+    const d = await apiGet('/api/apps')
+    const m = {}
+    for (const a of d.apps || []) m[a.package] = a.name || a.package
+    appNameCache.value = { ...m, ...(pkg in m ? {} : { [pkg]: pkg }) }
+  } catch { appNameCache.value = { ...appNameCache.value, [pkg]: pkg } }
+}
+async function openApp(pkg) {
+  try {
+    await apiPost(`/api/apps/${encodeURIComponent(pkg)}/run`, {})
+    ElMessage.success(`已在设备上打开 ${appNameCache.value[pkg] || pkg}`)
+    notifOpen.value = false
+  } catch (e) {
+    ElMessage.error(e.message || '打开失败')
+  }
+}
+// 打开面板：清未读；时间显示每 30s 刷新（刚刚/x分钟前）
+watch(notifOpen, (v) => { if (v) unread.value = 0 })
+setInterval(() => {
+  const now = Date.now()
+  for (const n of notifications.value) {
+    const dt = Math.floor((now - n.at) / 1000)
+    n.timeAgo = dt < 60 ? '刚刚' : dt < 3600 ? Math.floor(dt / 60) + ' 分钟前' : Math.floor(dt / 3600) + ' 小时前'
+  }
+}, 30000)
+function clearNotifs() { notifications.value = []; unread.value = 0 }
 
 const needLogin = computed({
   get: () => authState.needLogin,
@@ -219,6 +357,91 @@ onUnmounted(() => {
 .sb-app { font-size: 12px; }
 .sb-right { display: flex; align-items: center; gap: 15px; overflow: hidden; white-space: nowrap; }
 .sb-clock { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* 通知铃铛 + 未读 badge */
+.sb-bell {
+  position: relative;
+  background: none; border: none; cursor: pointer;
+  color: rgba(255,255,255,0.85);
+  width: 26px; height: 26px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.sb-bell:hover { background: rgba(255,255,255,0.12); }
+.sb-bell.has { color: #8ab4f8; }
+.bell-badge {
+  position: absolute; top: -4px; right: -6px;
+  min-width: 15px; height: 15px; padding: 0 4px;
+  background: #ea4335; color: #fff;
+  font-size: 9px; font-weight: 700; line-height: 15px;
+  border-radius: 999px; text-align: center;
+}
+/* macOS 风格通知中心：右上滑出，毛玻璃卡片列表 */
+.notif-center {
+  position: fixed; top: 30px; right: 8px; z-index: 3000;
+  width: 340px; max-height: 70vh;
+  display: flex; flex-direction: column;
+  background: rgba(28, 28, 30, 0.72);
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 18px;
+  box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+  overflow: hidden;
+}
+.nc-enter-active { transition: all 0.25s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.nc-leave-active { transition: all 0.18s ease; }
+.nc-enter-from, .nc-leave-to { opacity: 0; transform: translateY(-12px) scale(0.98); }
+.nc-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px 8px;
+}
+.nc-title { font-size: 14px; font-weight: 700; color: #fff; }
+.nc-clear {
+  background: none; border: none; cursor: pointer;
+  color: #8ab4f8; font-size: 12px;
+}
+.nc-list { overflow-y: auto; padding: 0 8px 10px; }
+.nc-item {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px; margin-bottom: 8px;
+  background: rgba(255,255,255,0.09);
+  border-radius: 14px;
+}
+.nc-item:hover { background: rgba(255,255,255,0.14); }
+.nc-ico {
+  width: 30px; height: 30px; border-radius: 8px;
+  background: #4285f4; color: #fff; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.nc-main { flex: 1; min-width: 0; }
+.nc-row1 { display: flex; align-items: baseline; gap: 8px; }
+.nc-title2 { font-size: 13px; font-weight: 600; color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nc-time { margin-left: auto; font-size: 11px; color: rgba(255,255,255,0.45); flex-shrink: 0; }
+.nc-text { font-size: 12px; color: rgba(255,255,255,0.75); margin-top: 2px; line-height: 1.45; word-break: break-word; }
+.nc-empty { padding: 28px 0 34px; text-align: center; color: rgba(255,255,255,0.4); font-size: 13px; }
+.nc-count {
+  flex-shrink: 0; min-width: 18px; height: 18px; padding: 0 5px;
+  background: rgba(138,180,248,0.25); color: #8ab4f8;
+  font-size: 11px; font-weight: 700; line-height: 18px;
+  border-radius: 999px; text-align: center;
+}
+.nc-fold { color: rgba(255,255,255,0.4); flex-shrink: 0; transition: transform 0.18s; }
+.nc-fold.open { transform: rotate(90deg); }
+.nc-group { margin-bottom: 8px; }
+.nc-group-head { background: rgba(255,255,255,0.12); }
+.nc-sub {
+  margin: 4px 0 0 26px;
+  background: rgba(255,255,255,0.06);
+  cursor: pointer;
+}
+.nc-ico img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.nc-ico.fallback { background: #5f6368; }
+.nc-letter {
+  font-size: 14px; font-weight: 700; color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 100%; height: 100%;
+}
+.nc-letter.sm { font-size: 11px; }
 
 /* 状态栏指标：扁平图标+数字，仅异常态着色 */
 .si { display: inline-flex; align-items: center; gap: 4px; color: inherit; }

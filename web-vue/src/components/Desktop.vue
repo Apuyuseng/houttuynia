@@ -17,7 +17,7 @@
 
     <!-- 图标网格：业务应用在前，设备 Android 应用随后 -->
     <div class="desk-grid">
-      <div v-for="b in BIZ_APPS" :key="b.id" class="desk-item"
+      <div v-for="b in visibleBizApps()" :key="b.id" class="desk-item"
            @click="b.special === 'mirror' ? openMirror(deviceSerial) : openBiz(b.id)">
         <div class="di-wrap">
           <div class="desk-icon" :style="{ background: b.tint }">
@@ -80,15 +80,28 @@
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { apiGet, apiPost, imgUrl, fmtBytes, authState } from '../api'
+import { onDeviceEvent } from '../sseDevice'
+import { getFlags } from '../flags'
 import MsIcon from './MsIcon.vue'
 import BizWindow from './BizWindow.vue'
 import AppWindow from '../views/AppWindow.vue'
 import {
-  BIZ_APPS, bizMeta, winState,
+  BIZ_APPS, bizMeta, visibleBizApps, winState,
   openBiz, openAndroid, openMirror, closeWin, frontWin, minWin, showDesktop,
 } from '../windows'
 
 const { deviceSerial } = inject('vmState')
+
+// 设备通知 → 桌面 toast（桥 APK 实时事件，零轮询）
+onDeviceEvent('notification', (n) => {
+  if (!getFlags().notify_toast) return
+  ElNotification({
+    title: n.title || (n.pkg ? '通知 · ' + n.pkg : '设备通知'),
+    message: n.text || '',
+    type: 'info',
+    duration: 6000,
+  })
+})
 const running = computed(() => !!deviceSerial.value)
 
 // ---- 设备应用列表（SSE 推送 + 轮询兜底，与原应用库一致） ----

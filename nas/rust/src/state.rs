@@ -86,6 +86,8 @@ pub struct StreamSession {
     pub stop_fn: Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// 设备剪贴板最新内容（控制通道设备消息读取线程更新）
     pub clipboard: Mutex<String>,
+    /// 最后一次视频帧到达时间（毫秒时间戳）——空闲回收看门狗用
+    pub last_frame_ms: AtomicU64,
 }
 
 impl StreamSession {
@@ -272,4 +274,9 @@ pub fn config_save(v: &Value) -> std::io::Result<()> {
 
 pub fn config_get_str(key: &str) -> Option<String> {
     config_load().get(key)?.as_str().map(String::from)
+}
+
+/// 第一台在线真机（device_op 兜底用）
+pub fn online_real_devices_first() -> Option<String> {
+    online_real_devices().into_iter().next()
 }

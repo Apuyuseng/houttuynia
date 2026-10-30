@@ -32,8 +32,8 @@ use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, KeyLog, SignatureScheme};
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
+use sha2::{Digest, Sha256, Sha512};
 
 const CLIENT_NAME: &[u8] = b"adb pair client\0"; // sizeof 含 NUL = 16
 const SERVER_NAME: &[u8] = b"adb pair server\0";
@@ -194,8 +194,8 @@ impl Zeroize for [u8; 64] {
 /// 密文 = 明文 || 16B tag（与 EVP_AEAD_CTX_seal 一致）。
 struct PairCipher {
     aead: Aes128Gcm,
-    enc_seq: u32,
-    dec_seq: u32,
+    enc_seq: u64,
+    dec_seq: u64,
 }
 
 impl PairCipher {
@@ -211,8 +211,9 @@ impl PairCipher {
     }
 
     fn encrypt(&mut self, pt: &[u8]) -> Result<Vec<u8>, String> {
+        // AOSP aes_128_gcm.cpp：nonce = LE64 序号 || 4 零字节
         let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&self.enc_seq.to_le_bytes());
+        nonce[..8].copy_from_slice(&self.enc_seq.to_le_bytes());
         self.enc_seq += 1;
         self.aead
             .encrypt(Nonce::from_slice(&nonce), pt)
@@ -221,7 +222,7 @@ impl PairCipher {
 
     fn decrypt(&mut self, ct: &[u8]) -> Result<Vec<u8>, String> {
         let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&self.dec_seq.to_le_bytes());
+        nonce[..8].copy_from_slice(&self.dec_seq.to_le_bytes());
         self.dec_seq += 1;
         self.aead
             .decrypt(Nonce::from_slice(&nonce), ct)
@@ -281,73 +282,6 @@ impl ServerCertVerifier for AcceptAnyVerifier {
 
 /// 通过 KeyLog 捕获 EXPORTER_SECRET（rustls 不暴露导出主密钥，
 /// 而 BoringSSL 的 TLS1.3 导出算法与 RFC 8448 不同，必须拿到原始密钥自行计算）。
-#[derive(Debug)]
-struct ExporterCapture {
-    inner: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-}
-
-impl KeyLog for ExporterCapture {
-    fn will_log(&self, label: &str) -> bool {
-        label == "EXPORTER_SECRET"
-    }
-
-    fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
-        if label == "EXPORTER_SECRET" {
-            if let Ok(mut g) = self.inner.lock() {
-                *g = Some(secret.to_vec());
-            }
-        }
-    }
-}
-
-/// RFC 8448 HKDF-Expand-Label：info = u16be(L) || u8(len) "tls13 "+Label || u8(len) Context。
-fn hkdf_label_info(label: &[u8], ctx: &[u8], out_len: usize) -> Vec<u8> {
-    let mut info = Vec::with_capacity(2 + 7 + label.len() + 1 + ctx.len());
-    info.extend_from_slice(&(out_len as u16).to_be_bytes());
-    info.push((6 + label.len()) as u8);
-    info.extend_from_slice(b"tls13 ");
-    info.extend_from_slice(label);
-    info.push(ctx.len() as u8);
-    info.extend_from_slice(ctx);
-    info
-}
-
-fn hkdf_expand_label_sha256(prk: &[u8], label: &[u8], ctx: &[u8], out_len: usize) -> Vec<u8> {
-    let hk = hkdf::Hkdf::<Sha256>::new(None, prk);
-    let mut out = vec![0u8; out_len];
-    hk.expand(&hkdf_label_info(label, ctx, out_len), &mut out)
-        .expect("HKDF-Expand-Label");
-    out
-}
-
-fn hkdf_expand_label_sha384(prk: &[u8], label: &[u8], ctx: &[u8], out_len: usize) -> Vec<u8> {
-    let hk = hkdf::Hkdf::<Sha384>::new(None, prk);
-    let mut out = vec![0u8; out_len];
-    hk.expand(&hkdf_label_info(label, ctx, out_len), &mut out)
-        .expect("HKDF-Expand-Label");
-    out
-}
-
-/// BoringSSL 版 TLS1.3 密钥导出（tls13_enc.cc，与 RFC 8448 单步不同）：
-///   derived = HKDF-Expand-Label(exporter_master, label, Hash(""), N)
-///   out     = HKDF-Expand-Label(derived, "exporter", Hash(context), L)
-fn boringssl_export(
-    exporter_master: &[u8],
-    is_sha384: bool,
-    label: &[u8],
-    out_len: usize,
-) -> Vec<u8> {
-    if is_sha384 {
-        let empty = Sha384::digest([]);
-        let derived = hkdf_expand_label_sha384(exporter_master, label, &empty, 48);
-        hkdf_expand_label_sha384(&derived, b"exporter", &empty, out_len)
-    } else {
-        let empty = Sha256::digest([]);
-        let derived = hkdf_expand_label_sha256(exporter_master, label, &empty, 32);
-        hkdf_expand_label_sha256(&derived, b"exporter", &empty, out_len)
-    }
-}
-
 /// 无线调试 TLS 连接（_adb._tcp）：用手机已信任的 adbkey 自签证书做
 /// 客户端证书，与 adbd 的 TLS 服务端握手后即建立加密 ADB 通道。
 /// 这是 Android 11+ 无线调试的标准连接方式，授权持久化无需重复弹窗。
@@ -359,7 +293,13 @@ pub fn tls_adb_connect(addr: &str) -> Result<(ClientConnection, TcpStream), Stri
         .ok_or("无可达地址")?;
     let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
         .map_err(|e| format!("TLS 端口连接失败: {e}"))?;
+    tls_wrap(stream, &host)
+}
+
+/// 对已建立的 TCP 连接做无线调试 TLS 升级（STLS 流程的第二阶段）。
+pub fn tls_wrap(mut stream: TcpStream, host: &str) -> Result<(ClientConnection, TcpStream), String> {
     stream.set_nodelay(true).ok();
+    stream.set_nonblocking(false).ok();
 
     // 用持久 adbkey 生成自签证书（无线调试服务端校验这个）
     let adbkey = crate::adbkeys::load_or_create();
@@ -370,9 +310,11 @@ pub fn tls_adb_connect(addr: &str) -> Result<(ClientConnection, TcpStream), Stri
         .with_client_auth_cert(vec![cert_der], key_der.into())
         .map_err(|e| format!("TLS 客户端配置失败: {e}"))?;
     cfg.dangerous().set_certificate_verifier(std::sync::Arc::new(AcceptAnyVerifier));
+    // 无线调试 ALPN：AOSP 用 "adb"；不设置则某些固件拒绝。若后续实测被设备拒，
+    // 可试 vec![b"adb".to_vec(), b"adb-tls".to_vec()] 候选协商。
     cfg.alpn_protocols = vec![b"adb".to_vec()];
 
-    let server_name = ServerName::try_from(host).map_err(|e| format!("SNI 失败: {e}"))?;
+    let server_name = ServerName::try_from(host.to_string()).map_err(|e| format!("SNI 失败: {e}"))?;
     let mut tls = ClientConnection::new(std::sync::Arc::new(cfg), server_name)
         .map_err(|e| format!("TLS 初始化失败: {e}"))?;
     while tls.is_handshaking() {
@@ -395,9 +337,7 @@ fn adbkey_self_signed_cert(key: &rsa::RsaPrivateKey) -> Result<(CertificateDer<'
     Ok((CertificateDer::from(cert.der().to_vec()), key_der))
 }
 
-fn make_client_config(
-    exporter: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-) -> Result<ClientConfig, String> {
+fn make_client_config() -> Result<ClientConfig, String> {
     // 临时自签 ECDSA P-256 证书（配对专用，用完即弃）
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| format!("生成配对密钥失败: {e}"))?;
@@ -409,13 +349,23 @@ fn make_client_config(
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
-    let mut cfg = ClientConfig::builder()
+    // 只提供 SHA-256 套件：实测部分固件（魅族 FlymeOS）配对码弹窗的服务端
+    // 固定选 SHA384 套件、口令推导却按 SHA256 算——套件哈希与导出推导错位
+    // 导致 SPAKE2 口令不一致（「配对解密失败」）。强制 SHA256 后两端一致；
+    // 标准服务端（按协商哈希推导）不受影响。
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .cipher_suites
+        .retain(|s| s.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+    let mut cfg = ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS 版本配置失败: {e}"))?
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_client_auth_cert(vec![cert_der], key_der.into())
         .map_err(|e| format!("TLS 客户端配置失败: {e}"))?;
     cfg.dangerous()
         .set_certificate_verifier(std::sync::Arc::new(AcceptAnyVerifier));
-    cfg.key_log = std::sync::Arc::new(ExporterCapture { inner: exporter });
+    cfg.alpn_protocols = vec![b"adb".to_vec()];
     Ok(cfg)
 }
 
@@ -436,17 +386,21 @@ fn write_packet(tls: &mut ClientConnection, stream: &mut TcpStream, ty: u8, payl
 fn read_exact_tls(tls: &mut ClientConnection, stream: &mut TcpStream, n: usize) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; n];
     let mut filled = 0;
+    // Stream::read 具备阻塞读语义：close_notify → Ok(0)＝真 EOF；
+    // 读超时（EAGAIN/ETIMEDOUT）是"暂无数据"，继续等而不是当成对端关闭
     while filled < n {
-        match tls.reader().read(&mut out[filled..]) {
-            Ok(k) if k > 0 => {
-                filled += k;
-                continue;
+        let mut st = rustls::Stream::new(&mut *tls, &mut *stream);
+        match st.read(&mut out[filled..]) {
+            Ok(0) => return Err("TLS 对端关闭".into()),
+            Ok(k) => filled += k,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            _ => {}
-        }
-        match tls.complete_io(stream) {
-            Ok((_, incoming)) if incoming == 0 => return Err("TLS 对端关闭".into()),
-            Ok(_) => {}
             Err(e) => return Err(format!("TLS 读取失败: {e}")),
         }
     }
@@ -485,8 +439,12 @@ fn load_adbkey_pub() -> Result<Vec<u8>, String> {
     Ok(line.as_bytes().to_vec())
 }
 
-/// 与手机配对端口执行完整配对流程。password = 配对码。
-/// 成功返回对端设备信息（GUID），手机此后信任本机 adbkey。
+/// 与手机配对端口执行完整配对流程。password = 配对码 || TLS1.3 导出密钥
+/// （AOSP 语义：label "adb-label" 连 NUL 共 10B、长度 64；导出值与现行
+/// BoringSSL/OpenSSL 一致，已用本地 OpenSSL 神谕与真机双向验证）。
+/// 注意：客户端仅提供 SHA256 套件（实测部分固件配对码服务端固定选
+/// SHA384 套件却按 SHA256 推导口令，套件受限后两端一致）。
+/// 成功返回 paired:<GUID>（跨网段匹配连接服务用），手机此后信任本机 adbkey。
 pub fn pair(addr: &str, code: &str) -> Result<String, String> {
     let host = addr
         .split(':')
@@ -504,29 +462,23 @@ pub fn pair(addr: &str, code: &str) -> Result<String, String> {
         .set_read_timeout(Some(Duration::from_secs(15)))
         .ok();
     stream.set_nodelay(true).ok();
+    // connect_timeout 可能残留非阻塞模式；读超时(EAGAIN)时 rustls 的
+    // complete_io 会返回 Ok((n,0))，若不恢复阻塞会把 WouldBlock 误判成 EOF
+    stream.set_nonblocking(false).ok();
 
     let server_name = ServerName::try_from(host)
         .map_err(|_| "配对地址非法".to_string())?;
-    let exporter_slot: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let cfg = make_client_config(exporter_slot.clone())?;
+    let cfg = make_client_config()?;
     let mut tls = ClientConnection::new(std::sync::Arc::new(cfg), server_name)
         .map_err(|e| format!("TLS 初始化失败: {e}"))?;
     while tls.is_handshaking() {
         tls.complete_io(&mut stream).map_err(|e| format!("TLS 握手失败: {e}"))?;
     }
 
-    // 口令 = 配对码 || BoringSSL 版 TLS1.3 导出密钥（label 含 NUL，与 sizeof 行为一致）
-    let exporter_master = exporter_slot
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .ok_or("TLS 导出主密钥缺失（EXPORTER_SECRET 未记录）")?;
-    let is_sha384 = matches!(
-        tls.negotiated_cipher_suite().map(|s| s.suite()),
-        Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)
-    );
-    let exported = boringssl_export(&exporter_master, is_sha384, TLS_EXPORT_LABEL, 64);
+    // 口令 = 配对码 || TLS1.3 导出密钥（64B）
+    let mut exported = [0u8; 64];
+    tls.export_keying_material(&mut exported, TLS_EXPORT_LABEL, None)
+        .map_err(|e| format!("TLS 导出密钥失败: {e}"))?;
     let mut password = code.as_bytes().to_vec();
     password.extend_from_slice(&exported);
 
@@ -604,5 +556,18 @@ mod tests {
         // 序列号递增：第二条消息 nonce 不同
         let ct2 = a.encrypt(&pt).unwrap();
         assert_ne!(ct, ct2);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    #[test]
+    #[ignore = "真机抓包/联调：MWINE_PAIR_ADDR 与 MWINE_PAIR_CODE 指定配对地址（可指向本地代理）"]
+    fn live_pair() {
+        let addr = std::env::var("MWINE_PAIR_ADDR").expect("MWINE_PAIR_ADDR");
+        let code = std::env::var("MWINE_PAIR_CODE").expect("MWINE_PAIR_CODE");
+        let t0 = std::time::Instant::now();
+        let r = super::pair(&addr, &code);
+        eprintln!("pair({addr}) 用时 {:?} 结果: {r:?}", t0.elapsed());
     }
 }

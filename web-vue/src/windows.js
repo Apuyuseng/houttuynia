@@ -1,22 +1,29 @@
 // Android 平板桌面：统一窗口管理。
 // 业务功能与设备 Android 应用都是桌面上的「app」，点击开独立自由窗口。
 import { reactive, computed, defineAsyncComponent } from 'vue'
+import { getFlags } from './flags'
 
 // 业务应用注册表（桌面图标 + 窗口内容组件，懒加载保持代码分割）
 export const BIZ_APPS = [
   // 屏幕镜像：特殊窗口（AppWindow 主屏形态，打开即全幅画面），不走 BizWindow
   { id: 'mirror',   title: '屏幕镜像', icon: 'biz_space_dashboard', tint: '#4285f4', w: 430, h: 700,
     special: 'mirror' },
-  { id: 'devices',  title: '真机连接', icon: 'biz_smartphone', tint: '#34a853', w: 660, h: 540,
-    comp: defineAsyncComponent(() => import('./views/Devices.vue')) },
   { id: 'files',    title: '文件',     icon: 'biz_folder', tint: '#00acc1', w: 660, h: 540,
     comp: defineAsyncComponent(() => import('./views/Files.vue')) },
+  { id: 'sms',      title: '短信',     icon: 'biz_terminal', tint: '#34a853', w: 760, h: 560,
+    comp: defineAsyncComponent(() => import('./views/Sms.vue')) },
   { id: 'terminal', title: '终端',     icon: 'biz_terminal', tint: '#300a24', w: 860, h: 620,
     comp: defineAsyncComponent(() => import('./views/Terminal.vue')) },
   { id: 'settings', title: '设置',     icon: 'biz_settings', tint: '#5f6368', w: 620, h: 540,
     comp: defineAsyncComponent(() => import('./views/Settings.vue')) },
 ]
 export function bizMeta(id) { return BIZ_APPS.find(b => b.id === id) }
+
+// 桌面可见业务应用（功能开关过滤；mirror/terminal 等核心项不过滤）
+export function visibleBizApps() {
+  const f = getFlags()
+  return BIZ_APPS.filter(b => b.id !== 'files' || f.files_app)
+}
 
 // 窗口：{ key, kind:'biz'|'app', id, title, app?, z, minimized }
 export const winState = reactive({ list: [], seq: 0, zTop: 100 })

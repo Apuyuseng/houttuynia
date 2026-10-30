@@ -8,6 +8,7 @@
 //!   MWINE_HEADLESS 无头启动模拟器（-no-window）
 
 mod adb;
+mod bridge;
 mod adbkeys;
 mod api;
 mod console;
@@ -141,6 +142,17 @@ fn scrcpy_feeder(
     tx: tokio::sync::mpsc::Sender<FrameMsg>,
     stream: Arc<state::StreamSession>,
 ) {
+    // 标记活动时间（帧到达即刷新；空闲回收看门狗读取）
+    let touch = |s: &state::StreamSession| {
+        s.last_frame_ms.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    };
+    touch(&stream);
     let mut last_size = (session.width, session.height);
     loop {
         if stream.ended.load(std::sync::atomic::Ordering::SeqCst) {
@@ -332,6 +344,17 @@ async fn main() {
                     .map(|ds| !ds.iter().any(|d| d.serial == serial))
                     .unwrap_or(true)
                 {
+                    // 快速端口探测：TCP 通才走完整 connect（省无谓的握手超时）
+                    let host = serial.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+                    let port: u16 = serial.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(5555);
+                    let reachable = std::net::TcpStream::connect_timeout(
+                        &format!("{host}:{port}").parse().unwrap(),
+                        std::time::Duration::from_millis(800),
+                    ).is_ok();
+                    if !reachable {
+                        tracing::debug!("回连跳过（{serial} 端口未开）");
+                        continue;
+                    }
                     match adb::adb_connect(&serial) {
                         Ok(_) => tracing::info!("已回连设备 {serial}"),
                         Err(e) => tracing::debug!("回连 {serial} 未成功: {e}"),
@@ -378,8 +401,12 @@ async fn main() {
     let api = Router::new()
         // 基础
         .route("/status", get(api::status))
+        .route("/about", get(api::about))
+        .route("/sms/list", get(api::sms_list))
+        .route("/sms/send", post(api::sms_send))
         .route("/events/status", get(api::events_status))
         .route("/events/apps", get(api::events_apps))
+        .route("/events/device", get(api::events_device))
         .route("/perf", get(api::perf))
         // 应用
         .route("/apps", get(api::apps))
@@ -410,6 +437,7 @@ async fn main() {
         .route("/devices/connect", post(api::devices_connect))
         .route("/devices/disconnect", post(api::devices_disconnect))
         .route("/devices/select", post(api::devices_select))
+        .route("/device/op", post(api::device_op))
         .route("/devices/known/remove", post(api::devices_known_remove))
         .route("/device/info", get(api::device_info))
         .route("/guard", get(api::guard_get).post(api::guard_set))

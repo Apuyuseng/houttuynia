@@ -36,6 +36,8 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ScrcpyWebPlayer } from '../player'
 import { imgUrl } from '../api'
+import { getFlags } from '../flags'
+import { onDeviceEvent } from '../sseDevice'
 import MsIcon from '../components/MsIcon.vue'
 
 const props = defineProps({
@@ -101,13 +103,16 @@ async function resolveDisplaySize() {
 
 let player = null
 let canvas = null
+let offClip = null
 
 onMounted(async () => {
   await resolveDisplaySize()
   // 真机主屏镜像：原始分辨率直投（max_size=0 = scrcpy 不缩放；默认档会
   // 把 720×1600 压到 576×1280，画面明显发糊）。USB 直连带宽足够 8M。
+  const flags = getFlags()
+  const audioPart = flags.audio_stream ? '' : '&audio=0'
   const openQuery = props.deviceSerial
-    ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=30`
+    ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=30${audioPart}`
     : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`
   player = new ScrcpyWebPlayer({
     openQuery,
@@ -133,7 +138,16 @@ onMounted(async () => {
   box.appendChild(canvas)
   // 宿主输入法捕获（隐藏输入框承载 IME 组合）
   player.attachIme(imeRef.value, { onPreedit: (t) => { preedit.value = t } })
-  startClipboardSync()
+  if (props.deviceSerial && getFlags().clipboard_sync) {
+    // SSE 剪贴板推送（桥/投屏会话实时事件）；组件卸载时随 SSE 单例常驻，
+    // 不额外清理（handlers 列表极小）
+    offClip = onDeviceEvent('clipboard', (d) => {
+      if (d.text && d.text !== lastClip) {
+        lastClip = d.text
+        navigator.clipboard.writeText(d.text).catch(() => {})
+      }
+    })
+  }
   // 不 await：start() 会阻塞到流结束；失败由 catch 处理
   player.start().catch((e) => {
     ElMessage.error(`${title}：投屏失败 ${e.message}`)
@@ -142,7 +156,58 @@ onMounted(async () => {
 })
 onUnmounted(() => {
   stopClipboardSync()
+  if (offClip) { offClip(); offClip = null }
   if (player) { const p = player; player = null; p.stop() }
+})
+
+// ---- 会话主动回收（后端空闲看门狗兜底，这里尽力即时关）----
+// 1) 页面刷新/关闭：sendBeacon 异步 close（不阻塞卸载）
+// 2) 长时间隐藏（切后台标签 >60s）：主动关会话省 USB 带宽与设备编码开销；
+//    回到前台重新开流（该窗口的 attached 已置位，需新建会话——openStream 重入即可）
+let sessionId = null
+const origOpen = ScrcpyWebPlayer.prototype.start
+window.addEventListener('beforeunload', () => {
+  const id = player?.id
+  if (!id) return
+  // sendBeacon 不带自定义 header——token 走 query（网关 auth 中间件兼容 query token）
+  const blob = new Blob([JSON.stringify({})], { type: 'application/json' })
+  navigator.sendBeacon?.(
+    `/api/stream/${id}/close?token=${encodeURIComponent(authState.token)}`, blob
+  )
+})
+let hideTimer = null
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && player) {
+    // 隐藏 60s 后主动关会话（省设备编码开销；看门狗 90s 兜底）
+    hideTimer = setTimeout(() => {
+      const p = player
+      player = null
+      liveOn.value = false
+      p?.stop()
+    }, 60000)
+  }
+  if (document.visibilityState === 'visible' && !player) {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null }
+    // 从后台回到前台：重开投屏（原会话已被可见性守卫或看门狗回收）
+    player = new ScrcpyWebPlayer({
+      openQuery: props.deviceSerial
+        ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=30`
+        : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`,
+      onStatus: (t) => { status.value = t },
+      onFirstFrame: () => { ready.value = true; liveOn.value = true },
+      onEnd: () => { liveOn.value = false },
+    })
+    bodyRef.value.appendChild(player.canvas)
+    if (props.deviceSerial && getFlags().clipboard_sync) {
+      offClip = onDeviceEvent('clipboard', (d) => {
+        if (d.text && d.text !== lastClip) {
+          lastClip = d.text
+          navigator.clipboard.writeText(d.text).catch(() => {})
+        }
+      })
+    }
+    player.start().catch(() => {})
+  }
 })
 
 function key(k) { player && player.key(k) }
