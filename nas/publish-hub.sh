@@ -2,6 +2,9 @@
 # Docker Hub 发布脚本（在已完成 docker login 的机器上执行）
 # 用法：REG=apuyuseng sh nas/publish-hub.sh
 # 依赖：/tmp/crane、/tmp/layer-amd64.tar、/tmp/layer-arm64.tar（已组装）
+# ⚠️ 层包 tar 必须在 Linux 容器内打包（如 alpine tar --format=gnu）——
+# macOS 的 tar 会把 com.apple.provenance 等 xattr 写进 pax 头，Linux 上的
+# Docker 解层时报 lsetxattr "operation not supported"
 set -e
 REG=${REG:-apuyuseng}
 REPO=${REPO:-houttuynia-nas}
