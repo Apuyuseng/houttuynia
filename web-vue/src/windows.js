@@ -19,10 +19,14 @@ export const BIZ_APPS = [
 ]
 export function bizMeta(id) { return BIZ_APPS.find(b => b.id === id) }
 
-// 桌面可见业务应用（功能开关过滤；mirror/terminal 等核心项不过滤）
-export function visibleBizApps() {
+// 桌面可见业务应用（功能开关过滤；mirror/terminal 等核心项不过滤）。
+// 设备未连接时仅保留「设置」——其余应用（镜像/文件/短信/终端）都依赖
+// adb 设备，展示无意义；连接恢复后自动回来
+export function visibleBizApps(deviceOnline = true) {
   const f = getFlags()
-  return BIZ_APPS.filter(b => b.id !== 'files' || f.files_app)
+  return BIZ_APPS
+    .filter(b => b.id !== 'files' || f.files_app)
+    .filter(b => deviceOnline || b.id === 'settings')
 }
 
 // 窗口：{ key, kind:'biz'|'app', id, title, app?, z, minimized }

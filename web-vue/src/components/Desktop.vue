@@ -17,7 +17,7 @@
 
     <!-- 图标网格：业务应用在前，设备 Android 应用随后 -->
     <div class="desk-grid">
-      <div v-for="b in visibleBizApps()" :key="b.id" class="desk-item"
+      <div v-for="b in visibleBizApps(running)" :key="b.id" class="desk-item"
            @click="b.special === 'mirror' ? openMirror(deviceSerial) : openBiz(b.id)">
         <div class="di-wrap">
           <div class="desk-icon" :style="{ background: b.tint }">
@@ -48,7 +48,7 @@
     </div>
     <div v-if="loading" class="desk-hint">读取中…</div>
     <div v-else-if="!running" class="desk-hint">
-      真机未连接 —— 打开「真机连接」接入设备后，设备应用会出现在桌面上
+      真机未连接 —— 打开「设置 → 真机连接」接入设备（USB / 无线 / 扫码），连接后应用会出现在桌面上
     </div>
 
     <!-- 任务栏：已打开窗口（Android 平板 taskbar 观感） -->
