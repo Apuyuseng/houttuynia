@@ -43,6 +43,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # TODO(临时诊断): 定位 DockerHub secret 未被读到的命名/位置问题，定位后删除
+      - name: Debug secret presence
+        run: |
+          echo "repo=${GITHUB_REPOSITORY}"
+          echo "DOCKERHUB_TOKEN=${{ secrets.DOCKERHUB_TOKEN != '' }}"
+          echo "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME != '' }}"
+          echo "DOCKER_HUB_TOKEN=${{ secrets.DOCKER_HUB_TOKEN != '' }}"
+          echo "DH_TOKEN=${{ secrets.DH_TOKEN != '' }}"
+          echo "DOCKERHUB_PAT=${{ secrets.DOCKERHUB_PAT != '' }}"
+          echo "TOKEN=${{ secrets.TOKEN != '' }}"
+
       # ---------- Web 前端 ----------
       - uses: actions/setup-node@v4
         with:
