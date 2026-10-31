@@ -538,9 +538,8 @@ mw::Result<bool> Session::ensureReady(const QString& serial)
     if (!have) {
         const QString bin = findHostBinary();
         if (bin.isEmpty())
-            return R::Err(
-                QStringLiteral("未找到 ecapture 二进制（%1 与可执行文件同目录均不存在）")
-                    .arg(QDir(mw::mwineDir()).filePath(QStringLiteral("bin/ecapture"))));
+            return R::Err(QStringLiteral(
+                "流量分析组件未安装：请在流量分析页按提示下载 ecapture（约 13MB）"));
         QFile f(bin);
         if (!f.open(QIODevice::ReadOnly))
             return R::Err(QStringLiteral("IO 错误：无法读取 %1").arg(bin));
@@ -619,8 +618,10 @@ mw::Result<bool> Session::start(const QString& serial, const TargetSpec& targets
         return mw::Result<bool>::Err(QStringLiteral("会话已在运行"));
     const QString bin = findHostBinary();
     if (bin.isEmpty()) {
-        lastError_ = QStringLiteral("未找到 ecapture 二进制（%1 与可执行文件同目录均不存在）")
-                         .arg(QDir(mw::mwineDir()).filePath(QStringLiteral("bin/ecapture")));
+        lastError_ = QStringLiteral(
+                         "流量分析组件未安装：请在流量分析页按提示下载 ecapture（约 13MB）")
+                         + QStringLiteral("（安装位 %1）")
+                               .arg(QDir(mw::mwineDir()).filePath(QStringLiteral("bin/ecapture")));
         return mw::Result<bool>::Err(lastError_);
     }
     auto st = Store::open(dbPath_);

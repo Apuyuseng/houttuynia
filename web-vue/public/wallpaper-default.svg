@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1200" width="1920" height="1200">
+  <defs>
+    <!-- 基底：Material 深色，自上而下极轻沉降 -->
+    <linearGradient id="base" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#181920"/>
+      <stop offset="0.6" stop-color="#141218"/>
+      <stop offset="1" stop-color="#121016"/>
+    </linearGradient>
+    <!-- 氛围光：取叶色——上部叶绿、右下叶基红晕 -->
+    <radialGradient id="glowLeaf" cx="50%" cy="40%" r="60%">
+      <stop offset="0" stop-color="#7CB84E" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#4E9A3F" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#141218" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowFlush" cx="84%" cy="90%" r="55%">
+      <stop offset="0" stop-color="#B5434E" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#141218" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx="50%" cy="46%" r="75%">
+      <stop offset="0.62" stop-color="#000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.32"/>
+    </radialGradient>
+    <filter id="softBlur" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="52"/>
+    </filter>
+
+    <!-- 以下为 logo 叶片原画（与 logo.svg 同一矢量稿） -->
+    <linearGradient id="blade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#A9D468"/>
+      <stop offset="0.55" stop-color="#7CB84E"/>
+      <stop offset="1" stop-color="#4E9A3F"/>
+    </linearGradient>
+    <linearGradient id="flush" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#C25B4E" stop-opacity="0"/>
+      <stop offset="0.55" stop-color="#C25B4E" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#B5434E" stop-opacity="0.5"/>
+    </linearGradient>
+    <linearGradient id="petiole" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6FAF4C"/>
+      <stop offset="0.5" stop-color="#9C5A50"/>
+      <stop offset="1" stop-color="#AD4A5E"/>
+    </linearGradient>
+    <clipPath id="leafClip">
+      <path d="M 272,84
+               C 246,110 206,168 166,226
+               C 128,282 112,330 128,368
+               C 140,394 158,412 182,420
+               C 200,426 218,426 232,418
+               C 242,394 250,364 256,336
+               C 264,372 276,398 292,414
+               C 314,428 342,424 362,404
+               C 388,378 398,340 394,300
+               C 386,244 344,158 300,104
+               C 294,96 284,88 272,84 Z"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1920" height="1200" fill="url(#base)"/>
+  <rect width="1920" height="1200" fill="url(#glowLeaf)"/>
+  <rect width="1920" height="1200" fill="url(#glowFlush)"/>
+
+  <!-- 叶片背光晕 -->
+  <ellipse cx="960" cy="520" rx="300" ry="290" fill="#7CB84E" opacity="0.13" filter="url(#softBlur)"/>
+
+  <!-- logo 叶片：居中略偏上（512 稿中心约 (256,285)，放大 1.06 倍） -->
+  <g transform="translate(960,512) scale(1.06) translate(-256,-285)">
+    <path d="M 257,346 C 260,392 250,442 214,486"
+          fill="none" stroke="url(#petiole)" stroke-width="14" stroke-linecap="round"/>
+    <path d="M 272,84
+             C 246,110 206,168 166,226
+             C 128,282 112,330 128,368
+             C 140,394 158,412 182,420
+             C 200,426 218,426 232,418
+             C 242,394 250,364 256,336
+             C 264,372 276,398 292,414
+             C 314,428 342,424 362,404
+             C 388,378 398,340 394,300
+             C 386,244 344,158 300,104
+             C 294,96 284,88 272,84 Z"
+          fill="url(#blade)"/>
+    <g clip-path="url(#leafClip)">
+      <rect x="96" y="330" width="320" height="110" fill="url(#flush)"/>
+    </g>
+    <g fill="none" stroke="#F4F7E3" stroke-linecap="round">
+      <path d="M 256,336 C 258,260 262,180 271,92" stroke-width="12"/>
+      <path d="M 256,336 C 226,328 190,315 154,302" stroke-width="9"/>
+      <path d="M 256,336 C 290,326 332,310 366,294" stroke-width="9"/>
+      <path d="M 256,336 C 230,352 202,374 176,398" stroke-width="9"/>
+      <path d="M 256,336 C 286,354 316,378 344,400" stroke-width="9"/>
+    </g>
+  </g>
+
+  <rect width="1920" height="1200" fill="url(#vignette)"/>
+</svg>

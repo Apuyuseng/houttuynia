@@ -1,0 +1,43 @@
+# ============================================================
+# 鱼腥草（Houttuynia）NAS 版 —— 自含预编译镜像（宿主机零依赖）
+#
+# 设计约束（用户拍板）：NAS 宿主机不做任何操作——不装包、不放二进制、
+# 不建服务。adb server 与授权钥全部在容器内运行；HOME=/data 持久卷保存
+# adb 密钥/网关配置/图标缓存/管控库。
+#
+# 构建上下文（全部随 tar 提供，宿主机不落文件）：
+#   mwine-nas            musl 静态网关（Mac zig 交叉编译）
+#   web/                 web-vue/dist 构建产物
+#   scrcpy-server-v4.1   scrcpy server jar
+#   mwine-bridge.apk     壁纸桥
+#   adb                  官方 platform-tools（x86_64，glibc 动态链——本镜像基座提供）
+#   adbkey / adbkey.pub  已被设备授权的 adb 密钥（首次启动拷入 /data，设备免重新授权）
+#
+# 注意：host 网络下容器内 adb server 绑定宿主 5037——宿主机若有自己的
+# adb server 会端口冲突（属预期：本容器接管该端口）。
+# ============================================================
+
+FROM debian:bookworm-slim
+
+COPY mwine-nas /usr/local/bin/mwine-nas
+COPY web/ /opt/mwine/web/
+COPY scrcpy-server-v4.1 /opt/mwine/bin/scrcpy-server-v4.1
+COPY mwine-bridge.apk /opt/mwine/bin/mwine-bridge.apk
+COPY adb /opt/mwine/adb
+COPY adbkey adbkey.pub /opt/mwine/keys/
+COPY tmp/ /tmp/
+
+# 入口：adb 密钥落卷（首启）→ 容器内起 adb server → 接管为网关主进程
+COPY entrypoint.sh /opt/mwine/entrypoint.sh
+RUN chmod +x /opt/mwine/entrypoint.sh /opt/mwine/adb /usr/local/bin/mwine-nas /opt/mwine/bin/scrcpy-server-v4.1 \
+    && chmod 1777 /tmp && chmod 600 /opt/mwine/keys/adbkey
+
+ENV HOME=/data \
+    MWINE_HOST=0.0.0.0 \
+    MWINE_TLS_PORT=18443 \
+    MWINE_WEB_DIR=/opt/mwine/web \
+    PATH=/opt/mwine:$PATH
+
+VOLUME /data
+EXPOSE 18443
+ENTRYPOINT ["/opt/mwine/entrypoint.sh"]

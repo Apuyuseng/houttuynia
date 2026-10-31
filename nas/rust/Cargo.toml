@@ -1,0 +1,48 @@
+[package]
+name = "mwine-nas"
+version = "0.1.0"
+edition = "2021"
+description = "Houttuynia NAS gateway — Rust backend serving the Web console"
+
+[dependencies]
+axum = { version = "0.8", features = ["http2", "query", "ws"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["fs"] }
+bytes = "1"
+futures-util = "0.3"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+qrcode = { version = "0.14", default-features = false }
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 无线配对：SPAKE2(ed25519) + TLS1.3 + AES-128-GCM，纯 Rust 零外部 adb 依赖
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables"] }
+sha2 = "0.10"
+hkdf = "0.12"
+aes-gcm = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# 网关自带 HTTPS（WebCodecs 投屏需要安全上下文）；
+# no-provider 变体：不引入 aws-lc-rs（cmake 链，musl/zig 交叉编不过），统一走 ring
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+# 家长管控存储（配置/用量统计/事件；事务化防崩溃损坏，bundled 零系统依赖）
+rusqlite = { version = "0.31", features = ["bundled"] }
+# 集成 ADB 传输层：USB 设备 AUTH 签名（RSASSA-PKCS1v15-SHA1，与 adbd 协议一致）
+rsa = { version = "0.9.7", features = ["sha2"] }
+sha1 = "0.10.6"
+base64 = "0.22"
+pkcs8 = { version = "0.10", features = ["pem"] }
+
+# macOS 开发机 USB 后端（纯 Rust IOKit；NAS 生产走 Linux usbfs 直驱，不含此依赖）
+[target.'cfg(target_os = "macos")'.dependencies]
+nusb = "0.1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

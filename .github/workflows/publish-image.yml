@@ -1,0 +1,191 @@
+# 镜像自动发布：push 到 nas 分支即构建多架构镜像并推送
+#
+# 全程在 GitHub runner 上执行（网络干净），本地零依赖。
+# 构建：web-vue → Rust 网关 musl × 2（cargo-zigbuild 交叉编）→ 组装上下文
+#       → buildx linux/amd64,linux/arm64 直推
+#
+# 仓库目标：
+#   ghcr.io/apuyuseng/houttuynia-nas —— 用内置 GITHUB_TOKEN，零配置，恒生效
+#   docker.io/apuyuseng/houttuynia-nas —— 需仓库 secrets：
+#     DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（hub.docker.com → Account Settings
+#     → Security → New Access Token 生成，只读不行须 Read&Write）
+#     配好后无需改任何代码，下次 push 自动同步推 DockerHub
+#
+# 标签：latest（多架构）、amd64/arm64（单架构）、sha-<commit>（可追溯）
+#
+# 层污染防护：镜像由 buildx 本地上下文构建，BuildKit 不传输 macOS xattr
+# （历史事故：macOS tar 手搓层包把 com.apple.provenance 写进 pax 头，
+# Linux 解层报 lsetxattr "operation not supported"，已踩坑两次勿回退）。
+name: publish-image
+
+on:
+  push:
+    branches: [nas]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DH_IMAGE: docker.io/apuyuseng/houttuynia-nas
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Web 前端 ----------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-vue/package-lock.json
+      - name: Build web (vite)
+        working-directory: web-vue
+        run: |
+          npm ci
+          npm run build
+
+      # ---------- Rust 网关：zig 交叉编译两个 musl 目标 ----------
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('nas/rust/Cargo.lock') }}
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+      - name: Build gateway binaries (musl static x2)
+        working-directory: nas/rust
+        run: |
+          rm -f .cargo/config.toml   # runner 直连 crates.io，不走国内镜像
+          cargo zigbuild --release --target x86_64-unknown-linux-musl
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
+          mkdir -p dist-out
+          cp target/x86_64-unknown-linux-musl/release/mwine-nas dist-out/mwine-nas-amd64
+          cp target/aarch64-unknown-linux-musl/release/mwine-nas dist-out/mwine-nas-arm64
+          file dist-out/mwine-nas-*
+
+      # ---------- 组装镜像构建上下文 ----------
+      - name: Fetch official adb (linux amd64)
+        run: |
+          curl -fsSL -o /tmp/pt.zip https://dl.google.com/android/repository/platform-tools-latest-linux.zip
+          unzip -j /tmp/pt.zip platform-tools/adb -d /tmp/adb
+          file /tmp/adb/adb
+      - name: Assemble build context
+        run: |
+          set -eux
+          C=/tmp/hubctx
+          mkdir -p "$C/bin" "$C/arch/amd64" "$C/arch/arm64" "$C/web"
+          cp nas/Dockerfile.hub "$C/Dockerfile"
+          cp -r web-vue/dist/. "$C/web/"
+          cp dist/Houttuynia.app/Contents/Resources/bin/scrcpy-server-v4.1 "$C/bin/"
+          cp assets/companion/dist/mwine-bridge.apk "$C/bin/"
+          cp nas/entrypoint.hub.sh "$C/entrypoint.sh"
+          cp nas/rust/dist-out/mwine-nas-amd64 nas/rust/dist-out/mwine-nas-arm64 "$C/"
+          cp /tmp/adb/adb "$C/arch/amd64/adb"
+          touch "$C/arch/arm64/.keep"
+
+      # ---------- 构建并推送 ----------
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+        with:
+          cache-binary: false
+
+      # GHCR：内置 GITHUB_TOKEN，零配置恒生效（镜像名必须小写）
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: GHCR image name (lowercase)
+        run: echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/houttuynia-nas" >> "$GITHUB_ENV"
+      - name: Push GHCR multi-arch (latest + sha + per-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/hubctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Push GHCR per-arch tags
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/hubctx
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.GHCR_IMAGE }}:amd64
+          cache-from: type=gha
+      - name: Push GHCR arm64 tag
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/hubctx
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.GHCR_IMAGE }}:arm64
+          cache-from: type=gha
+
+      # Docker Hub：secrets 配好后自动生效（未配置时整段跳过）
+      - name: Login Docker Hub
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push Docker Hub multi-arch (latest + sha)
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/hubctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DH_IMAGE }}:latest
+            ${{ env.DH_IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+      - name: Push Docker Hub per-arch tags
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/hubctx
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.DH_IMAGE }}:amd64
+          cache-from: type=gha
+      - name: Push Docker Hub arm64 tag
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/hubctx
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.DH_IMAGE }}:arm64
+          cache-from: type=gha
+
+      - name: Summary
+        run: |
+          {
+            echo "### 已发布"
+            echo '```'
+            echo "${GHCR_IMAGE}:latest / :amd64 / :arm64 / :sha-$(git rev-parse --short HEAD)"
+            if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+              echo "${DH_IMAGE}:latest / :amd64 / :arm64 / :sha-$(git rev-parse --short HEAD)"
+            else
+              echo "（DockerHub 未配置 secrets，本次跳过）"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

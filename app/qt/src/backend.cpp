@@ -68,6 +68,7 @@ Backend::Backend(QObject *parent)
 
     QSettings settings;
     m_keepApk = settings.value(QStringLiteral("store/keepApk"), false).toBool();
+    m_captureEnabled = settings.value(QStringLiteral("ui/captureEnabled"), false).toBool();
 
     // 任务/性能对象预填默认结构：避免 QML 在首次轮询到达前读到 undefined
     const auto taskDefaults = [] {
@@ -391,6 +392,38 @@ void Backend::pollCapture()
         if (obj != m_captureStatus) {
             m_captureStatus = obj;
             emit captureChanged();
+        }
+    });
+    // ecapture 组件：存在性/安装状态；下载中顺带拉任务进度
+    fetch(QStringLiteral("/api/capture/binary"), [this](QJsonObject obj, int) {
+        const bool wasInstalling = jBool(m_captureBinStatus, "installing");
+        const bool wasPresent = jBool(m_captureBinStatus, "present");
+        const bool installing = jBool(obj, "installing");
+        const bool present = jBool(obj, "present");
+        if (obj != m_captureBinStatus) {
+            m_captureBinStatus = obj;
+            emit captureBinChanged();
+        }
+        if (installing || wasInstalling) {
+            fetch(QStringLiteral("/api/capture/binary/task"), [this](QJsonObject t, int) {
+                if (t == m_captureBinTask)
+                    return;
+                m_captureBinTask = t;
+                emit captureBinTaskChanged();
+                if (jBool(t, "done")) {
+                    // 落位成功：刷新状态并通知页面自动开始采集
+                    fetch(QStringLiteral("/api/capture/binary"), [this](QJsonObject s2, int) {
+                        m_captureBinStatus = s2;
+                        emit captureBinChanged();
+                        if (jBool(s2, "present"))
+                            emit captureBinInstalled();
+                    });
+                } else if (!jBool(t, "running") && !jStr(t, "error").isEmpty()) {
+                    emit toast(jStr(t, "error"), QStringLiteral("error"));
+                }
+            });
+        } else if (!wasPresent && present) {
+            emit captureBinInstalled();
         }
     });
     if (m_captureFlowsQueried && m_tick % 2 == 0)
@@ -1663,6 +1696,61 @@ void Backend::captureStop()
             emit toast(QStringLiteral("已停止采集"), QStringLiteral("ok"));
         else
             emit toast(jStr(obj, "error"), QStringLiteral("error"));
+    });
+}
+
+// ecapture 组件按需下载（app 不内置；daemon 侧断点续传 → 校验 → ~/.mwine/bin/ecapture）
+void Backend::captureBinInstall()
+{
+    postEmpty(QStringLiteral("/api/capture/binary/install"), [this](QJsonObject obj, int code) {
+        if (code != 200) {
+            emit toast(jStr(obj, "error"), QStringLiteral("error"));
+            return;
+        }
+        // 立即拉一次状态让页面进入"下载中"，不等下一拍轮询
+        fetch(QStringLiteral("/api/capture/binary"), [this](QJsonObject s, int) {
+            m_captureBinStatus = s;
+            emit captureBinChanged();
+        });
+    });
+}
+
+void Backend::captureBinCancel()
+{
+    postEmpty(QStringLiteral("/api/capture/binary/cancel"),
+              [this](QJsonObject, int) {});
+}
+
+void Backend::refreshCaptureBinStatus()
+{
+    fetch(QStringLiteral("/api/capture/binary"), [this](QJsonObject obj, int) {
+        if (obj != m_captureBinStatus) {
+            m_captureBinStatus = obj;
+            emit captureBinChanged();
+        }
+    });
+}
+
+// 流量分析功能开关：关闭时若在采集先停掉（页面入口由 QML 绑定隐藏）。
+// 开启时主动拉一次组件状态——缺失（流量分析页未轮询过时本地状态可能为空）
+// 则发 captureBinMissing，设置页据此弹下载引导。
+void Backend::setCaptureEnabled(bool v)
+{
+    if (v == m_captureEnabled)
+        return;
+    m_captureEnabled = v;
+    QSettings().setValue(QStringLiteral("ui/captureEnabled"), v);
+    emit captureEnabledChanged();
+    if (!v) {
+        if (jBool(m_captureStatus, "running"))
+            captureStop();
+        return;
+    }
+    fetch(QStringLiteral("/api/capture/binary"), [this](QJsonObject obj, int) {
+        m_captureBinStatus = obj;
+        emit captureBinChanged();
+        if (!jBool(obj, "present"))
+            emit captureBinMissing();
     });
 }
 

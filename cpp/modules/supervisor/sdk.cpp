@@ -26,7 +26,14 @@ static QString homeDir()
 
 QString Sdk::externalRuntimeDir()
 {
+#ifdef Q_OS_MACOS
     return QDir(homeDir()).filePath(QStringLiteral("Library/Application Support/MWine/runtime"));
+#else
+    // Linux/NAS：XDG 数据目录（~/.local/share/MWine/runtime）
+    if (const QString xdg = qEnvironmentVariable("XDG_DATA_HOME"); !xdg.isEmpty())
+        return QDir(xdg).filePath(QStringLiteral("MWine/runtime"));
+    return QDir(homeDir()).filePath(QStringLiteral(".local/share/MWine/runtime"));
+#endif
 }
 
 Sdk Sdk::fromRoot(const QString& root)
@@ -87,14 +94,25 @@ mw::Result<Sdk> Sdk::detectUncached()
         if (auto v = qEnvironmentVariable(name); !v.isEmpty())
             candidates << v;
     }
+#ifdef Q_OS_MACOS
     candidates << QDir(homeDir()).filePath(QStringLiteral("Library/Android/sdk"));
+#else
+    candidates << QDir(homeDir()).filePath(QStringLiteral("Android/Sdk"));
+    candidates << QStringLiteral("/opt/android-sdk");
+    candidates << QStringLiteral("/usr/lib/android-sdk");
+#endif
 
     for (const auto& c : candidates) {
         if (QDir(c).exists(QStringLiteral("emulator")))
             return mw::Result<Sdk>::Ok(Sdk::fromRoot(c));
     }
+#ifdef Q_OS_MACOS
     return mw::err<Sdk>(QStringLiteral(
         "Android SDK not found (tried ANDROID_HOME, ANDROID_SDK_ROOT, ~/Library/Android/sdk)"));
+#else
+    return mw::err<Sdk>(QStringLiteral(
+        "Android SDK not found (tried MWINE_SDK_ROOT, ANDROID_HOME, ~/Android/Sdk, /opt/android-sdk)"));
+#endif
 }
 
 QString Sdk::avdHome() const
@@ -102,9 +120,16 @@ QString Sdk::avdHome() const
     if (auto p = qEnvironmentVariable("ANDROID_AVD_HOME"); !p.isEmpty())
         return p;
     if (isBundled()) {
-        // 零依赖模式：AVD 放 Application Support（首启从 bundle 模板种子）
+        // 零依赖模式：AVD 放用户数据目录（首启从模板种子）
+#ifdef Q_OS_MACOS
         const QString d = QDir(homeDir()).filePath(
             QStringLiteral("Library/Application Support/MWine/avd"));
+#else
+        const QString xdg = qEnvironmentVariable("XDG_DATA_HOME");
+        const QString d = !xdg.isEmpty()
+            ? QDir(xdg).filePath(QStringLiteral("MWine/avd"))
+            : QDir(homeDir()).filePath(QStringLiteral(".local/share/MWine/avd"));
+#endif
         QDir().mkpath(d);
         return d;
     }

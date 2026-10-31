@@ -1689,6 +1689,21 @@ Resp vmStartWindowed(AppState* state, bool forceWindowed)
         // 视觉用官方 -qt-hide-window（启动即有窗但隐藏）实现，帧不受影响
         opts.windowed = true;
         opts.hideWindow = !forceWindowed && (cfg.windowModeAll || cfg.hideEmulatorWindow);
+        // NAS/服务器无头环境：无显示服务器（或显式 MWINE_HEADLESS=1）时
+        // 退 -no-window——此时没有 Qt 窗口可显示，屏幕由 Web 截图通道承担。
+        // 多维显示副屏帧尺寸在无头下的已知畸变只影响独立窗口特性（Web 模式不用）。
+        if (qEnvironmentVariableIsSet("MWINE_HEADLESS")
+            || qEnvironmentVariableIsSet("MWINE_NO_WINDOW")) {
+            opts.windowed = false;
+            opts.hideWindow = false;
+        }
+#ifdef Q_OS_LINUX
+        if (qEnvironmentVariableIsEmpty("DISPLAY")
+            && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
+            opts.windowed = false;
+            opts.hideWindow = false;
+        }
+#endif
         opts.avdHome = avdHomeOverride;
         opts.noSnapshot = cfg.noSnapshot;
         opts.noBootAnim = cfg.noBootAnim;
@@ -3207,6 +3222,126 @@ Resp captureFlowDetail(AppState* state, const QString& idStr)
     return resp(200, r.value());
 }
 
+// ---------------------------------------------------------------------------
+// ecapture 组件按需安装（app 包不内置，开启流量分析时下载到 ~/.mwine/bin/）
+
+// 安装位 = findHostBinary() 的兜底位，装完无需重启即可被采集链路找到
+static QString captureBinInstallPath()
+{
+    return QDir(mw::mwineDir()).filePath(QStringLiteral("bin/ecapture"));
+}
+
+// 下载源优先级：请求 body.url > 环境变量 MWINE_ECAPTURE_URL > 内置默认
+//（与运行时分发包同库 latest 资产，upx 压缩后约 13MB）
+static QString captureBinDownloadUrl(const QJsonObject& body)
+{
+    const QString fromBody = body.value(QStringLiteral("url")).toString().trimmed();
+    if (!fromBody.isEmpty())
+        return fromBody;
+    const QByteArray env = qgetenv("MWINE_ECAPTURE_URL");
+    if (!env.trimmed().isEmpty())
+        return QString::fromLocal8Bit(env);
+    return QStringLiteral(
+        "https://github.com/Apuyuseng/houttuynia/releases/latest/download/"
+        "ecapture-android-arm64");
+}
+
+Resp captureBinStatus(AppState* state)
+{
+    const QString bin = capture::Session::findHostBinary();
+    QJsonObject o;
+    o[QStringLiteral("present")] = !bin.isEmpty();
+    o[QStringLiteral("path")] = bin;
+    o[QStringLiteral("installing")] = state->captureBinTask.running.load();
+    return resp(200, o);
+}
+
+Resp captureBinInstall(AppState* state, const QByteArray& body)
+{
+    QJsonObject req;
+    if (!body.trimmed().isEmpty()) {
+        const QJsonDocument doc = QJsonDocument::fromJson(body);
+        if (doc.isObject())
+            req = doc.object();
+    }
+    if (!state->captureBinTask.tryBegin(QStringLiteral("准备下载流量分析组件…")))
+        return mw::jsonError(409, QStringLiteral("组件下载已在进行中"));
+    auto flag = std::make_shared<std::atomic_bool>(false);
+    state->captureBinCancel = flag;
+    const QString url = captureBinDownloadUrl(req);
+    std::thread([state, flag, url]() {
+        const auto log = [state](const QString& line) {
+            MW_LOG("core", line);
+            state->captureBinTask.log(line, 100);
+        };
+        const QString dest = captureBinInstallPath();
+        QDir().mkpath(QFileInfo(dest).absolutePath());
+        // .part 落盘：失败/取消保留半档，重试断点续传
+        const QString part = dest + QStringLiteral(".part");
+        log(QStringLiteral("下载 %1").arg(url));
+        const auto prog = [state](quint64 done, quint64 total) {
+            state->captureBinTask.setProgress(
+                QStringLiteral("下载组件 %1%")
+                    .arg(total > 0 ? QString::number(done * 100 / total)
+                                   : QStringLiteral("?")),
+                done, total);
+        };
+        const store::SourceOpts opts; // 无代理；downloadFile 自带探测/续传/重试
+        const auto r = mw::store::detail::downloadFile(
+            url, part, opts, QByteArrayLiteral("Houttuynia/1.0"), *flag, prog, 0, log);
+        if (!r) {
+            state->captureBinTask.finishErr(
+                QStringLiteral("%1（已下载部分已保留，重新下载将断点续传）").arg(r.error()));
+            return;
+        }
+        // 校验：ELF + arm64（e_machine=0xB7）+ 体积下限——防 404 HTML/半档被装进去
+        QFile f(part);
+        if (!f.open(QIODevice::ReadOnly)) {
+            state->captureBinTask.finishErr(QStringLiteral("IO 错误：无法读取 %1").arg(part));
+            return;
+        }
+        const QByteArray head = f.read(20);
+        const qint64 size = f.size();
+        f.close();
+        const bool validElf = head.size() >= 20
+            // "\x7f" "ELF"：拆开写字面量，避免 \x7fE 被当超长十六进制转义
+            && head.startsWith(QByteArrayLiteral("\x7f" "ELF"))
+            && static_cast<uchar>(head.at(18)) == 0xb7;
+        if (!validElf || size < 1024 * 1024) {
+            QFile::remove(part); // 校验失败的半档没有续传价值
+            state->captureBinTask.finishErr(QStringLiteral(
+                "下载内容不是有效的 arm64 ELF（%1 字节）——下载源可能暂不可用，请稍后重试")
+                .arg(size));
+            return;
+        }
+        if (QFile::exists(dest))
+            QFile::remove(dest);
+        if (!QFile::rename(part, dest)) {
+            state->captureBinTask.finishErr(QStringLiteral("IO 错误：无法落位 %1").arg(dest));
+            return;
+        }
+        // 宿主本机模式直接执行；设备模式仅读取内容 push 给 guest，权限都需 755
+        QFile::setPermissions(dest, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                         | QFileDevice::ExeOwner | QFileDevice::ReadGroup
+                                         | QFileDevice::ExeGroup | QFileDevice::ReadOther
+                                         | QFileDevice::ExeOther);
+        log(QStringLiteral("✓ ecapture 组件就绪: %1").arg(dest));
+        state->captureBinTask.finishOk(dest);
+    }).detach();
+    return resp(200, QJsonObject{ { QStringLiteral("ok"), true } });
+}
+
+Resp captureBinCancel(AppState* state)
+{
+    state->captureBinCancel->store(true, std::memory_order_relaxed);
+    return resp(200, QJsonObject{ { QStringLiteral("ok"), true } });
+}
+
+Resp captureBinTaskStatus(AppState* state)
+{
+    return resp(200, state->captureBinTask.toJson());
+}
+
 // ===================== 交互式 ADB 终端 =====================
 
 // 建立终端会话：设备侧长驻 PTY shell，UI 轮询 read 增量拉输出、write 送输入。
@@ -3582,6 +3717,15 @@ Resp routeWithBody(const QString& method, const QString& url, const QByteArray& 
         return captureStats(state);
     if (url == QStringLiteral("/api/capture/webview-export") && method == QStringLiteral("POST"))
         return captureWebviewExport(state);
+    // ecapture 组件按需安装（app 不内置；present/install 接口供前端引导下载）
+    if (url == QStringLiteral("/api/capture/binary") && method == QStringLiteral("GET"))
+        return captureBinStatus(state);
+    if (url == QStringLiteral("/api/capture/binary/install") && method == QStringLiteral("POST"))
+        return captureBinInstall(state, body);
+    if (url == QStringLiteral("/api/capture/binary/cancel") && method == QStringLiteral("POST"))
+        return captureBinCancel(state);
+    if (url == QStringLiteral("/api/capture/binary/task") && method == QStringLiteral("GET"))
+        return captureBinTaskStatus(state);
     // 交互式 ADB 终端（UI 终端页）：open 建会话，read/write/close 带会话 id
     if (method == QStringLiteral("POST") && pathOf(url) == QStringLiteral("/api/term/open"))
         return termOpen(state);

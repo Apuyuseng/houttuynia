@@ -18,7 +18,15 @@ find_library(ZLIB_LIBRARY NAMES z)
 add_subdirectory(common)
 
 # 业务模块（目录存在即纳入；每模块自带 CMakeLists，源码 GLOB 自动收录）
-set(MWINE_MODULES adb config keymap app store supervisor capture qemu mitm scrcpy audio input cli window)
+# MWINE_HEADLESS=ON（NAS/服务器无头构建）只保留守护进程依赖的模块：
+# 桌面专属模块（独立窗口/音频/输入捕获/CLI/游戏键位引擎）不参与编译。
+option(MWINE_HEADLESS "仅构建守护进程所需模块（NAS/无头服务器）" OFF)
+if(MWINE_HEADLESS)
+    # scrcpy 为 Web 投屏所需（纯协议层，解码器 __APPLE__ 门控天然跨平台）
+    set(MWINE_MODULES adb config keymap app store supervisor capture scrcpy)
+else()
+    set(MWINE_MODULES adb config keymap app store supervisor capture qemu mitm scrcpy audio input cli window)
+endif()
 foreach(m ${MWINE_MODULES})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/modules/${m}/CMakeLists.txt")
         add_subdirectory(modules/${m})

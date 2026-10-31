@@ -6,6 +6,15 @@ import Houttuynia
 Item {
     id: page
 
+    // 开始采集：ecapture 组件缺失（daemon 明确回报 present=false）先引导下载
+    //（下载完成自动开始由 EcapInstallDialog 的 autoStart 处理）
+    function tryStartCapture() {
+        if (backend.captureBinStatus && backend.captureBinStatus.present === false)
+            ecapDialog.open()
+        else
+            backend.captureStart()
+    }
+
     function fmtBytes(b) {
         if (!b) return "0 B"
         return b >= 1048576 ? (b / 1048576).toFixed(1) + " MB"
@@ -64,7 +73,7 @@ Item {
                 text: qsTr("▶ 开始采集")
                 highlighted: true
                 enabled: backend.vmRunning
-                onClicked: backend.captureStart()
+                onClicked: page.tryStartCapture()
             }
             RButton {
                 visible: backend.captureStatus.running
@@ -106,6 +115,41 @@ Item {
                     font.pixelSize: 11; color: Theme.textFaint
                     elide: Text.ElideMiddle
                     Layout.fillWidth: true
+                }
+            }
+        }
+
+        // 组件下载进度条（ecapture 按需下载时可见）
+        Rectangle {
+            visible: backend.captureBinStatus.installing === true
+            Layout.fillWidth: true
+            height: 40
+            radius: Theme.radius
+            color: Theme.card
+            border.color: Theme.separator
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.margins: 12
+                spacing: 10
+
+                Text {
+                    text: qsTr("⬇ ecapture 组件：")
+                          + (backend.captureBinTask.phase || qsTr("准备下载…"))
+                    font.pixelSize: 12; color: Theme.text
+                    elide: Text.ElideMiddle
+                    Layout.fillWidth: true
+                }
+                ProgressBar {
+                    visible: (backend.captureBinTask.progress_total || 0) > 0
+                    Layout.preferredWidth: 160
+                    from: 0
+                    to: backend.captureBinTask.progress_total || 1
+                    value: backend.captureBinTask.progress || 0
+                }
+                RButton {
+                    text: qsTr("取消")
+                    onClicked: backend.captureBinCancel()
                 }
             }
         }
@@ -306,4 +350,7 @@ Item {
             }
         }
     }
+
+    // ecapture 按需下载引导（共享组件；采集页场景下载完成自动开始采集）
+    EcapInstallDialog { id: ecapDialog; autoStart: true }
 }

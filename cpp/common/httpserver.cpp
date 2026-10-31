@@ -1,5 +1,6 @@
 #include "httpserver.hpp"
 
+#include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTcpSocket>
@@ -17,6 +18,24 @@ QString queryDecode(const QString& s)
     return QString::fromUtf8(
         QByteArray(s.toUtf8().replace('+', ' '))
             .percentDecoded());
+}
+
+QByteArray reasonPhrase(int code)
+{
+    switch (code) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 413: return "Payload Too Large";
+    case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
+    default: return QByteArray::number(code);
+    }
 }
 
 } // namespace
@@ -53,6 +72,14 @@ QPair<int, QByteArray> jsonError(int code, const QString& message)
     QJsonObject o;
     o[QStringLiteral("error")] = message;
     return qMakePair(code, QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+
+HttpHandler adaptJsonHandler(std::function<QPair<int, QByteArray>(const HttpRequest&)> fn)
+{
+    return [fn = std::move(fn)](const HttpRequest& req) -> HttpResponse {
+        const auto [code, body] = fn(req);
+        return HttpResponse::json(code, body);
+    };
 }
 
 namespace {
@@ -106,17 +133,47 @@ public:
         }
         req.body = body.left(want);
 
-        auto [code, respBody] = m_handler(req);
-        QByteArray type = code == 200 ? "application/json" : "application/json";
+        const HttpResponse r = m_handler(req);
         QByteArray resp;
-        resp += "HTTP/1.1 " + QByteArray::number(code) + " "
-                + (code == 200 ? "OK" : QByteArray::number(code)) + "\r\n";
-        resp += "Content-Type: " + type + "\r\n";
-        resp += "Content-Length: " + QByteArray::number(respBody.size()) + "\r\n";
-        resp += "Connection: close\r\n\r\n";
-        resp += respBody;
-        sock.write(resp);
-        sock.waitForBytesWritten(10000);
+        resp += "HTTP/1.1 " + QByteArray::number(r.code) + " " + reasonPhrase(r.code) + "\r\n";
+        resp += "Content-Type: " + r.contentType + "\r\n";
+        if (!r.streamer)
+            resp += "Content-Length: " + QByteArray::number(r.body.size()) + "\r\n";
+        resp += "Connection: close\r\n";
+        for (auto it = r.extraHeaders.constBegin(); it != r.extraHeaders.constEnd(); ++it) {
+            // 响应头注入防护：键值均不允许换行
+            if (it.key().contains('\n') || it.key().contains('\r') || it.value().contains('\n')
+                || it.value().contains('\r'))
+                continue;
+            resp += it.key() + ": " + it.value() + "\r\n";
+        }
+        resp += "\r\n";
+        // 流式模式：只写响应头，然后把 socket 交给回调持续推流
+        if (r.streamer) {
+            qint64 off = 0;
+            while (off < resp.size()) {
+                const qint64 n = sock.write(resp.mid(off, 64 * 1024));
+                if (n < 0)
+                    return;
+                off += n;
+                if (!sock.waitForBytesWritten(10000))
+                    return;
+            }
+            (void)r.streamer(sock);
+            sock.disconnectFromHost();
+            return;
+        }
+        resp += r.body;
+        // 大响应（截图/静态资源）分块写，避免单次 write 截断
+        qint64 off = 0;
+        while (off < resp.size()) {
+            const qint64 n = sock.write(resp.mid(off, 256 * 1024));
+            if (n < 0)
+                break;
+            off += n;
+            if (!sock.waitForBytesWritten(30000))
+                break;
+        }
         sock.disconnectFromHost();
     }
 
@@ -128,7 +185,13 @@ private:
 } // namespace
 
 HttpServer::HttpServer(HttpHandler handler, quint16 port, QObject* parent)
-    : QObject(parent), m_handler(std::move(handler)), m_port(port)
+    : HttpServer(std::move(handler), QStringLiteral("127.0.0.1"), port, parent)
+{
+}
+
+HttpServer::HttpServer(HttpHandler handler, const QString& host, quint16 port,
+                       QObject* parent)
+    : QObject(parent), m_handler(std::move(handler)), m_host(host), m_port(port)
 {
     m_pool = new QThreadPool(this);
     m_pool->setMaxThreadCount(16);
@@ -137,11 +200,20 @@ HttpServer::HttpServer(HttpHandler handler, quint16 port, QObject* parent)
 
 bool HttpServer::start()
 {
-    if (!m_server.listen(QHostAddress::LocalHost, m_port)) {
+    QHostAddress addr(m_host);
+    if (m_host == QLatin1String("*") || m_host.compare(QLatin1String("any"),
+                                                       Qt::CaseInsensitive)
+                                            == 0)
+        addr = QHostAddress::Any;
+    if (addr.isNull())
+        addr = QHostAddress::LocalHost;
+    if (!m_server.listen(addr, m_port)) {
         qWarning() << "[http] 监听失败:" << m_server.errorString();
         return false;
     }
-    qInfo().noquote() << QStringLiteral("[http] mwine-cored 监听 127.0.0.1:%1").arg(m_port);
+    qInfo().noquote() << QStringLiteral("[http] mwine-cored 监听 %1:%2")
+                                 .arg(m_server.serverAddress().toString())
+                                 .arg(m_port);
     return true;
 }
 

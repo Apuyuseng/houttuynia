@@ -6,6 +6,13 @@ import Houttuynia
 Item {
     id: page
 
+    // 页面可见时刷新 ecapture 组件状态（"已就绪"提示与开关引导依赖它；
+    // 组件状态平时只在流量分析页轮询，从设置页开启功能前可能从未拉取）
+    onVisibleChanged: {
+        if (visible && backend.captureEnabled)
+            backend.refreshCaptureBinStatus()
+    }
+
     property var cfg: backend.config
     // 编辑状态（保存时一次性提交）
     property string mode: cfg.mode || "phone"
@@ -480,6 +487,48 @@ Item {
                 }
             }
 
+            // ===== 功能开关 =====
+            RGroupBox {
+                Layout.fillWidth: true
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 10
+                    SectionLabel { icon: "📡"; title: qsTr("功能开关"); subtitle: qsTr("按需启用的进阶功能") }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+                        ColumnLayout {
+                            spacing: 1
+                            FieldLabel { text: qsTr("流量分析（eBPF 明文旁挂）") }
+                            Text {
+                                text: qsTr("开启后侧栏显示入口；ecapture 组件（约 13MB）首次开启时下载，"
+                                           + "需 userdebug 镜像")
+                                font.pixelSize: 11; color: Theme.textDim
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                        }
+                        Item { Layout.fillWidth: true }
+                        RCheckBox {
+                            id: captureToggle
+                            text: qsTr("启用")
+                            font.pixelSize: 12
+                            checked: backend.captureEnabled
+                            onToggled: backend.setCaptureEnabled(checked)
+                        }
+                    }
+
+                    Text {
+                        visible: backend.captureBinStatus.present === true
+                        text: qsTr("✓ ecapture 组件已就绪：") + (backend.captureBinStatus.path || "")
+                        font.pixelSize: 11; color: Theme.textFaint
+                        elide: Text.ElideMiddle
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+
             // ===== 危险区 =====
             RGroupBox {
                 Layout.fillWidth: true
@@ -572,5 +621,13 @@ Item {
             text: qsTr("将关停虚拟机并清空 userdata 与全部快照，所有应用与数据将丢失且不可恢复。确定继续？")
         }
         onAccepted: backend.vmReset()
+    }
+
+    // 开启流量分析但组件缺失：下载引导（完成后组件就绪提示自动刷新）
+    EcapInstallDialog { id: ecapDialog; autoStart: false }
+
+    Connections {
+        target: backend
+        function onCaptureBinMissing() { ecapDialog.open() }
     }
 }

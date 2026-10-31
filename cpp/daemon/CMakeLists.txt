@@ -12,12 +12,16 @@ target_include_directories(mwine-cored PRIVATE
     ${CMAKE_SOURCE_DIR}/modules/supervisor
     ${CMAKE_SOURCE_DIR}/modules/capture)
 target_link_libraries(mwine-cored PRIVATE
-    mw_common mw_adb mw_config mw_keymap mw_app mw_store mw_supervisor mw_capture)
+    mw_common mw_adb mw_config mw_keymap mw_app mw_store mw_supervisor mw_capture mw_scrcpy)
 
 # 图标抓取子进程：与守护隔离（解析器在守护并发环境下有堆损坏史，
-# 隔离后最坏情况是单个图标缺失，守护本体不受影响）
-add_executable(mwine-iconfetch iconfetch.cpp)
-target_include_directories(mwine-iconfetch PRIVATE
-    ${CMAKE_SOURCE_DIR}/common ${CMAKE_SOURCE_DIR}/modules/adb ${CMAKE_SOURCE_DIR}/modules/app)
-find_package(Qt6 REQUIRED COMPONENTS Gui)
-target_link_libraries(mwine-iconfetch PRIVATE mw_common mw_adb mw_app Qt6::Gui)
+# 隔离后最坏情况是单个图标缺失，守护本体不受影响）。
+# 无头构建（MWINE_HEADLESS）跳过——避免引入 Qt Gui 依赖；appcache 对
+# helper 缺失本就容错（图标缺位时 Web 前端回退字母块）。
+if(NOT MWINE_HEADLESS)
+    add_executable(mwine-iconfetch iconfetch.cpp)
+    target_include_directories(mwine-iconfetch PRIVATE
+        ${CMAKE_SOURCE_DIR}/common ${CMAKE_SOURCE_DIR}/modules/adb ${CMAKE_SOURCE_DIR}/modules/app)
+    find_package(Qt6 REQUIRED COMPONENTS Gui)
+    target_link_libraries(mwine-iconfetch PRIVATE mw_common mw_adb mw_app Qt6::Gui)
+endif()

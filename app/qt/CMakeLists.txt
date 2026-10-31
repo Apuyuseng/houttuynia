@@ -35,6 +35,7 @@ qt_add_qml_module(HouttuyniaApp
         qml/RCheckBox.qml
         qml/RGroupBox.qml
         qml/RSlider.qml
+        qml/EcapInstallDialog.qml
         qml/Main.qml
         qml/OverviewPage.qml
         qml/AppsPage.qml
