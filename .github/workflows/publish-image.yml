@@ -35,6 +35,8 @@ env:
   DH_IMAGE: docker.io/apuyuseng/houttuynia-nas
   # secrets 不能直接进 if 条件（启动即失败）——经 env 中转
   HAS_DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+  # 兼容单条 DOCKERHUB secret（仅令牌值，用户名回退 apuyuseng）
+  HAS_DH: ${{ secrets.DOCKERHUB != '' }}
 
 jobs:
   publish:
@@ -43,16 +45,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # TODO(临时诊断): 定位 DockerHub secret 未被读到的命名/位置问题，定位后删除
-      - name: Debug secret presence
-        run: |
-          echo "repo=${GITHUB_REPOSITORY}"
-          echo "DOCKERHUB_TOKEN=${{ secrets.DOCKERHUB_TOKEN != '' }}"
-          echo "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME != '' }}"
-          echo "DOCKER_HUB_TOKEN=${{ secrets.DOCKER_HUB_TOKEN != '' }}"
-          echo "DH_TOKEN=${{ secrets.DH_TOKEN != '' }}"
-          echo "DOCKERHUB_PAT=${{ secrets.DOCKERHUB_PAT != '' }}"
-          echo "TOKEN=${{ secrets.TOKEN != '' }}"
 
       # ---------- Web 前端 ----------
       - uses: actions/setup-node@v4
@@ -154,13 +146,13 @@ jobs:
 
       # Docker Hub：secrets 配好后自动生效（未配置时整段跳过）
       - name: Login Docker Hub
-        if: env.HAS_DH_TOKEN == 'true'
+        if: env.HAS_DH_TOKEN == 'true' || env.HAS_DH == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'apuyuseng' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB }}
       - name: Push Docker Hub multi-arch (latest + sha)
-        if: env.HAS_DH_TOKEN == 'true'
+        if: env.HAS_DH_TOKEN == 'true' || env.HAS_DH == 'true'
         uses: docker/build-push-action@v6
         with:
           context: /tmp/hubctx
@@ -171,7 +163,7 @@ jobs:
             ${{ env.DH_IMAGE }}:sha-${{ github.sha }}
           cache-from: type=gha
       - name: Push Docker Hub per-arch tags
-        if: env.HAS_DH_TOKEN == 'true'
+        if: env.HAS_DH_TOKEN == 'true' || env.HAS_DH == 'true'
         uses: docker/build-push-action@v6
         with:
           context: /tmp/hubctx
@@ -180,7 +172,7 @@ jobs:
           tags: ${{ env.DH_IMAGE }}:amd64
           cache-from: type=gha
       - name: Push Docker Hub arm64 tag
-        if: env.HAS_DH_TOKEN == 'true'
+        if: env.HAS_DH_TOKEN == 'true' || env.HAS_DH == 'true'
         uses: docker/build-push-action@v6
         with:
           context: /tmp/hubctx
