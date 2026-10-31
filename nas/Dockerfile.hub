@@ -1,20 +1,21 @@
 # ============================================================
 # 鱼腥草（Houttuynia）NAS 版 —— 多架构自含镜像（Docker Hub 发布用）
 #
-# 与 nas/Dockerfile.selfhost 的差异：二进制按 TARGETARCH 从构建上下文
-# 选择（amd64/arm64 都已交叉编译好，构建期零编译零网络拉取——
-# debian:bookworm-slim 基础层除外）。
-#
-# 安全：不含 adb 授权私钥。entrypoint 首启自动生成密钥对，用户在设备上
-# 允许一次 USB/无线调试授权即可（标准流程）。
-#
-# 构建上下文（docker/ 目录，见 .github 或 README）：
-#   mwine-nas-amd64 / mwine-nas-arm64  musl 静态网关
+# 构建上下文（/tmp/hubctx 组装）：
+#   mwine-nas-amd64 / mwine-nas-arm64  musl 静态网关（容器内编译）
 #   web/                               web-vue/dist
-#   scrcpy-server-v4.1                 scrcpy server jar
-#   mwine-bridge.apk                   壁纸/通知桥
-#   adb-amd64 / adb-arm64              官方 platform-tools adb
-#   entrypoint.sh                      入口脚本
+#   bin/scrcpy-server-v4.1             scrcpy server jar
+#   bin/mwine-bridge.apk               壁纸/通知桥
+#   arch/<amd64|arm64>/adb             官方 platform-tools adb（按架构可选）
+#   entrypoint.sh                      入口脚本（nas/entrypoint.hub.sh）
+#
+# adb：官方 platform-tools 只有 linux-amd64；arm64 无官方静态版（Debian 的
+# android-tools-adb 需 glibc>=2.38 + 全套 android 私有库，slim 基座带不动）
+# → 按架构目录放入，没有就不装（网关集成传输层兜底）。
+#
+# ⚠️ 组装上下文后、构建前必须 `xattr -rc /tmp/hubctx`：macOS 的
+# com.apple.provenance 等 xattr 一旦进入层 tar，Linux Docker 解层报
+# lsetxattr "operation not supported"（DockerHub 发布已踩坑两次）。
 # ============================================================
 
 FROM debian:bookworm-slim
@@ -23,17 +24,16 @@ ARG TARGETARCH
 
 COPY mwine-nas-${TARGETARCH} /usr/local/bin/mwine-nas
 COPY web/ /opt/mwine/web/
-COPY scrcpy-server-v4.1 /opt/mwine/bin/scrcpy-server-v4.1
-COPY mwine-bridge.apk /opt/mwine/bin/mwine-bridge.apk
-COPY adb-${TARGETARCH} /opt/mwine/adb
+COPY bin/ /opt/mwine/bin/
 COPY entrypoint.sh /opt/mwine/entrypoint.sh
+COPY arch/${TARGETARCH}/ /opt/mwine/arch/
 
-RUN chmod +x /opt/mwine/entrypoint.sh /opt/mwine/adb /usr/local/bin/mwine-nas \
-    && chmod +x /opt/mwine/bin/scrcpy-server-v4.1 \
-    && mkdir -p /data
+RUN set -eux; \
+    chmod +x /opt/mwine/entrypoint.sh /usr/local/bin/mwine-nas /opt/mwine/bin/scrcpy-server-v4.1; \
+    if [ -f /opt/mwine/arch/adb ]; then mv /opt/mwine/arch/adb /opt/mwine/adb && chmod +x /opt/mwine/adb; fi; \
+    rm -rf /opt/mwine/arch; \
+    mkdir -p /data
 
-# adb 二进制为动态链接（glibc），基座已提供；ca-certificates 由 rustls
-# 内置根证书替代，无需安装。scratch 最小化但不适合（entrypoint 需 shell）。
 ENV HOME=/data \
     MWINE_HOST=0.0.0.0 \
     MWINE_TLS_PORT=18443 \
