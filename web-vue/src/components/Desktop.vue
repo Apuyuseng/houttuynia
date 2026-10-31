@@ -238,18 +238,15 @@ onUnmounted(() => {
   transition: transform 0.16s ease;
 }
 .desk-item:active .desk-icon { transform: scale(0.9); }
-/* 设备应用：玻璃底托（adaptive 图标全内缩贴合，legacy 透明图标自然居中留白） */
+/* 设备应用：图标本体铺满整个圆角框（容器裁出 squircle 圆角）；
+   玻璃底仅作为 legacy 透明图标/字母兜底的底色 */
 .desk-icon.and {
   background: linear-gradient(160deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
-  box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.16),
-    0 1px 2px rgba(0, 0, 0, 0.22),
-    0 6px 18px rgba(0, 0, 0, 0.32);
   color: rgba(255, 255, 255, 0.85);
 }
 .desk-icon.and img {
   width: 100%; height: 100%;
-  object-fit: contain; padding: 5px; box-sizing: border-box;
+  object-fit: cover; display: block;
 }
 /* 业务应用 logo 角标（Android 工作资料徽章观感：深色圆底 + 细亮边） */
 .di-wrap { position: relative; }
@@ -308,12 +305,8 @@ onUnmounted(() => {
   display: flex; align-items: center; justify-content: center;
   color: #fff; overflow: visible; position: relative;
 }
-.tb-ico.and {
-  overflow: hidden;
-  background: linear-gradient(160deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
-  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.16);
-}
-.tb-ico.and img { width: 100%; height: 100%; object-fit: contain; padding: 3px; box-sizing: border-box; }
+.tb-ico.and { overflow: hidden; }
+.tb-ico.and img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tb-item.live::after {
   content: ''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
   width: 4px; height: 4px; border-radius: 50%; background: #a8c7fa;
