@@ -471,24 +471,30 @@ export class ScrcpyWebPlayer {
       try { ws.send(JSON.stringify(msg)) } catch { this._ctlPost(msg) }
       return
     }
+    // 连接建立中（readyState 0/2）：入队，open/close 时统一冲刷
+    if (ws) { this._ctlQueue.push(msg); return }
+    // 重试额度用尽：直接 POST 回落，绝不无限积压（否则输入会永久失灵）
+    if ((this._ctlTries || 0) >= 3) { this._ctlPost(msg); return }
     this._ctlQueue.push(msg)
-    if (!this._ctlSocket && this._ctlTries < 3) {
-      this._ctlTries = (this._ctlTries || 0) + 1
-      try {
-        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const tok = encodeURIComponent(authState.token || '')
-        const s = new WebSocket(`${proto}//${location.host}/api/stream/${this.id}/ctl?token=${tok}`)
-        this._ctlSocket = s
-        s.onopen = () => {
-          this._ctlQueue.splice(0).forEach((m) => { try { s.send(JSON.stringify(m)) } catch {} })
-        }
-        s.onclose = s.onerror = () => {
-          if (this._ctlSocket === s) this._ctlSocket = null
-          // 回落：把队列里的消息用 POST 补发
-          this._ctlQueue.splice(0).forEach((m) => this._ctlPost(m))
-        }
-      } catch { this._ctlSocket = null }
-    }
+    this._ctlTries = (this._ctlTries || 0) + 1
+    try {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const tok = encodeURIComponent(authState.token || '')
+      const s = new WebSocket(`${proto}//${location.host}/api/stream/${this.id}/ctl?token=${tok}`)
+      this._ctlSocket = s
+      s.onopen = () => {
+        s._openAt = performance.now()
+        this._ctlQueue.splice(0).forEach((m) => { try { s.send(JSON.stringify(m)) } catch {} })
+      }
+      s.onclose = s.onerror = () => {
+        if (this._ctlSocket === s) this._ctlSocket = null
+        // 存活过 3s 的健康连接掉线 → 恢复重试额度（瞬时故障不永久禁用 WS）；
+        // 秒断的不恢复，避免抖动时每条消息都重连
+        if (s._openAt && performance.now() - s._openAt > 3000) this._ctlTries = 0
+        // 回落：把队列里的消息用 POST 补发
+        this._ctlQueue.splice(0).forEach((m) => this._ctlPost(m))
+      }
+    } catch { this._ctlSocket = null }
   }
   _ctlPost(msg) {
     const map = { touch: 'touch', key: 'key', text: 'text', scroll: 'scroll' }

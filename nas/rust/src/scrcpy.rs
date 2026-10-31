@@ -89,9 +89,15 @@ pub struct Session {
     /// 由 next_packet 首次调用惰性读取，避免阻塞 start 返回）
     header_pending: bool,
     server: Option<ShellProcess>,
+    /// 后台接通线程的取消标志（stop / api 层 stop_fn 置位）
+    connector_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
+    /// 后台接通线程的取消标志（api 层放入 stop_fn：拆会话时同步叫停接通线程）
+    pub fn connector_cancel(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.connector_cancel.clone()
+    }
     /// 限时探测视频流是否已开始产出（server 侧全 socket accept 后才发流）。
     /// 返回 true=已有画面元数据。探测用的数据留在内部缓冲，不丢失。
     pub fn probe_first_frame(&mut self, timeout: Duration) -> bool {
@@ -115,6 +121,7 @@ impl Session {
     }
 
     pub fn stop(&mut self) {
+        self.connector_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(s) = &self.server {
             s.shutdown();
         }
@@ -376,10 +383,24 @@ pub fn start(
     let want_audio = p.audio;
     let start_app_msg = p.start_app.as_ref().and_then(|a| control::start_app(a));
     let connector_serial = serial.to_string();
+    // 取消标志：会话被拆（音频冷启降级/关窗）后接通线程必须立刻停手——否则
+    // 它会继续向转发端口 connect，若该端口被新会话复用就会抢走新 server 的
+    // 控制/音频槽位，新会话挂上的是死连接（有画面、无输入）
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_c = cancel.clone();
     std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        let cancelled = || cancel_c.load(Ordering::Relaxed);
         let connect_wait = |deadline: Instant| -> Option<TcpStream> {
             loop {
+                if cancelled() {
+                    return None;
+                }
                 if let Ok(conn) = TcpStream::connect(("127.0.0.1", port)) {
+                    if cancelled() {
+                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                        return None;
+                    }
                     conn.set_nodelay(true).ok();
                     return Some(conn);
                 }
@@ -415,6 +436,9 @@ pub fn start(
                 }
             }
         }
+        if cancelled() {
+            return;
+        }
         if let Some(mut c) = connect_wait(Instant::now() + Duration::from_secs(20)) {
             // 副屏会话：控制通道一建立就下发 StartApp（应用落在该副屏）
             if let Some(msg) = &start_app_msg {
@@ -422,7 +446,6 @@ pub fn start(
                 let _ = c.write_all(msg);
             }
             let _ = ctrl_tx.send(c);
-        } else {
         }
         let _ = connector_serial;
     });
@@ -440,6 +463,7 @@ pub fn start(
         forward_port: port,
         header_pending: true,
         server: Some(server),
+        connector_cancel: cancel,
     })
 }
 

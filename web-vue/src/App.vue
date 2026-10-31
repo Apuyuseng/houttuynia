@@ -36,10 +36,10 @@
             <MsIcon name="smartphone" :size="14" />
           </span>
         </template>
-        <button class="si sb-bell" :class="{ has: unread > 0 }" title="通知"
+        <button class="si sb-bell" :class="{ has: unread > 0 }" :title="unread > 0 ? '有新通知' : '通知'"
                 @click.stop="notifOpen = !notifOpen">
-          <MsIcon :name="unread > 0 ? 'notifications_active' : 'notifications'" :size="15" />
-          <span class="bell-badge" v-if="unread > 0">{{ unread > 99 ? '99+' : unread }}</span>
+          <MsIcon name="notifications" :size="15" />
+          <span class="bell-dot" v-if="unread > 0"></span>
         </button>
         <span class="sb-clock">{{ clock }}</span>
       </div>
@@ -358,7 +358,7 @@ onUnmounted(() => {
 .sb-right { display: flex; align-items: center; gap: 15px; overflow: hidden; white-space: nowrap; }
 .sb-clock { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
 
-/* 通知铃铛 + 未读 badge */
+/* 通知铃铛 + 未读蓝点（只表示"有新消息"，不显示具体数字；图标本身不换形不变色） */
 .sb-bell {
   position: relative;
   background: none; border: none; cursor: pointer;
@@ -367,14 +367,16 @@ onUnmounted(() => {
   display: inline-flex; align-items: center; justify-content: center;
 }
 .sb-bell:hover { background: rgba(255,255,255,0.12); }
-.sb-bell.has { color: #8ab4f8; }
-.bell-badge {
-  position: absolute; top: -4px; right: -6px;
-  min-width: 15px; height: 15px; padding: 0 4px;
-  background: #ea4335; color: #fff;
-  font-size: 9px; font-weight: 700; line-height: 15px;
-  border-radius: 999px; text-align: center;
+.sb-bell.has { color: #fff; }
+.bell-dot {
+  position: absolute; top: 5px; right: 5px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #8ab4f8;
+  /* 深色细描边把点从图标/壁纸上托起，外圈淡蓝光晕增强可见性 */
+  box-shadow: 0 0 0 1.5px rgba(20, 22, 28, 0.65), 0 0 6px rgba(138, 180, 248, 0.7);
+  animation: bell-dot-in 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.4);
 }
+@keyframes bell-dot-in { from { transform: scale(0); } to { transform: scale(1); } }
 /* macOS 风格通知中心：右上滑出，毛玻璃卡片列表 */
 .notif-center {
   position: fixed; top: 30px; right: 8px; z-index: 3000;

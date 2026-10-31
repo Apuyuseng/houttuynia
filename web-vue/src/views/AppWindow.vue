@@ -1,10 +1,14 @@
 <template>
   <div class="app-window" :style="{ left: pos.x + 'px', top: pos.y + 'px', zIndex: z }"
        @pointerdown="bringFront">
-    <div class="win-titlebar" @pointerdown="startDrag">
+    <div class="win-titlebar" :class="{ drag: dragging }" @pointerdown="startDrag">
       <span class="win-live" :class="{ on: liveOn }" :title="status"></span>
+      <span class="win-icon" aria-hidden="true">
+        <img v-if="iconOk" :src="iconUrl" alt="" draggable="false" @error="iconOk = false">
+        <template v-else-if="pkg">{{ (title || pkg).slice(0, 1).toUpperCase() }}</template>
+        <MsIcon v-else name="smartphone" :size="13" />
+      </span>
       <span class="win-title">{{ title }}</span>
-      <span class="win-pkg muted">{{ pkg }}</span>
       <div style="flex:1"></div>
       <button class="win-btn" @pointerdown.stop @click="$emit('minimize')" title="最小化">
         <MsIcon name="minimize" :size="13" />
@@ -16,7 +20,11 @@
     <div class="win-body" :style="{ width: size.w + 'px', height: size.h + 'px' }" ref="bodyRef">
       <!-- 加载浮层：分阶段进度 + 实时状态行 + 失败重试 -->
       <div class="win-loading" v-if="!ready && !noDisplay">
-        <div class="wl-spinner" :class="{ err: !!loadError }"><MsIcon :name="loadError ? 'close' : 'smartphone'" :size="30" /></div>
+        <div class="wl-spinner" :class="{ err: !!loadError }">
+          <img v-if="iconOk && !loadError" :src="iconUrl" alt="" draggable="false" @error="iconOk = false">
+          <span v-else-if="pkg && !loadError" class="wl-letter">{{ (title || pkg).slice(0, 1).toUpperCase() }}</span>
+          <MsIcon v-else :name="loadError ? 'close' : 'smartphone'" :size="30" />
+        </div>
         <div class="wl-title" v-if="!loadError">{{ loadError ? '' : '正在启动投屏' }}</div>
         <div class="wl-title err" v-else>投屏失败</div>
         <div class="wl-steps" v-if="!loadError">
@@ -37,7 +45,10 @@
       </div>
       <!-- 副屏无内容（设备/应用不支持虚拟屏独立窗口）→ 提供主屏回退 -->
       <div class="win-fallback" v-if="noDisplay">
-        <div class="wf-icon"><MsIcon name="smartphone" :size="26" /></div>
+        <div class="wf-icon">
+          <img v-if="iconOk" class="wf-appicon" :src="iconUrl" alt="" @error="iconOk = false">
+          <MsIcon v-else name="smartphone" :size="26" />
+        </div>
         <div class="wf-title">{{ noDisplayReason }}</div>
         <div class="wf-sub muted small">并非所有设备/应用都支持独立窗口（虚拟屏）：Android 10 以下、
           部分厂商 ROM 及强制主屏的应用（如银行类）会受限</div>
@@ -126,6 +137,10 @@ const bodyRef = ref(null)
 
 const title = props.titleText || props.app?.name || props.app?.package || ''
 const pkg = props.app?.package || ''
+// 应用图标（标题栏 + 加载/回退浮层共用；主屏镜像无 app → 手机图标回退）
+const iconUrl = pkg ? imgUrl('/api/apps/icon?pkg=' + encodeURIComponent(pkg)) : ''
+const iconOk = ref(pkg ? props.app.has_icon !== false : false)
+const dragging = ref(false)
 
 async function resolveDisplaySize() {
   if (props.deviceSerial) {
@@ -368,6 +383,7 @@ function bringFront() {
 // ---- 拖拽 ----
 let drag = null
 function startDrag(e) {
+  dragging.value = true // 拖拽期间标题栏保持显形
   drag = { sx: e.clientX, sy: e.clientY, ox: pos.value.x, oy: pos.value.y }
   const move = (ev) => {
     pos.value = {
@@ -376,6 +392,7 @@ function startDrag(e) {
     }
   }
   const up = () => {
+    dragging.value = false
     window.removeEventListener('pointermove', move)
     window.removeEventListener('pointerup', up)
   }
@@ -404,37 +421,64 @@ function startResize(e) {
 </script>
 
 <style scoped>
+/* 独立窗口外框：单一圆角描边 + 阴影包住「标题带 + 画面 + 导航带」，视觉上是
+   一块完整的玻璃板。上下条带各占独立空间（绝不遮挡投屏内容），条带本身是
+   透出壁纸的浅色毛玻璃（不发黑），控件默认近全透明；鼠标经过时该条带压深、
+   控件显形 */
 .app-window {
   position: fixed;
-  background: #141318;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 16px;
+  padding: 38px 0 34px; /* 上=标题栏条带，下=导航栏条带 */
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
   overflow: hidden;
-  display: flex;
-  flex-direction: column;
   min-width: 240px;
 }
-/* Android 桌面模式 caption bar */
+/* Android 桌面模式 caption bar：玻璃条带贴满外框顶部（与画面同宽，一体），
+   本体始终是浅色毛玻璃（透壁纸）；控件近全透明，经过/按下/拖拽时显形 */
 .win-titlebar {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 5;
   display: flex; align-items: center; gap: 8px;
   padding: 0 8px 0 12px;
   height: 38px;                    /* 固定单行高度：fps 等状态文本不再引起抖动 */
   white-space: nowrap; overflow: hidden;
-  background: rgba(255, 255, 255, 0.04);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   cursor: move;
   user-select: none;
   touch-action: none;
+  transition: background-color 0.18s ease;
 }
+/* 透明度只作用于控件，不作用于条带的毛玻璃本体（条带始终保持玻璃观感） */
+.win-titlebar > * { opacity: 0.15; transition: opacity 0.18s ease; }
+/* 触屏无 hover：:active（按下即显）+ 拖拽类兜底 */
+.win-titlebar:hover,
+.win-titlebar:active,
+.win-titlebar.drag { background: rgba(16, 18, 24, 0.5); }
+.win-titlebar:hover > *,
+.win-titlebar:active > *,
+.win-titlebar.drag > * { opacity: 1; }
 /* 直播状态点（悬停看状态文本），不随内容变形 */
 .win-live {
   width: 8px; height: 8px; border-radius: 50%;
   background: rgba(255, 255, 255, 0.25); flex-shrink: 0;
 }
 .win-live.on { background: #81c995; box-shadow: 0 0 6px #81c99588; }
+/* 应用图标：squircle 圆角，图标本体铺满（无图标回退首字母，镜像回退手机图标） */
+.win-icon {
+  width: 18px; height: 18px; border-radius: 5px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  overflow: hidden;
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.06));
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 10px; font-weight: 700;
+}
+.win-icon img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .win-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
-.win-pkg { font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .win-btn {
   background: none; border: none; cursor: pointer;
   color: rgba(255, 255, 255, 0.6);
@@ -443,6 +487,7 @@ function startResize(e) {
 }
 .win-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
 .win-btn.close:hover { background: rgba(234, 67, 53, 0.25); color: #f6aea9; }
+/* 画面本体：方角贴在上下玻璃条带之间（外框统一裁圆角） */
 .win-body {
   position: relative;
   background: #000;
@@ -471,11 +516,14 @@ function startResize(e) {
   background: rgba(16, 18, 24, 0.88); backdrop-filter: blur(8px);
 }
 .wl-spinner {
-  width: 56px; height: 56px; border-radius: 16px;
+  width: 56px; height: 56px; border-radius: 16px; overflow: hidden;
   display: flex; align-items: center; justify-content: center;
   background: rgba(66, 133, 244, 0.14); color: #8ab4f8;
   animation: wl-pulse 1.6s ease-in-out infinite;
 }
+/* 有应用图标时图标铺满整个 squircle（与桌面图标同观感），脉冲动画保留 */
+.wl-spinner img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.wl-spinner .wl-letter { font-size: 22px; font-weight: 700; }
 .wl-spinner.err {
   background: rgba(237, 78, 78, 0.14); color: #f28b82; animation: none;
 }
@@ -515,16 +563,28 @@ function startResize(e) {
   background: rgba(16, 18, 24, 0.82); backdrop-filter: blur(6px);
 }
 .wf-icon { opacity: 0.6; }
+.wf-appicon { width: 34px; height: 34px; border-radius: 10px; object-fit: cover; display: block; }
 .wf-title { font-size: 14px; font-weight: 600; color: #e6e9ef; }
 .wf-sub { max-width: 320px; line-height: 1.5; }
 .wf-actions { display: flex; gap: 8px; margin-top: 4px; }
-/* 底部导航栏 */
+/* 底部导航栏：玻璃条带贴满外框底部，与标题栏同款——本体浅色毛玻璃，
+   控件近全透明，经过/按下时显形 */
 .win-navbar {
+  position: absolute; bottom: 0; left: 0; right: 0; z-index: 5;
   display: flex; align-items: center; gap: 4px;
-  background: rgba(255, 255, 255, 0.03);
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  box-sizing: border-box;
   padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  transition: background-color 0.18s ease;
 }
+.win-navbar > * { opacity: 0.15; transition: opacity 0.18s ease; }
+.win-navbar:hover,
+.win-navbar:active { background: rgba(16, 18, 24, 0.5); }
+.win-navbar:hover > *,
+.win-navbar:active > * { opacity: 1; }
 .nav-btn {
   background: none; border: none; color: rgba(255, 255, 255, 0.75);
   font-size: 13px; width: 40px; height: 26px; border-radius: 999px; cursor: pointer;
@@ -532,10 +592,11 @@ function startResize(e) {
 .nav-btn:hover { background: rgba(255, 255, 255, 0.1); }
 .win-resize {
   position: absolute; right: 0; bottom: 0;
+  z-index: 6; /* 压在悬浮导航栏之上 */
   width: 18px; height: 18px;
   cursor: nwse-resize;
   background: linear-gradient(135deg, transparent 50%, rgba(255, 255, 255, 0.22) 50%);
-  border-bottom-right-radius: 16px;
+  border-bottom-right-radius: 17px;
   touch-action: none;
 }
 </style>

@@ -915,6 +915,7 @@ pub async fn stream_open(
     let fwd_port = session.forward_port;
     let late_ctrl = session.late_control.take();
     let server_proc = session.take_server();
+    let connector_cancel = session.connector_cancel();
     let mut session = session; // feeder 会 move；降级路径不再直接使用
 
     let mut stream = Arc::new(StreamSession {
@@ -931,6 +932,8 @@ pub async fn stream_open(
         clipboard: Mutex::new(String::new()),
         last_frame_ms: std::sync::atomic::AtomicU64::new(0),
         stop_fn: Mutex::new(Some(Box::new(move || {
+            // 先叫停后台接通线程，再关 server：避免它在端口复用时抢走新会话槽位
+            connector_cancel.store(true, Ordering::SeqCst);
             control_for_stop.shutdown();
             if let Some(sp) = &server_proc {
                 sp.shutdown();
@@ -976,10 +979,15 @@ pub async fn stream_open(
         });
     }
     let s2 = stream.clone();
+    let s2_me = stream.clone();
     let st2 = st.clone();
     std::thread::spawn(move || {
         crate::scrcpy_feeder(session, tx, s2);
-        st2.streams.lock().unwrap().remove(&id);
+        // 只移除自己这个会话实例：下方音频冷启降级会用同一 id 重建会话，
+        // 旧 server 在设备侧可能晚几秒才断流，旧喂包线程若无条件 remove(&id)
+        // 会把新会话删掉——视频已被浏览器领走仍在播，但控制通道按 id 查不到，
+        // 表现为「有画面、鼠标键盘全失灵」
+        remove_stream_if_same(&st2, id, &s2_me);
     });
     st.streams.lock().unwrap().insert(id, stream.clone());
     // 音频冷启降级：开了音频但 1.2s 内无画面元数据（server 等音频管线，
@@ -1027,6 +1035,7 @@ pub async fn stream_open(
                     let serial2_stop = serial.clone();
                     let fwd2 = sess2.forward_port;
                     let server_proc2 = sess2.take_server();
+                    let connector_cancel2 = sess2.connector_cancel();
                     let late_ctrl2 = sess2.late_control.take();
                     let stream2 = Arc::new(StreamSession {
                         id,
@@ -1042,6 +1051,7 @@ pub async fn stream_open(
                         clipboard: Mutex::new(String::new()),
                         last_frame_ms: std::sync::atomic::AtomicU64::new(0),
                         stop_fn: Mutex::new(Some(Box::new(move || {
+                            connector_cancel2.store(true, Ordering::SeqCst);
                             control2_stop.shutdown();
                             if let Some(sp) = &server_proc2 {
                                 sp.shutdown();
@@ -1060,10 +1070,11 @@ pub async fn stream_open(
                         });
                     }
                     let s2c = stream2.clone();
+                    let s2c_me = stream2.clone();
                     let st2c = st.clone();
                     std::thread::spawn(move || {
                         crate::scrcpy_feeder(sess2, tx2, s2c);
-                        st2c.streams.lock().unwrap().remove(&id);
+                        remove_stream_if_same(&st2c, id, &s2c_me);
                     });
                     st.streams.lock().unwrap().insert(id, stream2.clone());
                     stream = stream2;
@@ -1135,6 +1146,14 @@ fn stream_get(st: &AppState, id: u64) -> Result<Arc<StreamSession>, (StatusCode,
         .get(&id)
         .cloned()
         .ok_or_else(|| err(404, "会话不存在"))
+}
+
+/// 仅当表中该 id 仍是 `me` 这个实例时才移除（同 id 已被新会话替换则不动）
+fn remove_stream_if_same(st: &AppState, id: u64, me: &Arc<StreamSession>) {
+    let mut g = st.streams.lock().unwrap();
+    if g.get(&id).map(|cur| Arc::ptr_eq(cur, me)).unwrap_or(false) {
+        g.remove(&id);
+    }
 }
 
 fn stream_control_send(
