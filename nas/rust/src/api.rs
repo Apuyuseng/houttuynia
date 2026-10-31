@@ -311,12 +311,12 @@ pub async fn apps(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
                 .filter(|p| !crate::icons::icon_cached_or_inflight(p))
                 .collect();
             if !missing.is_empty() {
-                for lane in 0..3usize {
+                for lane in 0..6usize {
                     let serial_ic = serial.clone();
                     let chunk: Vec<String> = missing
                         .iter()
                         .skip(lane)
-                        .step_by(3)
+                        .step_by(6)
                         .cloned()
                         .collect();
                     if chunk.is_empty() {

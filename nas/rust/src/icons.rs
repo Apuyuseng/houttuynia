@@ -607,16 +607,73 @@ pub fn app_label(serial: &str, pkg: &str) -> Option<String> {
             }
         }
     }
-    // APK 解析
+    // APK 解析（Range 局部拉取：尾部目录 → manifest（几 KB）→ 需要时 arsc 头部。
+    // 原整包拉取在大应用（数百 MB）上要数分钟，是应用名补全慢的主因）
     let out = adb::shell_blocking(serial, &format!("pm path {pkg}"), 30000).ok()?;
     let text = String::from_utf8_lossy(&out);
     let apk_path = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("package:").map(str::to_string))?;
+    if let Some(label) = label_from_apk_ranged(serial, &apk_path) {
+        label_store(pkg, &label);
+        return Some(label);
+    }
+    // Range 失败兜底（老 adbd/极端分卷）：整包
     let apk = adb::pull_file(serial, &apk_path, 200 * 1024 * 1024).ok()?;
     let label = crate::meta::app_label_from_apk(&apk)?;
     label_store(pkg, &label);
     Some(label)
+}
+
+/// Range 版应用名提取：zip 目录 → AndroidManifest.xml →（资源引用时）
+/// resources.arsc 头部 768KB（string pool 集中在表头；解不出交整包兜底）
+fn label_from_apk_ranged(serial: &str, path: &str) -> Option<String> {
+    let size = adb::remote_file_size(serial, path)?;
+    if size == 0 || size > 0x4000_0000 {
+        return None;
+    }
+    // 尾部 256KB 找 EOCD + 中央目录
+    let tail_len = 256 * 1024u64.min(size);
+    let tail = adb::pull_range(serial, path, size - tail_len, tail_len).ok()?;
+    let mut eocd = None;
+    let mut i = tail.len().saturating_sub(22);
+    loop {
+        if tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] {
+            eocd = Some(i);
+            break;
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    let eocd = eocd?;
+    let cd_size = u32::from_le_bytes([tail[eocd + 12], tail[eocd + 13], tail[eocd + 14], tail[eocd + 15]]) as u64;
+    let cd_off = u32::from_le_bytes([tail[eocd + 16], tail[eocd + 17], tail[eocd + 18], tail[eocd + 19]]) as u64;
+    if cd_size == 0 || cd_size > 4 * 1024 * 1024 || cd_off + cd_size > size {
+        return None;
+    }
+    let cd = adb::pull_range(serial, path, cd_off, cd_size).ok()?;
+    let entries = cd_parse(&cd);
+    let entry = |name: &str| entries.iter().find(|e| e.name == name);
+    let read_entry = |e: &CdEntry| read_cd_entry_ranged(serial, path, e);
+
+    // manifest
+    let m = entry("AndroidManifest.xml")?;
+    let manifest = read_entry(m)?;
+    match crate::meta::axml_app_label(&manifest)? {
+        crate::meta::AppLabel::Literal(s) => Some(s),
+        crate::meta::AppLabel::Resource(id) => {
+            let ar = entry("resources.arsc")?;
+            // arsc 前部（全局字符串池+类型表在前）：只拉 min(压缩尺寸,768KB)。
+            // Android 11+ 要求 arsc STORED 明文存储——截断读可解析；个别
+            // deflate 旧包部分解压失败 → None → 整包兜底
+            let comp = ar.comp_size.min(768 * 1024) as u64;
+            let slice = adb::pull_range(serial, path, ar.local_off, 512 + comp).ok()?;
+            let head = zip_read_slice(&slice, ar.method, comp as u32)?;
+            crate::meta::arsc_resolve_string(&head, id)
+        }
+    }
 }
 
 // ---------------- 壁纸 ----------------
