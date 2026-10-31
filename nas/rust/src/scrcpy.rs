@@ -75,28 +75,77 @@ pub struct Session {
     pub device_name: String,
     pub codec: String,
     pub video: TcpStream,
-    pub control: Option<TcpStream>,
-    /// 音频 socket（aac 等；设备不支持音频采集时 None——server 下发 codec id 0）
-    pub audio: Option<TcpStream>,
+    /// 控制通道：后台接通后经通道交付（server 侧在音频管线就绪后才 accept
+    /// 控制槽位——部分设备音频初始化 10s 级，不能阻塞开流）
+    pub late_control: Option<std::sync::mpsc::Receiver<TcpStream>>,
+    /// 音频 (socket, codec)：后台接通并读 codec id 后交付；设备不支持时
+    /// 不交付（server 下发 disable 码时直接关闭）
+    pub late_audio: Option<std::sync::mpsc::Receiver<(TcpStream, String)>>,
     pub audio_codec: String,
     pub width: u32,
     pub height: u32,
     pub forward_port: u16,
-    server: ShellProcess,
+    /// 64B 设备名 + 4B codec id 未消费（server 在全部 socket accept 后才发，
+    /// 由 next_packet 首次调用惰性读取，避免阻塞 start 返回）
+    header_pending: bool,
+    server: Option<ShellProcess>,
 }
 
 impl Session {
-    pub fn stop(&mut self) {
-        self.server.shutdown();
-        let _ = self.video.shutdown(std::net::Shutdown::Both);
-        if let Some(c) = &self.control {
-            let _ = c.shutdown(std::net::Shutdown::Both);
+    /// 限时探测视频流是否已开始产出（server 侧全 socket accept 后才发流）。
+    /// 返回 true=已有画面元数据。探测用的数据留在内部缓冲，不丢失。
+    pub fn probe_first_frame(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.next_packet() {
+                Ok(Some(_)) => return self.width > 0,
+                Ok(None) => return false,
+                Err(_) => return false,
+            }
+            #[allow(unreachable_code)]
+            if Instant::now() >= deadline {
+                return self.width > 0;
+            }
         }
+    }
+
+    /// 取走 server 进程句柄（api 层放入 stop_fn——喂包线程卡住时也能强杀）
+    pub fn take_server(&mut self) -> Option<ShellProcess> {
+        self.server.take()
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(s) = &self.server {
+            s.shutdown();
+        }
+        let _ = self.video.shutdown(std::net::Shutdown::Both);
+        // late socket 由接收端 drop 自动关闭；forward 由 api 层 stop_fn 清理
         let _ = adb::remove_forward(&self.serial, self.forward_port);
     }
 
     /// 阻塞读下一个视频包（流结束 Ok(None)；session meta 被吸收并更新尺寸）。
     pub fn next_packet(&mut self) -> AdbResult<Option<VideoPacket>> {
+        if self.header_pending {
+            // server 在全部 socket accept 后发 64B 设备名 + 4B codec id；
+            // 此处阻塞读取（首帧自然随之就绪），不阻塞会话建立
+            let mut name = [0u8; 64];
+            match read_exact(&mut self.video, &mut name, 20000)? {
+                true => {}
+                false => return err("读设备名 EOF"),
+            }
+            let mut cid = [0u8; 4];
+            match read_exact(&mut self.video, &mut cid, 20000)? {
+                true => {}
+                false => return err("读 codec id EOF"),
+            }
+            if let Ok(n) = std::str::from_utf8(&name) {
+                let n = n.trim_end_matches('\0').trim();
+                if !n.is_empty() {
+                    self.device_name = n.to_string();
+                }
+            }
+            self.header_pending = false;
+        }
         loop {
             let mut h8 = [0u8; 8];
             match read_exact(&mut self.video, &mut h8, 0) {
@@ -316,120 +365,81 @@ pub fn start(
         }
     };
 
-    // audio socket（启用音频时；server 在 video 后按序 accept 它，再 control）
-    let audio = if p.audio {
-        let adeadline = Instant::now() + Duration::from_secs(15);
-        let mut a = None;
-        while Instant::now() < adeadline {
-            if let Ok(conn) = TcpStream::connect(("127.0.0.1", port)) {
-                conn.set_nodelay(true).ok();
-                a = Some(conn);
-                break;
+    // ---- 视频 socket 已就绪：立即返回会话，音频/控制后台接通 ----
+    // server 按 video→audio→control 顺序 accept 后续槽位；音频槽位要等
+    // 设备音频管线初始化（实测 FlymeOS Android16 约 10s）——开流决不能
+    // 等它。后台线程串行接通 audio→control（顺序不可换），接通后经通道
+    // 交付；期间控制消息由 ControlChan 排队。设备名/codec id 的 68B 头由
+    // next_packet 首包惰性读取（server 在全部 accept 后才发它）。
+    let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<(TcpStream, String)>(1);
+    let (ctrl_tx, ctrl_rx) = std::sync::mpsc::sync_channel::<TcpStream>(1);
+    let want_audio = p.audio;
+    let start_app_msg = p.start_app.as_ref().and_then(|a| control::start_app(a));
+    let connector_serial = serial.to_string();
+    std::thread::spawn(move || {
+        let connect_wait = |deadline: Instant| -> Option<TcpStream> {
+            loop {
+                if let Ok(conn) = TcpStream::connect(("127.0.0.1", port)) {
+                    conn.set_nodelay(true).ok();
+                    return Some(conn);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Some(a.ok_or_else(|| adb::AdbError("audio socket 连接超时".into()))?)
-    } else {
-        None
-    };
-
-    // control socket（video/audio 之后；全部 accept 完成才发设备名）
-    let control = {
-        let cdeadline = Instant::now() + Duration::from_secs(15);
-        let mut c = None;
-        while Instant::now() < cdeadline {
-            if let Ok(conn) = TcpStream::connect(("127.0.0.1", port)) {
-                conn.set_nodelay(true).ok();
-                c = Some(conn);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        c.ok_or_else(|| adb::AdbError("control socket 连接超时".into()))?
-    };
-
-    // 设备名（64 字节）+ codec id（4 字节）
-    let mut name = [0u8; 64];
-    match read_exact(&mut video, &mut name, 15000)? {
-        true => {}
-        false => return err("读设备名 EOF"),
-    }
-    let device_name = String::from_utf8_lossy(&name)
-        .trim_end_matches('\0')
-        .to_string();
-    let mut codec = [0u8; 4];
-    match read_exact(&mut video, &mut codec, 15000)? {
-        true => {}
-        false => return err("读 codec id EOF"),
-    }
-    let codec = match &codec {
-        b"h264" => "h264",
-        b"h265" => "h265",
-        b"av1\x00" => "av1",
-        other => return err(format!("未知 codec id: {}", String::from_utf8_lossy(other))),
-    }
-    .to_string();
-
-    // 音频流 meta：仅 4 字节 codec id（无 dummy/设备名——那些只在首个 socket）。
-    // id=0 设备禁用音频（静默回退纯视频）；id=1 配置错误（同样降级，不杀视频）
-    let mut audio = audio;
-    let mut audio_codec = String::new();
-    if let Some(mut a) = audio.take() {
-        let mut cid = [0u8; 4];
-        match read_exact(&mut a, &mut cid, 10000) {
-            Ok(true) => {
-                let id = u32::from_be_bytes(cid);
-                match id {
-                    0 | 1 => {
-                        tracing::warn!("设备侧音频不可用（disable 码 {id}），回退纯视频");
-                        let _ = a.shutdown(std::net::Shutdown::Both);
-                    }
-                    _ => {
-                        audio_codec = match &cid {
-                            b"\0aac" => "aac".into(),
-                            b"opus" => "opus".into(),
-                            b"flac" => "flac".into(),
-                            other => format!("unknown:{}", String::from_utf8_lossy(other)),
+        };
+        if want_audio {
+            if let Some(mut a) = connect_wait(Instant::now() + Duration::from_secs(20)) {
+                // audio codec id（4B）：0/1 = server 侧音频不可用 → 关闭不交付
+                let mut cid = [0u8; 4];
+                match read_exact(&mut a, &mut cid, 15000) {
+                    Ok(true) => {
+                        let id = u32::from_be_bytes(cid);
+                        let name = match &cid {
+                            b"\0aac" => "aac",
+                            b"opus" => "opus",
+                            b"flac" => "flac",
+                            _ => "",
                         };
-                        if audio_codec.starts_with("unknown") {
-                            tracing::warn!("未知音频 codec id {id:#x}，忽略音频流");
+                        if id == 0 || id == 1 || name.is_empty() {
+                            tracing::info!("音频不可用/未知 codec（id={id:#x}），纯视频");
                             let _ = a.shutdown(std::net::Shutdown::Both);
                         } else {
-                            audio = Some(a);
+                            let _ = audio_tx.send((a, name.to_string()));
                         }
+                    }
+                    _ => {
+                        let _ = a.shutdown(std::net::Shutdown::Both);
                     }
                 }
             }
-            _ => {
-                tracing::warn!("音频 codec id 读取失败，回退纯视频");
-                let _ = a.shutdown(std::net::Shutdown::Both);
-            }
         }
-    }
-
-    // 副屏会话：建立后即下发 StartApp（应用直接落在该副屏）
-    if let Some(app) = &p.start_app {
-        if let Some(msg) = control::start_app(app) {
-            let mut c = control.try_clone().ok();
-            if let Some(cc) = c.as_mut() {
+        if let Some(mut c) = connect_wait(Instant::now() + Duration::from_secs(20)) {
+            // 副屏会话：控制通道一建立就下发 StartApp（应用落在该副屏）
+            if let Some(msg) = &start_app_msg {
                 use std::io::Write as _;
-                let _ = cc.write_all(&msg);
+                let _ = c.write_all(msg);
             }
+            let _ = ctrl_tx.send(c);
+        } else {
         }
-    }
+        let _ = connector_serial;
+    });
 
     Ok(Session {
         serial: serial.to_string(),
-        device_name,
-        codec,
+        device_name: String::new(),
+        codec: "h264".to_string(),
         video,
-        control: Some(control),
-        audio,
-        audio_codec,
+        late_control: Some(ctrl_rx),
+        late_audio: Some(audio_rx),
+        audio_codec: String::new(),
         width: 0,
         height: 0,
         forward_port: port,
-        server,
+        header_pending: true,
+        server: Some(server),
     })
 }
 

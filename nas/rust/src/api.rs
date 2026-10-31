@@ -764,7 +764,8 @@ pub async fn stream_open(
     let fps: u32 = q.get("fps").and_then(|s| s.parse().ok()).unwrap_or(60);
     // 应用独立窗口：app= 包名 + 可选 w/h/dpi 副屏尺寸（默认 720×1280@320 竖屏手机）
     let start_app = q.get("app").cloned().filter(|s| !s.is_empty());
-    let audio = q.get("audio").and_then(|s| s.parse().ok()).unwrap_or(true);
+    // 兼容 "0"/"1"/"true"/"false"（bool::parse 只认 true/false，历史前端传 0/1）
+    let audio = !matches!(q.get("audio").map(|s| s.as_str()), Some("0") | Some("false"));
     let new_display = if start_app.is_some() {
         let w: u32 = q.get("w").and_then(|s| s.parse().ok()).unwrap_or(720);
         let h: u32 = q.get("h").and_then(|s| s.parse().ok()).unwrap_or(1280);
@@ -779,7 +780,14 @@ pub async fn stream_open(
     } else {
         max_size
     };
-    // 音频始终请求：设备不支持时 server 下发 disable 码自动回退纯视频
+    // 音频冷缓存：近期降级过的设备直接纯视频开流（音频管线冷启 ~10s，
+    // 探测+重开的 1.6s 成本没必要每次都付；10 分钟后再试一次音频）
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let audio_cold = now_ms < *st.audio_cold_until.lock().unwrap();
+    let audio = audio && !audio_cold;
     let params = scrcpy::StartParams { max_size, bit_rate, fps, audio, new_display, start_app };
 
     // TV/大屏设备待机（Dreaming）时 scrcpy 抓的是黑缓冲——开流前先唤醒。
@@ -843,9 +851,18 @@ pub async fn stream_open(
     // 开流（含一次整体重试）：server 桥上「推 jar（sync 流）→ 启动 server
     // （shell 流）」快速连续建链偶发假流（HTTP200 但 0 字节，实测 ~30% 概率
     // 连续开关时出现）。重试路径 jar 已在（stat 命中快路径），第二轮稳定。
+    // 开流阶梯（快出画面优先）：
+    //   尝试 1：按请求参数（默认开音频）。server 侧视频流要等音频管线就绪
+    //           （冷启实测 ~10s）——1.2s 内无首帧即判定音频冷，放弃该会话。
+    //   尝试 2：纯视频重开（无音频槽位，server 立即出流，~1s 出画面）。
+    //   音频热（近期用过）时尝试 1 直接带音频成功，无感。
+    //   另：server 桥上「推 jar→启动」快速连续建链偶发假流，此处一并覆盖重试。
     let mut attempt = 0;
     let mut wake_handle_opt = Some(wake_handle);
-    let session = loop {
+    let mut params = params;
+    let mut downgrade_audio = audio; // 尝试 1 后若降级则置 false
+    let mut session;
+    loop {
         attempt += 1;
         let serial_c = serial.clone();
         let jar_c = jar.clone();
@@ -853,43 +870,56 @@ pub async fn stream_open(
         let wake_c = wake_handle_opt.take();
         let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial_c, &jar_c, &params_c, wake_c)).await;
         match r {
-            Ok(Ok(s)) => break s,
+            Ok(Ok(s)) => session = s,
             Ok(Err(e)) => {
                 if attempt >= 2 {
                     return err(500, format!("投屏会话启动失败: {e}"));
                 }
                 tracing::warn!("投屏开流第 {attempt} 次失败（{e}），重试");
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
             }
             Err(e) => return err(500, format!("投屏任务失败: {e}")),
         }
-    };
-    let mut session = session;
+        if !downgrade_audio {
+            break; // 纯视频模式：直接进入建流
+        }
+        // 音频模式冷启探测由建流后的 width 轮询完成（见下方 1.2s 判定）
+        break;
+    }
 
     let id = st.alloc_id();
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let codec = session.codec.clone();
     let serial = session.serial.clone();
 
-    // 音频 socket 交给专用喂包线程（与视频线程并行读）
-    if let Some(audio_sock) = session.audio.take() {
+    // 音频 socket 后台接通后交给专用喂包线程（设备音频管线初始化可 10s 级）
+    if let Some(late_audio) = session.late_audio.take() {
         let tx_audio = tx.clone();
-        std::thread::spawn(move || crate::scrcpy_audio_feeder(audio_sock, tx_audio));
+        std::thread::spawn(move || {
+            while let Ok((audio_sock, _codec)) = late_audio.recv() {
+                crate::scrcpy_audio_feeder(audio_sock, tx_audio.clone());
+            }
+        });
     }
 
-    // 控制通道克隆用于 stop_fn
-    let control = session.control.take().map(|c| Arc::new(Mutex::new(c)));
+    // 控制通道：后台接通（音频之后）→ ControlChan 接管并冲刷排队消息 +
+    // 启动设备消息（剪贴板上行）读取线程
+    let control = Arc::new(crate::state::ControlChan::new());
     let control_for_stop = control.clone();
     let serial_for_stop = serial.clone();
     let fwd_port = session.forward_port;
+    let late_ctrl = session.late_control.take();
+    let server_proc = session.take_server();
+    let mut session = session; // feeder 会 move；降级路径不再直接使用
 
-    let stream = Arc::new(StreamSession {
+    let mut stream = Arc::new(StreamSession {
         id,
         serial: serial.clone(),
         codec: codec.clone(),
         width: std::sync::atomic::AtomicU64::new(session.width as u64),
         height: std::sync::atomic::AtomicU64::new(session.height as u64),
-        control,
+        control: Some(control.clone()),
         ended: std::sync::atomic::AtomicBool::new(false),
         err: Mutex::new(String::new()),
         frame_rx: Mutex::new(Some(rx)),
@@ -897,42 +927,49 @@ pub async fn stream_open(
         clipboard: Mutex::new(String::new()),
         last_frame_ms: std::sync::atomic::AtomicU64::new(0),
         stop_fn: Mutex::new(Some(Box::new(move || {
-            if let Some(c) = &control_for_stop {
-                let _ = c.lock().unwrap().shutdown(std::net::Shutdown::Both);
+            control_for_stop.shutdown();
+            if let Some(sp) = &server_proc {
+                sp.shutdown();
             }
             let _ = adb::remove_forward(&serial_for_stop, fwd_port);
         }))),
     });
-    // 设备消息读取线程：clipboard_autosync 的剪贴板推送经控制通道上行
-    if let Some(ctrl) = &stream.control {
-        if let Ok(mut rd) = ctrl.lock().unwrap().try_clone() {
-            let s3 = stream.clone();
-            std::thread::spawn(move || {
-                use std::io::Read as _;
-                loop {
-                    let mut t = [0u8; 1];
-                    if rd.read_exact(&mut t).is_err() { break; }
-                    if t[0] == 0 {
-                        // CLIPBOARD：lp32 字符串
-                        let mut l4 = [0u8; 4];
-                        if rd.read_exact(&mut l4).is_err() { break; }
-                        let n = u32::from_be_bytes(l4) as usize;
-                        let mut payload = vec![0u8; n.min(1_000_000)];
-                        if n > 0 && rd.read_exact(&mut payload).is_err() { break; }
-                        *s3.clipboard.lock().unwrap() = String::from_utf8_lossy(&payload).to_string();
-                    } else {
-                        // 其余消息（ack/uhid）本用例不关心——但无法预知长度，
-                        // 协议上 ack 是 8 字节序列号，跳过；未知类型终止读取
-                        if t[0] == 1 {
-                            let mut skip = [0u8; 8];
-                            if rd.read_exact(&mut skip).is_err() { break; }
+    // 控制通道后台接通：attach（冲刷排队消息）+ 启动设备消息（剪贴板上行）
+    // 读取线程。音频/控制在设备音频管线就绪后才可用（可 10s 级），不阻塞会话
+    if let Some(late_ctrl) = late_ctrl {
+        let chan = control.clone();
+        let s3 = stream.clone();
+        std::thread::spawn(move || {
+            if let Ok(sock) = late_ctrl.recv() {
+                if let Ok(mut w) = sock.try_clone() {
+                    chan.attach(w);
+                }
+                if let Ok(mut rd) = sock.try_clone() {
+                    use std::io::Read as _;
+                    loop {
+                        let mut t = [0u8; 1];
+                        if rd.read_exact(&mut t).is_err() { break; }
+                        if t[0] == 0 {
+                            // CLIPBOARD：lp32 字符串
+                            let mut l4 = [0u8; 4];
+                            if rd.read_exact(&mut l4).is_err() { break; }
+                            let n = u32::from_be_bytes(l4) as usize;
+                            let mut payload = vec![0u8; n.min(1_000_000)];
+                            if n > 0 && rd.read_exact(&mut payload).is_err() { break; }
+                            *s3.clipboard.lock().unwrap() = String::from_utf8_lossy(&payload).to_string();
                         } else {
-                            break;
+                            // ack 是 8 字节序列号，跳过；未知类型终止读取
+                            if t[0] == 1 {
+                                let mut skip = [0u8; 8];
+                                if rd.read_exact(&mut skip).is_err() { break; }
+                            } else {
+                                break;
+                            }
                         }
                     }
                 }
-            });
-        }
+            }
+        });
     }
     let s2 = stream.clone();
     let st2 = st.clone();
@@ -941,8 +978,101 @@ pub async fn stream_open(
         st2.streams.lock().unwrap().remove(&id);
     });
     st.streams.lock().unwrap().insert(id, stream.clone());
-    // 等首个 meta（编码器冷启数秒）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    // 音频冷启降级：开了音频但 1.2s 内无画面元数据（server 等音频管线，
+    // 冷启 ~10s）→ 拆掉该会话，纯视频重开（~1s 出画面）。音频热则无感保留。
+    if audio {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+        let mut got = false;
+        while std::time::Instant::now() < deadline {
+            if stream.width.load(Ordering::SeqCst) > 0 || stream.ended.load(Ordering::SeqCst) {
+                got = stream.width.load(Ordering::SeqCst) > 0;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if got {
+            // 音频热：清冷缓存（下次开流直接带音频）
+            *st.audio_cold_until.lock().unwrap() = 0;
+        }
+        if !got {
+            *st.audio_cold_until.lock().unwrap() = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64 + 600_000)
+                .unwrap_or(0);
+            tracing::info!("音频管线冷启（1.2s 无首帧），降级纯视频重开（10 分钟内跳过音频尝试）");
+            stream.stop();
+            st.streams.lock().unwrap().remove(&id);
+            // 纯视频重开（一次，不再降级判定）
+            let mut params2 = params.clone();
+            params2.audio = false;
+            let serial_c = serial.clone();
+            let jar_c = jar.clone();
+            let s2 = tokio::task::spawn_blocking(move || {
+                scrcpy::start(&serial_c, &jar_c, &params2, None)
+            })
+            .await;
+            match s2 {
+                Ok(Ok(mut sess2)) => {
+                    // 复用同 id 重建通道与会话（前端尚未拿到 id——open 还没返回）
+                    let (tx2, rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    if let Some(late_audio) = sess2.late_audio.take() {
+                        let _ = late_audio; // 纯视频：late_audio 为 None
+                    }
+                    let control2 = Arc::new(crate::state::ControlChan::new());
+                    let control2_stop = control2.clone();
+                    let serial2_stop = serial.clone();
+                    let fwd2 = sess2.forward_port;
+                    let server_proc2 = sess2.take_server();
+                    let late_ctrl2 = sess2.late_control.take();
+                    let stream2 = Arc::new(StreamSession {
+                        id,
+                        serial: serial.clone(),
+                        codec: sess2.codec.clone(),
+                        width: std::sync::atomic::AtomicU64::new(0),
+                        height: std::sync::atomic::AtomicU64::new(0),
+                        control: Some(control2.clone()),
+                        ended: std::sync::atomic::AtomicBool::new(false),
+                        err: Mutex::new(String::new()),
+                        frame_rx: Mutex::new(Some(rx2)),
+                        attached: std::sync::atomic::AtomicBool::new(false),
+                        clipboard: Mutex::new(String::new()),
+                        last_frame_ms: std::sync::atomic::AtomicU64::new(0),
+                        stop_fn: Mutex::new(Some(Box::new(move || {
+                            control2_stop.shutdown();
+                            if let Some(sp) = &server_proc2 {
+                                sp.shutdown();
+                            }
+                            let _ = adb::remove_forward(&serial2_stop, fwd2);
+                        }))),
+                    });
+                    if let Some(lc) = late_ctrl2 {
+                        let chan2 = control2.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(sock) = lc.recv() {
+                                if let Ok(mut w) = sock.try_clone() {
+                                    chan2.attach(w);
+                                }
+                            }
+                        });
+                    }
+                    let s2c = stream2.clone();
+                    let st2c = st.clone();
+                    std::thread::spawn(move || {
+                        crate::scrcpy_feeder(sess2, tx2, s2c);
+                        st2c.streams.lock().unwrap().remove(&id);
+                    });
+                    st.streams.lock().unwrap().insert(id, stream2.clone());
+                    stream = stream2;
+                }
+                Ok(Err(e)) => return err(500, format!("纯视频重开失败: {e}")),
+                Err(e) => return err(500, format!("纯视频重开任务失败: {e}")),
+            }
+        }
+    }
+
+    // 等首个 meta（编码器冷启）：最多 3s——超时不判失败（会话已可用，
+    // 视频帧随后经 /video 推送；真失败的由前端 onEnd 兜底提示）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if stream.width.load(Ordering::SeqCst) > 0 || stream.ended.load(Ordering::SeqCst) {
             break;
@@ -1007,12 +1137,12 @@ fn stream_control_send(
     s: &StreamSession,
     bytes: &[u8],
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(ctrl) = &s.control else {
+    // 通道未接通时消息排队（音频/控制在设备侧晚就绪），不报错——
+    // 接通即冲刷，用户在最初几秒内的输入不丢
+    let Some(chan) = &s.control else {
         return Err(err(500, "控制通道不可用"));
     };
-    ctrl.lock()
-        .unwrap()
-        .write_all(bytes)
+    chan.send(bytes)
         .map_err(|e| err(500, format!("控制通道写入失败: {e}")))
 }
 

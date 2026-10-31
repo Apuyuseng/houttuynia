@@ -70,13 +70,62 @@ impl TaskState {
 }
 
 /// 投屏会话（scrcpy）：视频由泵线程消费，控制通道共享给注入路由。
+/// 控制通道：socket 可能晚于会话建立（音频/控制在后台接通——设备音频
+/// 管线初始化可长达 10s，不能阻塞开流）。未接通期间控制消息排队（上限
+/// 16KB，防内存膨胀），接通即冲刷。
+pub struct ControlChan {
+    inner: Mutex<ControlInner>,
+}
+struct ControlInner {
+    sock: Option<std::net::TcpStream>,
+    pending: Vec<u8>,
+}
+impl ControlChan {
+    pub fn new() -> Self {
+        ControlChan { inner: Mutex::new(ControlInner { sock: None, pending: Vec::new() }) }
+    }
+    /// 接通（后台线程调用）：冲刷排队消息
+    pub fn attach(&self, mut sock: std::net::TcpStream) {
+        let mut g = self.inner.lock().unwrap();
+        if !g.pending.is_empty() {
+            use std::io::Write as _;
+            let _ = sock.write_all(&g.pending);
+            g.pending.clear();
+        }
+        g.sock = Some(sock);
+    }
+    /// 发控制消息；未接通时入队（返回 Ok，调用方无感）
+    pub fn send(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        match &mut g.sock {
+            Some(s) => {
+                use std::io::Write as _;
+                s.write_all(bytes)
+            }
+            None => {
+                if g.pending.len() + bytes.len() <= 16 * 1024 {
+                    g.pending.extend_from_slice(bytes);
+                }
+                Ok(())
+            }
+        }
+    }
+    pub fn shutdown(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(s) = g.sock.take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        g.pending.clear();
+    }
+}
+
 pub struct StreamSession {
     pub id: u64,
     pub serial: String,
     pub codec: String,
     pub width: AtomicU64,
     pub height: AtomicU64,
-    pub control: Option<Arc<Mutex<TcpStream>>>,
+    pub control: Option<Arc<ControlChan>>,
     pub ended: AtomicBool,
     pub err: Mutex<String>,
     /// 视频泵就绪帧队列（receive 端；见 scrcpy::Session 消费线程）
@@ -214,6 +263,9 @@ pub struct AppState {
     pub perf_last: Mutex<Option<(u64, u64)>>,
     /// 扫码配对会话
     pub hostpair: crate::devices::HostPairManager,
+    /// 设备音频管线冷启标记（毫秒时间戳）：降级纯视频后 10 分钟内开流
+    /// 直接跳过音频尝试（省 1.6s 探测+重开），之后自然再试一次音频
+    pub audio_cold_until: std::sync::Mutex<u64>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -230,6 +282,7 @@ impl AppState {
             runtime_task: TaskState::default(),
             perf_last: Mutex::new(None),
             hostpair: crate::devices::HostPairManager::new(),
+            audio_cold_until: std::sync::Mutex::new(0),
         })
     }
 
