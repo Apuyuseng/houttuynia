@@ -886,3 +886,109 @@ mod tests {
         }
     }
 }
+
+
+// ===================== 桥通道：系统 API 取应用名/图标 =====================
+
+/// 经桥 APK（系统 PackageManager）一次性同步全量应用名+图标。
+/// 返回同步条数；桥不可用/未装返回 None（调用方回落 APK 解析路径）。
+/// stamp 控频：成功后 1 小时内不重复全量拉取。
+pub fn bridge_sync_apps(serial: &str) -> Option<usize> {
+    // 频控
+    let stamp = PathBuf::from(format!("{}/.mwine/appcache/rust", home())).join("bridge_apps.stamp");
+    if let Ok(meta) = std::fs::metadata(&stamp) {
+        if let Ok(t) = meta.modified() {
+            if t.elapsed().map(|d| d.as_secs() < 3600).unwrap_or(false) {
+                return Some(0); // 近期已同步
+            }
+        }
+    }
+    // 一次性连接（与通知流各自的 forward 端口互不干扰）
+    if let Err(e) = crate::adb::forward_service(serial, 27186, "tcp:27185") {
+        return None;
+    }
+    let mut sock = None;
+    for _ in 0..8 {
+        if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 27186)) {
+            sock = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let mut s = sock?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+    use std::io::{BufRead, BufReader, Write as _};
+    let mut reader = BufReader::new(s.try_clone().ok()?);
+    // hello 行
+    let mut hello = String::new();
+    reader.read_line(&mut hello).ok()?;
+    s.write_all(b"{\"req\":\"apps\"}\n").ok()?;
+    // 大响应（数 MB 单行）循环读
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut line = String::new();
+    loop {
+        if std::time::Instant::now() > deadline {
+            let _ = crate::adb::remove_forward(serial, 27186);
+            return None;
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                let _ = crate::adb::remove_forward(serial, 27186);
+                return None;
+            }
+            Ok(_) => {
+                let t = line.trim();
+                if t.contains("\"resp\":\"apps\"") {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = crate::adb::remove_forward(serial, 27186);
+    // 解析落盘：labels.json + icons/<pkg>.png
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let arr = v.get("apps")?.as_array()?;
+    let mut n = 0usize;
+    for item in arr {
+        let pkg = item.get("pkg")?.as_str()?;
+        let label = item.get("label").and_then(|x| x.as_str()).unwrap_or("");
+        if !label.is_empty() {
+            label_store(pkg, label);
+        }
+        let icon_b64 = item.get("icon").and_then(|x| x.as_str()).unwrap_or("");
+        if !icon_b64.is_empty() {
+            if let Some(png) = b64_decode(icon_b64) {
+                if png.len() > 8 && &png[..4] == b"\x89PNG" {
+                    let dir = rust_icon_cache_dir();
+                    let _ = std::fs::write(dir.join(format!("{pkg}.png")), &png);
+                    let _ = std::fs::remove_file(dir.join(format!("{pkg}.noicon")));
+                    n += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::write(&stamp, b"ok");
+    Some(n)
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    // 标准 base64（桥侧 Base64.NO_WRAP）
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' {
+            continue;
+        }
+        let v = TBL.iter().position(|&t| t == c)? as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}

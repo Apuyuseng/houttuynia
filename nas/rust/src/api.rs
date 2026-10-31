@@ -270,6 +270,10 @@ pub async fn apps(State(st): State<SharedState>) -> (StatusCode, Json<Value>) {
         None => return err(503, "Android 未运行"),
     };
     let r = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        // 桥通道优先：系统 API 一把取全量名字+图标（准且快，落缓存后
+        // 本次响应即完整）；桥未装/超时回落 APK 解析路径
+        let bridge_ok = crate::icons::bridge_sync_apps(&serial).unwrap_or(0);
+        let _ = bridge_ok;
         let out = adb::shell_blocking(
             &serial,
             "pm query-activities --brief -a android.intent.action.MAIN \

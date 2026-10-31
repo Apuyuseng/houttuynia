@@ -13,6 +13,15 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
+    <!-- Android 11+ 包可见性：查询全部可启动应用（PM 按 MAIN/LAUNCHER 过滤）
+         需要 <queries> 声明，否则只看得到系统应用（实测仅 29/106） -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:label="mwine bridge"
         android:icon="@android:drawable/sym_def_app_icon">
