@@ -1977,7 +1977,10 @@ pub async fn events_status(
 /// 剪贴板每 2s 采样比对（有投屏会话才有源）；通知为纯事件驱动零轮询。
 /// GET /api/sms/list?box=inbox|sent|draft|all&limit= —— 设备短信（content://sms 经 shell content query）。
 /// 输出 JSON 行解析：Row: address=..., body=..., date=..., type=...
-pub async fn sms_list(Query(q): Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+pub async fn sms_list(
+    State(st): State<SharedState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
     let box_ = q.get("box").cloned().unwrap_or_else(|| "all".into());
     let limit = q.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(200).min(500);
     let uri = match box_.as_str() {
@@ -1986,12 +1989,14 @@ pub async fn sms_list(Query(q): Query<std::collections::HashMap<String, String>>
         "draft" => "content://sms/draft",
         _ => "content://sms",
     };
-    let serial = match state::selected_serial().or_else(state::online_real_devices_first) {
+    let serial = match st.current_serial() {
         Some(s) => s,
         None => return err(503, "设备未连接"),
     };
+    // 注：不传 --sort——provider 默认即按 date 倒序；`--sort date DESC` 需要
+    // 引号，裸传会让 content 打 usage 报错（曾因此静默返回空列表）
     let cmd = format!(
-        "content query --uri {uri} --projection _id:thread_id:address:person:body:date:type:read --sort date DESC 2>/dev/null | head -{limit}"
+        "content query --uri {uri} --projection _id:thread_id:address:person:body:date:type:read 2>/dev/null | head -{limit}"
     );
     let r = tokio::task::spawn_blocking(move || adb::shell_blocking(&serial, &cmd, 20000)).await;
     let out = match r {
@@ -2000,16 +2005,35 @@ pub async fn sms_list(Query(q): Query<std::collections::HashMap<String, String>>
         Err(e) => return err(500, format!("任务失败: {e}")),
     };
     let text = String::from_utf8_lossy(&out);
+    // 行格式：`Row: <序号> k=v, k=v, …`。序号前缀必须剥掉（否则首键变
+    // "0 _id"）；短信正文里的 ", " 会拆出假键——没有 `k=` 形态的片段并回
+    // 上一个键的值
     let mut msgs = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if !line.starts_with("Row:") {
-            continue;
-        }
+        let Some(rest) = line.strip_prefix("Row:") else { continue };
+        let rest = rest.trim_start();
+        // 剥行号前缀（到第一个 "key=" 之前的内容）
+        let started = rest.find(|c: char| c.is_ascii_alphabetic() || c == '_')
+            .map(|i| &rest[i..])
+            .unwrap_or(rest);
         let mut m = serde_json::Map::new();
-        for kv in line[4..].split(", ") {
-            if let Some((k, v)) = kv.split_once('=') {
-                m.insert(k.trim().to_string(), json!(v));
+        let mut last_key: Option<String> = None;
+        for kv in started.split(", ") {
+            match kv.split_once('=') {
+                Some((k, v)) if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+                    m.insert(k.to_string(), json!(v));
+                    last_key = Some(k.to_string());
+                }
+                _ => {
+                    // 正文片段：并回上一个键（通常是 body）
+                    if let (Some(lk), Some(Value::String(prev))) =
+                        (last_key.clone(), m.get_mut(&last_key.clone().unwrap_or_default()))
+                    {
+                        let _ = lk;
+                        *prev = format!("{prev}, {kv}");
+                    }
+                }
             }
         }
         if m.contains_key("_id") {
@@ -2021,13 +2045,13 @@ pub async fn sms_list(Query(q): Query<std::collections::HashMap<String, String>>
 
 /// POST /api/sms/send {to, body} —— 发送短信：调起设备短信 App 预填（smsto: 意图），
 /// 用户在设备上点发送键确认（adb 无法跨过系统发送确认，属安全设计）。
-pub async fn sms_send(Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
+pub async fn sms_send(State(st): State<SharedState>, Json(v): Json<Value>) -> (StatusCode, Json<Value>) {
     let to = v.get("to").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
     if to.is_empty() {
         return err(400, "缺少收件人");
     }
-    let serial = match state::selected_serial().or_else(state::online_real_devices_first) {
+    let serial = match st.current_serial() {
         Some(s) => s,
         None => return err(503, "设备未连接"),
     };
