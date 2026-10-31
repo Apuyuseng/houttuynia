@@ -14,7 +14,27 @@
       </button>
     </div>
     <div class="win-body" :style="{ width: size.w + 'px', height: size.h + 'px' }" ref="bodyRef">
-      <div class="win-placeholder muted" v-if="!ready">⏳ 正在启动应用…</div>
+      <!-- 加载浮层：分阶段进度 + 实时状态行 + 失败重试 -->
+      <div class="win-loading" v-if="!ready && !noDisplay">
+        <div class="wl-spinner" :class="{ err: !!loadError }"><MsIcon :name="loadError ? 'close' : 'smartphone'" :size="30" /></div>
+        <div class="wl-title" v-if="!loadError">{{ loadError ? '' : '正在启动投屏' }}</div>
+        <div class="wl-title err" v-else>投屏失败</div>
+        <div class="wl-steps" v-if="!loadError">
+          <div v-for="(s, i) in loadSteps" :key="i" class="wl-step"
+               :class="{ done: i < loadStepIdx, active: i === loadStepIdx }">
+            <span class="wl-dot"></span>{{ s }}
+          </div>
+        </div>
+        <div class="wl-log muted" v-if="!loadError && status">{{ status }}</div>
+        <div class="wl-elapsed muted" v-if="!loadError">{{ elapsedSec }}s</div>
+        <template v-if="loadError">
+          <div class="wl-log err">{{ loadError }}</div>
+          <div class="wl-actions">
+            <el-button size="small" type="primary" @click="retry">重试</el-button>
+            <el-button size="small" text @click="$emit('close')">关闭</el-button>
+          </div>
+        </template>
+      </div>
       <!-- 副屏无内容（设备/应用不支持虚拟屏独立窗口）→ 提供主屏回退 -->
       <div class="win-fallback" v-if="noDisplay">
         <div class="wf-icon"><MsIcon name="smartphone" :size="26" /></div>
@@ -72,6 +92,33 @@ let displayW = 720, displayH = 1280, displayDpi = 320
 const size = ref({ w: Math.round(initH * displayW / displayH), h: initH })
 const status = ref('')
 const liveOn = ref(false)
+// ---- 加载状态机：分阶段进度（建立会话 → 连接视频流 → 解码首帧）----
+const loadSteps = ['建立投屏会话', '连接视频流', '解码首帧']
+const loadStepIdx = ref(0)
+const loadError = ref('')
+const elapsedSec = ref(0)
+let elapsedTimer = null
+function startElapsed() {
+  stopElapsed()
+  elapsedSec.value = 0
+  elapsedTimer = setInterval(() => { elapsedSec.value++ }, 1000)
+}
+function stopElapsed() {
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null }
+}
+// 由 player 状态回调推导阶段
+function trackPhase(t) {
+  status.value = t
+  if (loadError.value) return
+  if (t.includes('建立投屏会话')) loadStepIdx.value = 0
+  else if (t.includes('等待首帧') || t.includes('投屏中')) loadStepIdx.value = Math.max(loadStepIdx.value, 1)
+}
+function retry() {
+  loadError.value = ''
+  ready.value = false
+  teardownPlayer()
+  startStream()
+}
 const preedit = ref('')
 const imeRef = ref(null)
 const ready = ref(false)
@@ -154,8 +201,14 @@ async function runOnMainDisplay() {
   }
 }
 
-onMounted(async () => {
-  await resolveDisplaySize()
+function teardownPlayer() {
+  stopElapsed()
+  if (player) { const p = player; player = null; p.stop() }
+}
+
+async function startStream() {
+  startElapsed()
+  loadStepIdx.value = 0
   // 真机主屏镜像：原始分辨率直投（max_size=0 = scrcpy 不缩放；默认档会
   // 把 720×1600 压到 576×1280，画面明显发糊）。USB 直连带宽足够 8M。
   const flags = getFlags()
@@ -165,10 +218,13 @@ onMounted(async () => {
     : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`
   player = new ScrcpyWebPlayer({
     openQuery,
-    onStatus: (t) => { status.value = t },
+    onStatus: (t) => { trackPhase(t) },
     onFirstFrame: () => {
       ready.value = true
       liveOn.value = true
+      loadStepIdx.value = loadSteps.length
+      stopElapsed()
+      console.info(`[投屏] ${title} 首帧就绪（${elapsedSec.value}s）`)
       if (detectTimer) { clearTimeout(detectTimer); detectTimer = null }
       // 首帧后再等 4s 采样：应用正常落屏需要启动时间，太早会误判
       setTimeout(checkBlackFrame, 4000)
@@ -182,7 +238,14 @@ onMounted(async () => {
         }
       }
     },
-    onEnd: () => { liveOn.value = false },
+    onEnd: () => {
+      liveOn.value = false
+      // 从未出过画面就结束 → 失败态（可重试）
+      if (!ready.value && !loadError.value) {
+        loadError.value = '视频流已结束（设备断开或会话被回收）'
+        stopElapsed()
+      }
+    },
   })
   // 找到即挂载 canvas
   canvas = player.canvas
@@ -200,15 +263,23 @@ onMounted(async () => {
       }
     })
   }
-  // 不 await：start() 会阻塞到流结束；失败由 catch 处理
+  // 不 await：start() 会阻塞到流结束；失败进浮层错误态（可重试，不再直接关窗）
   player.start().catch((e) => {
-    ElMessage.error(`${title}：投屏失败 ${e.message}`)
-    emit('close')
+    if (e.name === 'AbortError') return
+    loadError.value = e.message || '投屏中断'
+    stopElapsed()
+    console.warn(`[投屏] ${title} 失败:`, e)
   })
   armNoDisplayDetect()
+}
+
+onMounted(async () => {
+  await resolveDisplaySize()
+  startStream()
 })
 onUnmounted(() => {
   if (detectTimer) { clearTimeout(detectTimer); detectTimer = null }
+  stopElapsed()
   stopClipboardSync()
   if (offClip) { offClip(); offClip = null }
   if (player) { const p = player; player = null; p.stop() }
@@ -247,8 +318,8 @@ document.addEventListener('visibilitychange', () => {
       openQuery: props.deviceSerial
         ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=60`
         : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`,
-      onStatus: (t) => { status.value = t },
-      onFirstFrame: () => { ready.value = true; liveOn.value = true },
+      onStatus: (t) => { trackPhase(t) },
+      onFirstFrame: () => { ready.value = true; liveOn.value = true; loadStepIdx.value = loadSteps.length; stopElapsed() },
       onEnd: () => { liveOn.value = false },
     })
     bodyRef.value.appendChild(player.canvas)
@@ -392,6 +463,50 @@ function startResize(e) {
   color: #e6e9ef; padding: 4px 10px; font-size: 13px; z-index: 3;
   pointer-events: none;
 }
+/* 加载浮层：分阶段进度 + 失败重试 */
+.win-loading {
+  position: absolute; inset: 0; z-index: 4;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 20px; text-align: center;
+  background: rgba(16, 18, 24, 0.88); backdrop-filter: blur(8px);
+}
+.wl-spinner {
+  width: 56px; height: 56px; border-radius: 16px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(66, 133, 244, 0.14); color: #8ab4f8;
+  animation: wl-pulse 1.6s ease-in-out infinite;
+}
+.wl-spinner.err {
+  background: rgba(237, 78, 78, 0.14); color: #f28b82; animation: none;
+}
+@keyframes wl-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.92); opacity: 0.65; }
+}
+.wl-title { font-size: 14px; font-weight: 600; color: #e6e9ef; }
+.wl-title.err { color: #f28b82; }
+.wl-steps { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; margin-top: 2px; }
+.wl-step {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: rgba(230, 233, 239, 0.45); transition: color 0.3s;
+}
+.wl-step .wl-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: rgba(230, 233, 239, 0.25); transition: all 0.3s;
+}
+.wl-step.done { color: rgba(138, 180, 248, 0.9); }
+.wl-step.done .wl-dot { background: #8ab4f8; }
+.wl-step.active { color: #e6e9ef; font-weight: 600; }
+.wl-step.active .wl-dot {
+  background: #8ab4f8; box-shadow: 0 0 0 4px rgba(138, 180, 248, 0.22);
+  animation: wl-blink 1.2s ease-in-out infinite;
+}
+@keyframes wl-blink { 50% { box-shadow: 0 0 0 7px rgba(138, 180, 248, 0.08); } }
+.wl-log { font-size: 12px; max-width: 90%; line-height: 1.5; min-height: 18px; }
+.wl-log.err { color: #f28b82; }
+.wl-elapsed { font-size: 11px; font-variant-numeric: tabular-nums; opacity: 0.7; }
+.wl-actions { display: flex; gap: 8px; margin-top: 4px; }
+
 /* 独立窗口不支持时的回退提示层 */
 .win-fallback {
   position: absolute; inset: 0; z-index: 4;
