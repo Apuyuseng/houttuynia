@@ -409,10 +409,13 @@ onUnmounted(() => {
 }
 .nc-item:hover { background: rgba(255,255,255,0.14); }
 .nc-ico {
-  width: 30px; height: 30px; border-radius: 8px;
-  background: #4285f4; color: #fff; flex-shrink: 0;
+  width: 30px; height: 30px; border-radius: 9px;
+  background: linear-gradient(160deg, #4f8ef7, #2f6fe0); color: #fff; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.22), 0 1px 3px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
 }
+.nc-ico img { object-fit: contain; padding: 2px; box-sizing: border-box; }
 .nc-main { flex: 1; min-width: 0; }
 .nc-row1 { display: flex; align-items: baseline; gap: 8px; }
 .nc-title2 { font-size: 13px; font-weight: 600; color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -434,7 +437,7 @@ onUnmounted(() => {
   background: rgba(255,255,255,0.06);
   cursor: pointer;
 }
-.nc-ico img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.nc-ico img { width: 100%; height: 100%; border-radius: inherit; }
 .nc-ico.fallback { background: #5f6368; }
 .nc-letter {
   font-size: 14px; font-weight: 700; color: #fff;

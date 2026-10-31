@@ -226,15 +226,31 @@ onUnmounted(() => {
 .desk-item:hover { background: rgba(255, 255, 255, 0.08); }
 .desk-item:active { transform: scale(0.94); }
 /* Android 应用图标：大圆角 squircle，文字带阴影压在壁纸上可读 */
+/* 图标底托：现代启动器观感——squircle 圆角 + 玻璃底 + 双层阴影 + 按压反馈 */
 .desk-icon {
-  width: 58px; height: 58px; border-radius: 17px;
+  width: 58px; height: 58px; border-radius: 16px;
   display: flex; align-items: center; justify-content: center;
   color: #fff; font-size: 24px; font-weight: 700;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   overflow: hidden;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.22),
+    0 6px 18px rgba(0, 0, 0, 0.32);
+  transition: transform 0.16s ease;
 }
-.desk-icon.and { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.75); }
-.desk-icon.and img { width: 100%; height: 100%; object-fit: cover; }
+.desk-item:active .desk-icon { transform: scale(0.9); }
+/* 设备应用：玻璃底托（adaptive 图标全内缩贴合，legacy 透明图标自然居中留白） */
+.desk-icon.and {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
+  box-shadow:
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.16),
+    0 1px 2px rgba(0, 0, 0, 0.22),
+    0 6px 18px rgba(0, 0, 0, 0.32);
+  color: rgba(255, 255, 255, 0.85);
+}
+.desk-icon.and img {
+  width: 100%; height: 100%;
+  object-fit: contain; padding: 5px; box-sizing: border-box;
+}
 /* 业务应用 logo 角标（Android 工作资料徽章观感：深色圆底 + 细亮边） */
 .di-wrap { position: relative; }
 .biz-badge {
@@ -292,9 +308,12 @@ onUnmounted(() => {
   display: flex; align-items: center; justify-content: center;
   color: #fff; overflow: visible; position: relative;
 }
-.tb-ico.and { overflow: hidden; }
-.tb-ico.and { background: rgba(255, 255, 255, 0.1); }
-.tb-ico.and img { width: 100%; height: 100%; object-fit: cover; }
+.tb-ico.and {
+  overflow: hidden;
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.16);
+}
+.tb-ico.and img { width: 100%; height: 100%; object-fit: contain; padding: 3px; box-sizing: border-box; }
 .tb-item.live::after {
   content: ''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
   width: 4px; height: 4px; border-radius: 50%; background: #a8c7fa;
