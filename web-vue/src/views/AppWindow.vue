@@ -82,18 +82,9 @@ const pkg = props.app?.package || ''
 
 async function resolveDisplaySize() {
   if (props.deviceSerial) {
-    // 镜像模式：直接按截图真实宽高比开窗（荣耀 9:20 / 平板 4:3 / TV 16:9
-    // 各不相同，横竖二分假设 9:16 会先错后跳）
-    try {
-      const r = await fetch(imgUrl('/api/screenshot.png'))
-      if (r.ok) {
-        const img = await createImageBitmap(await r.blob())
-        if (img.width > 0 && img.height > 0) {
-          displayW = img.width; displayH = img.height
-        }
-        img.close()
-      }
-    } catch { /* 探测失败保持默认竖屏 */ }
+    // 镜像模式：不再预拉截图（一张整屏 screencap 串行 1~3s，是首帧前
+    // 最大耗时）。宽高比按 9:16 起步，首帧到达时 onFirstFrame 按真实
+    // 内容比例自适应贴合（该逻辑本就存在，覆盖旋转/异形屏）
     size.value = { w: Math.round(initH * displayW / displayH), h: initH }
     return
   }

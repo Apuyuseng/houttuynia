@@ -782,11 +782,12 @@ pub async fn stream_open(
     // 音频始终请求：设备不支持时 server 下发 disable 码自动回退纯视频
     let params = scrcpy::StartParams { max_size, bit_rate, fps, audio, new_display, start_app };
 
-    // TV/大屏设备待机（Dreaming）时 scrcpy 抓的是黑缓冲——开流前先唤醒
-    // （不影响手机：已亮屏的设备 wake_up 是 no-op；scrcpy stay_awake=true 接管保活）
-    // 唤醒：先查屏幕状态，仅在熄屏时才 wake+等管线（多数时候已亮屏，省 800ms+一次 shell 往返）
+    // TV/大屏设备待机（Dreaming）时 scrcpy 抓的是黑缓冲——开流前先唤醒。
+    // 唤醒探测改为后台线程，与 jar stat/推送/端口转发并行执行（原串行一次
+    // shell 往返 + 可能 800ms 等待是首帧时延的一部分）；scrcpy::start 在
+    // spawn server 前汇合句柄（server 一旦起来就开始抓帧，必须先醒）
     let serial_wake = serial.clone();
-    let woke = tokio::task::spawn_blocking(move || {
+    let wake_handle = std::thread::spawn(move || {
         let awake = adb::shell_blocking(&serial_wake, "dumpsys power | grep -q 'mWakefulness=Awake' && echo Y", 5000)
             .map(|o| String::from_utf8_lossy(&o).contains('Y'))
             .unwrap_or(true); // 查询失败按已亮屏处理（不白等）
@@ -796,13 +797,7 @@ pub async fn stream_open(
             let _ = adb::shell_blocking(&serial_wake, "input keyevent KEYCODE_WAKEUP", 5000);
             true
         }
-    })
-    .await
-    .unwrap_or(false);
-    if woke {
-        // 唤醒后给 SurfaceFlinger 一点时间建立新帧（TV 的管线启动比手机慢）
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-    }
+    });
 
     // 会话空闲回收看门狗（独立线程，每 15s 扫描）：
     //   A) 从未被观看（!attached）超 90s —— 页面打开失败/忘记关
@@ -849,12 +844,14 @@ pub async fn stream_open(
     // （shell 流）」快速连续建链偶发假流（HTTP200 但 0 字节，实测 ~30% 概率
     // 连续开关时出现）。重试路径 jar 已在（stat 命中快路径），第二轮稳定。
     let mut attempt = 0;
+    let mut wake_handle_opt = Some(wake_handle);
     let session = loop {
         attempt += 1;
         let serial_c = serial.clone();
         let jar_c = jar.clone();
         let params_c = params.clone();
-        let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial_c, &jar_c, &params_c)).await;
+        let wake_c = wake_handle_opt.take();
+        let r = tokio::task::spawn_blocking(move || scrcpy::start(&serial_c, &jar_c, &params_c, wake_c)).await;
         match r {
             Ok(Ok(s)) => break s,
             Ok(Err(e)) => {

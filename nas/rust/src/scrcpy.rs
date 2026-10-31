@@ -192,7 +192,15 @@ pub struct StartParams {
 }
 
 /// 启动完整会话（阻塞；冷启 server + dexopt 可达十秒级）。
-pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
+/// wake：并行执行的唤醒探测线程句柄——server 一旦启动就开始抓帧，
+/// 必须 spawn 前汇合（true=发生了唤醒，需给 SurfaceFlinger 留管线时间）。
+pub fn start(
+    serial: &str,
+    jar: &str,
+    p: &StartParams,
+    wake: Option<std::thread::JoinHandle<bool>>,
+) -> AdbResult<Session> {
+    let t_start = Instant::now();
     let remote = remote_jar_path();
     let local = std::fs::read(jar).map_err(|e| adb::AdbError(format!("读取 server jar: {e}")))?;
     // 魅族 FlymeOS / 部分 TV 会清理 /data/local/tmp 的 jar——用「远端 stat
@@ -225,6 +233,7 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
         }
     }
 
+    tracing::info!("投屏启动[1/3] jar 就绪 {:?}（stat/推送）", t_start.elapsed());
     let scid: u32 = rand_scid();
     let socket_name = format!("scrcpy_{scid:08x}");
     let port = free_port()?;
@@ -258,9 +267,17 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
             " new_display={w}x{h}/{dpi} vd_destroy_content=true vd_system_decorations=true"
         ));
     }
+    if let Some(h) = wake {
+        let woke = h.join().unwrap_or(false);
+        if woke {
+            // 唤醒后给 SurfaceFlinger 一点时间建立新帧（TV 的管线启动比手机慢）
+            std::thread::sleep(Duration::from_millis(800));
+        }
+    }
     let cmd = format!(
         "CLASSPATH={remote} app_process / {SERVER_CLASS} {SERVER_VERSION} {args}"
     );
+    tracing::info!("投屏启动[2/3] server spawn {:?}（含唤醒汇合）", t_start.elapsed());
     let server = adb::shell_stream_scrcpy(serial, &cmd)?;
 
     // 连 video socket：forward 在 server 未监听时也会接受 TCP 后立即关闭，
@@ -278,6 +295,7 @@ pub fn start(serial: &str, jar: &str, p: &StartParams) -> AdbResult<Session> {
                 match read_exact(&mut conn, &mut b, wait) {
                     Ok(true) => {
                         video = Some(conn);
+                        tracing::info!("投屏启动[3/3] 视频 socket 就绪 {:?}（server 冷启/首字节）", t_start.elapsed());
                         break;
                     }
                     _ => {
