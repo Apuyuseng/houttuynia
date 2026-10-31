@@ -41,3 +41,19 @@ scripts/build-custom-image.sh
 # NAS 前端预构建产物随源码分发（Docker 构建免 node）
 !web-vue/dist/
 .idea/
+
+# 发布物料白名单：镜像构建所需的两个二进制入库（GitHub Actions 构建镜像用）
+!/dist/
+/dist/*
+!/dist/Houttuynia.app/
+/dist/Houttuynia.app/*
+!/dist/Houttuynia.app/Contents/
+/dist/Houttuynia.app/Contents/*
+!/dist/Houttuynia.app/Contents/Resources/
+/dist/Houttuynia.app/Contents/Resources/*
+!/dist/Houttuynia.app/Contents/Resources/bin/
+/dist/Houttuynia.app/Contents/Resources/bin/*
+!/dist/Houttuynia.app/Contents/Resources/bin/scrcpy-server-v4.1
+!/assets/companion/dist/
+/assets/companion/dist/*
+!/assets/companion/dist/mwine-bridge.apk
