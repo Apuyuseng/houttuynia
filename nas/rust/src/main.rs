@@ -454,6 +454,7 @@ async fn main() {
         .route("/stream/{id}/key", post(api::stream_key))
         .route("/stream/{id}/text", post(api::stream_text))
         .route("/stream/{id}/scroll", post(api::stream_scroll))
+        .route("/stream/{id}/ctl", get(api::stream_control_ws))
         .route("/stream/{id}/reset", post(api::stream_reset))
         .route("/stream/{id}/close", post(api::stream_close))
         .route("/stream/{id}/clipboard", get(api::stream_clipboard_get).post(api::stream_clipboard_set))

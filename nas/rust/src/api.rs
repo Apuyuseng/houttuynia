@@ -760,8 +760,8 @@ pub async fn stream_open(
         None => return err(500, "找不到 scrcpy-server（运行时未就绪）"),
     };
     let max_size: u32 = q.get("max_size").and_then(|s| s.parse().ok()).unwrap_or(1280);
-    let bit_rate: u32 = q.get("bit_rate").and_then(|s| s.parse().ok()).unwrap_or(4_000_000);
-    let fps: u32 = q.get("fps").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let bit_rate: u32 = q.get("bit_rate").and_then(|s| s.parse().ok()).unwrap_or(8_000_000);
+    let fps: u32 = q.get("fps").and_then(|s| s.parse().ok()).unwrap_or(60);
     // 应用独立窗口：app= 包名 + 可选 w/h/dpi 副屏尺寸（默认 720×1280@320 竖屏手机）
     let start_app = q.get("app").cloned().filter(|s| !s.is_empty());
     let audio = q.get("audio").and_then(|s| s.parse().ok()).unwrap_or(true);
@@ -1133,6 +1133,120 @@ pub async fn stream_reset(State(st): State<SharedState>, Path(id): Path<u64>) ->
         Ok(()) => ok(json!({ "ok": true })),
         Err(e) => e,
     }
+}
+
+// ---- 控制通道 WebSocket：一条连接即发即走 ----
+// 原 POST /touch|key|text|scroll 每事件一个 HTTP 请求，连续拖动时事件
+// 在浏览器同源连接池里排队（并发 6 限制），输入延迟明显劣于原生 scrcpy
+// 的单 socket。WS 化后与 scrcpy 相同的即时注入路径。
+
+/// 按消息类型把 JSON 载荷编译成 scrcpy 控制帧并发送（touch/key/text/scroll/reset 复用各端点逻辑）
+fn ctl_dispatch(s: &Arc<StreamSession>, v: &Value) -> Result<(), String> {
+    let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+    match t {
+        "touch" => {
+            let action = v.get("action").and_then(|x| x.as_i64()).unwrap_or(-1);
+            if !(0..=2).contains(&action) {
+                return Err("action 须为 0(down)/1(up)/2(move)".into());
+            }
+            let w = s.width.load(Ordering::SeqCst) as u16;
+            let h = s.height.load(Ordering::SeqCst) as u16;
+            if w == 0 || h == 0 {
+                return Err("画面尺寸尚未就绪".into());
+            }
+            let x = v.get("x").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let y = v.get("y").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let up = action == 1;
+            let bytes = scrcpy::control::inject_touch(
+                action as u8,
+                scrcpy::control::POINTER_ID_MOUSE,
+                x, y, w, h,
+                if up { 0.0 } else { 1.0 },
+                1,
+                if up { 0 } else { 1 },
+            );
+            stream_control_send(s, &bytes).map_err(|(_, j)| j.get("error").and_then(|x| x.as_str()).unwrap_or("控制发送失败").to_string())
+        }
+        "key" => {
+            let keycode = v.get("keycode").and_then(|x| x.as_i64()).unwrap_or(-1) as i32;
+            if keycode < 0 {
+                return Err("缺少 keycode".into());
+            }
+            let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("tap");
+            let send = |down: bool| stream_control_send(s, &scrcpy::control::inject_keycode(down, keycode));
+            match action {
+                "down" => send(true),
+                "up" => send(false),
+                _ => send(true).and_then(|_| send(false)),
+            }
+            .map_err(|(_, j)| j.get("error").and_then(|x| x.as_str()).unwrap_or("控制发送失败").to_string())
+        }
+        "text" => {
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            if text.is_empty() || text.len() > 300 {
+                return Err("text 为空或超长".into());
+            }
+            let ascii = text.bytes().all(|b| (32..=127).contains(&b));
+            let bytes = if ascii {
+                scrcpy::control::inject_text(text).ok_or("文本超长")?
+            } else {
+                scrcpy::control::set_clipboard(0, true, text).ok_or("文本超长")?
+            };
+            stream_control_send(s, &bytes).map_err(|(_, j)| j.get("error").and_then(|x| x.as_str()).unwrap_or("控制发送失败").to_string())
+        }
+        "scroll" => {
+            let w = s.width.load(Ordering::SeqCst) as u16;
+            let h = s.height.load(Ordering::SeqCst) as u16;
+            if w == 0 || h == 0 {
+                return Err("画面尺寸尚未就绪".into());
+            }
+            let x = v.get("x").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let y = v.get("y").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let hs = v.get("hs").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+            let vs = v.get("vs").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+            let bytes = scrcpy::control::inject_scroll(x, y, w, h, hs, vs);
+            stream_control_send(s, &bytes).map_err(|(_, j)| j.get("error").and_then(|x| x.as_str()).unwrap_or("控制发送失败").to_string())
+        }
+        "reset" => stream_control_send(s, &scrcpy::control::reset_video()).map_err(|(_, j)| j.get("error").and_then(|x| x.as_str()).unwrap_or("控制发送失败").to_string()),
+        _ => Err(format!("未知控制类型 {t}")),
+    }
+}
+
+/// GET /api/stream/<id>/ctl —— 控制通道（WS 升级）。
+pub async fn stream_control_ws(
+    State(st): State<SharedState>,
+    Path(id): Path<u64>,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let s = match stream_get(&st, id) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    ws.on_upgrade(move |mut socket| async move {
+        while let Some(Ok(msg)) = socket.recv().await {
+            let text = match msg {
+                Message::Text(t) => t.to_string(),
+                Message::Binary(b) => match String::from_utf8(b.to_vec()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                },
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            let reply = match serde_json::from_str::<Value>(&text) {
+                Ok(v) => match ctl_dispatch(&s, &v) {
+                    Ok(()) => json!({ "ok": true }),
+                    Err(e) => json!({ "error": e }),
+                },
+                Err(e) => json!({ "error": format!("JSON 解析失败: {e}") }),
+            };
+            // 回包尽力而为（客户端主要靠发即忘，不等待响应）
+            if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 pub async fn stream_close(State(st): State<SharedState>, Path(id): Path<u64>) -> Json<Value> {

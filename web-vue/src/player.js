@@ -1,6 +1,6 @@
 // scrcpy Web 投屏播放器（与 vanilla 版 stream.js 同逻辑，框架无关类）
 // 帧协议（大端，头 15 字节）：u16 magic(0x4D57) | u8 type | u64 pts_us | u32 len | payload
-import { apiPost, imgUrl } from './api'
+import { apiPost, imgUrl, authState } from './api'
 
 export const SCRCPY_KEY = {
   BACK: 4, HOME: 3, APP_SWITCH: 187, POWER: 26,
@@ -56,6 +56,8 @@ export class ScrcpyWebPlayer {
     this._audioDisabled = false
     this._nextAudio = 0
     this._audioMeta = null
+    this._ctlQueue = []
+    this._ctlTries = 0
     this._bindInput()
   }
 
@@ -216,6 +218,7 @@ export class ScrcpyWebPlayer {
   _finish() {
     this.running = false
     this.id = 0
+    if (this._ctlSocket) { try { this._ctlSocket.close() } catch {} this._ctlSocket = null }
     clearInterval(this._statsTimer)
     clearInterval(this._wdTimer)
     if (this.decoder) { try { this.decoder.close() } catch {} this.decoder = null }
@@ -458,9 +461,47 @@ export class ScrcpyWebPlayer {
     }
   }
 
+  // 控制通道：单条 WebSocket 即发即走（原生 scrcpy 同款路径）。
+  // 原 POST 每事件一请求，连续拖动时事件在浏览器同源连接池排队，输入延迟大。
+  // WS 不可用时自动回落 POST。
+  _ctl(msg) {
+    if (!this.running) return
+    const ws = this._ctlSocket
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify(msg)) } catch { this._ctlPost(msg) }
+      return
+    }
+    this._ctlQueue.push(msg)
+    if (!this._ctlSocket && this._ctlTries < 3) {
+      this._ctlTries = (this._ctlTries || 0) + 1
+      try {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+        const tok = encodeURIComponent(authState.token || '')
+        const s = new WebSocket(`${proto}//${location.host}/api/stream/${this.id}/ctl?token=${tok}`)
+        this._ctlSocket = s
+        s.onopen = () => {
+          this._ctlQueue.splice(0).forEach((m) => { try { s.send(JSON.stringify(m)) } catch {} })
+        }
+        s.onclose = s.onerror = () => {
+          if (this._ctlSocket === s) this._ctlSocket = null
+          // 回落：把队列里的消息用 POST 补发
+          this._ctlQueue.splice(0).forEach((m) => this._ctlPost(m))
+        }
+      } catch { this._ctlSocket = null }
+    }
+  }
+  _ctlPost(msg) {
+    const map = { touch: 'touch', key: 'key', text: 'text', scroll: 'scroll' }
+    const ep = map[msg.t]
+    if (!ep) return
+    const body = { ...msg }
+    delete body.t
+    apiPost(`/api/stream/${this.id}/${ep}`, body).catch(() => {})
+  }
+
   _touch(action, p) {
     if (!this.running) return
-    apiPost(`/api/stream/${this.id}/touch`, { action, x: p.x, y: p.y }).catch(() => {})
+    this._ctl({ t: 'touch', action, x: p.x, y: p.y })
   }
 
   _bindInput() {
@@ -499,11 +540,11 @@ export class ScrcpyWebPlayer {
       if (now - this._lastWheel < 80) return
       this._lastWheel = now
       const p = this._pos(e)
-      apiPost(`/api/stream/${this.id}/scroll`, {
-        x: p.x, y: p.y,
+      this._ctl({
+        t: 'scroll', x: p.x, y: p.y,
         hs: Math.max(-3, Math.min(3, e.deltaX / 120)),
         vs: Math.max(-3, Math.min(3, e.deltaY / 120)),
-      }).catch(() => {})
+      })
     }, { passive: false })
     c.addEventListener('keydown', (e) => {
       if (!this.running) return
@@ -525,7 +566,7 @@ export class ScrcpyWebPlayer {
 
   key(keycode, action = 'tap') {
     if (!this.running) return
-    apiPost(`/api/stream/${this.id}/key`, { keycode, action }).catch(() => {})
+    this._ctl({ t: 'key', keycode, action })
   }
 
   // ---- 宿主输入法接入（组合文本注入设备）----
@@ -604,6 +645,6 @@ export class ScrcpyWebPlayer {
 
   text(text) {
     if (!this.running || !text) return
-    apiPost(`/api/stream/${this.id}/text`, { text }).catch(() => {})
+    this._ctl({ t: 'text', text })
   }
 }

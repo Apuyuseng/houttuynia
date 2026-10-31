@@ -170,7 +170,7 @@ onMounted(async () => {
   const flags = getFlags()
   const audioPart = flags.audio_stream ? '' : '&audio=0'
   const openQuery = props.deviceSerial
-    ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=30${audioPart}`
+    ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=60${audioPart}`
     : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`
   player = new ScrcpyWebPlayer({
     openQuery,
@@ -254,7 +254,7 @@ document.addEventListener('visibilitychange', () => {
     // 从后台回到前台：重开投屏（原会话已被可见性守卫或看门狗回收）
     player = new ScrcpyWebPlayer({
       openQuery: props.deviceSerial
-        ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=30`
+        ? `&serial=${encodeURIComponent(props.deviceSerial)}&max_size=0&bit_rate=20000000&fps=60`
         : `&app=${encodeURIComponent(pkg)}&w=${displayW}&h=${displayH}&dpi=${displayDpi}`,
       onStatus: (t) => { status.value = t },
       onFirstFrame: () => { ready.value = true; liveOn.value = true },
