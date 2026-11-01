@@ -23,13 +23,14 @@ ApplicationWindow {
     // 按键映射暂未开放（技术不成熟）——入口隐藏，KeysPage.qml 保留待后续启用
     // 性能监控已并入概览页（VM 运行时随性能区块展示）
     // 关于 / 许可是页面（LGPL 合规入口），不再是弹框
+    // 流量分析默认关闭（设置页开关）；gated 条目仅在开关开启时显示，索引恒定
     readonly property var pages: [
         { icon: "overview", label: qsTr("概览") },
         { icon: "apps", label: qsTr("应用库") },
         { icon: "devices", label: qsTr("真机") },
         { icon: "images", label: qsTr("镜像") },
         { icon: "terminal", label: qsTr("终端") },
-        { icon: "capture", label: qsTr("流量分析") },
+        { icon: "capture", label: qsTr("流量分析"), gated: true },
         { icon: "settings", label: qsTr("设置") },
         { icon: "info", label: qsTr("关于 / 许可") },
     ]
@@ -71,6 +72,11 @@ ApplicationWindow {
             confirmDialog.action = action
             confirmText.text = message
             confirmDialog.open()
+        }
+        // 流量分析开关关闭：正停留在该页则跳回概览（条目随绑定隐藏）
+        function onCaptureEnabledChanged() {
+            if (!backend.captureEnabled && root.currentPage === 5)
+                root.currentPage = 0
         }
     }
 
@@ -133,6 +139,9 @@ ApplicationWindow {
                     model: root.pages
                     delegate: Rectangle {
                         readonly property bool active: root.currentPage === index
+                        // gated 条目（流量分析）：开关未开启时不显示
+                        //（ColumnLayout 跳过 invisible 项，不占位；索引恒定）
+                        visible: !modelData.gated || backend.captureEnabled
                         Layout.fillWidth: true
                         height: 36
                         radius: 8

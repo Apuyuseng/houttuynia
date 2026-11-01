@@ -98,6 +98,9 @@ public:
     static QHash<QString, quint32> packageUids(const QString& serial);
     // pid → 包名（uid 表 + ps 联合）。
     static QMap<quint32, QString> pidPackages(const QString& serial);
+    // 宿主侧 ecapture 查找（bundle Resources/bin → 可执行同目录 → ~/.mwine/bin；
+    // daemon 组件状态接口用：空 = 未安装，前端引导下载）
+    static QString findHostBinary();
 
     // 数据库路径注入（默认 ~/.mwine/capture/flows.db；须在未运行时设置）。
     void setDbPath(const QString& path);
@@ -105,7 +108,6 @@ public:
 private:
     struct Shared;
 
-    static QString findHostBinary();
     static void collectorLoop(Shared* sh, const QString& bin);
     static void watchdogLoop(Shared* sh);
     static void processEvents(Shared* sh, const QVector<Event>& events);

@@ -85,6 +85,22 @@ HTTP 代理一键指向宿主；设备身份重置（android_id / 广告 ID 换�
 ### ⌨️ 命令行与 API
 GUI 能做的，CLI 都能做；UI 与 CLI 同源，统一走 `mwine-cored` 守护进程（localhost REST API）。
 
+### 🌐 NAS 版（Web 控制台，nas 分支）
+`nas` 分支把产品变成家庭服务器上的 Web 服务：**Rust 网关（axum + 自研
+adb/scrcpy 协议栈）**对外开放 REST API，内嵌 **Vue 3 + Element Plus** 控制台
+——局域网里任何设备的浏览器都能开关虚拟机、看 scrcpy 实时画面（WebCodecs
+硬解 + 触控注入）、上传 APK 装应用、管镜像、开 ADB 终端、改设置。Docker
+一键部署（群晖/威联通/TrueNAS/绿联通用），也可裸跑在常开的 Mac mini 上
+（全速 HVF 加速）。
+
+```bash
+docker build -t houttuynia-nas -f nas/Dockerfile .   # 国内加 --build-arg APT_MIRROR=mirrors.ustc.edu.cn CARGO_MIRROR=rsproxy
+cd nas && docker compose up -d                        # 先改 compose 里的 MWINE_TOKEN
+# 浏览器打开 http://<NAS的IP>:7788，输入令牌即可
+```
+
+部署形态、环境变量、能力矩阵、安全须知与 FAQ 详见 `nas/README.md`。
+
 ## 快速开始
 
 1. 从 [Releases](../../releases) 下载并解压 `Houttuynia-*.zip`，把 **Houttuynia.app** 拖入「应用程序」

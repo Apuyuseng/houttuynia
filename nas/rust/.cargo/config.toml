@@ -1,0 +1,9 @@
+# 国内网络加速（rsproxy 字节镜像）；海外构建可整文件删除
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+[net]
+git-fetch-with-cli = true

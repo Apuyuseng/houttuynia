@@ -31,13 +31,19 @@ public class WallpaperReceiver extends BroadcastReceiver {
             name = "wallpaper.png";
         }
         name = new File(name).getName();
-        File dir = context.getExternalFilesDir(null);
+        // 落点优先 /sdcard 根（宿主 adb shell 可读——A11+ scoped storage 挡的
+        // 正是应用外部私有目录）。MANAGE_EXTERNAL_STORAGE 由宿主 appops 授予；
+        // 未授时直写会失败 → 兜底应用外部私有目录（老安卓 adb 可读）。
+        File dir = new File(android.os.Environment.getExternalStorageDirectory(), "mwine");
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            dir = context.getExternalFilesDir(null);
+            android.util.Log.i("mwine-bridge", "sdcard 不可写，回落应用目录");
+        }
         android.util.Log.i("mwine-bridge", "WallpaperReceiver run, out=" + name
                 + " dir=" + dir);
         if (dir == null) {
             return;
         }
-        dir.mkdirs();
         final String out = new File(dir, name).getAbsolutePath();
         int maxDim = intent.getIntExtra("maxDim", 1080);
         try {

@@ -25,10 +25,13 @@ inline const char* kSocketName = "scrcpy";
 
 /// 每会话独立的远端 jar 路径：并发会话共用同一路径会在推送时互相覆盖，
 /// 后启动会话把先启动会话正在加载的字节码写坏（表现为会话超时/黑屏窗口）。
+/// 必须以 .jar 结尾：Android 5.0 的 ART（API 21，产品最老镜像）对 CLASSPATH
+/// 中无 .jar 扩展名的条目直接 SIGABRT（2026-10-20 实测：scrcpy-server.3 /
+/// scrcpy-server.27a0b7b7 全部 Aborted，改 .jar 即正常）。
 inline QString sessionRemotePath(quint32 session)
 {
-    return QStringLiteral("%1.%2").arg(QString::fromLatin1(kServerRemotePath),
-                                       QString::number(session, 16));
+    return QStringLiteral("%1-%2.jar").arg(QString::fromLatin1(kServerRemotePath),
+                                           QString::number(session, 16));
 }
 
 enum class VideoCodecId {

@@ -101,6 +101,12 @@ class Backend : public QObject {
     Q_PROPERTY(QJsonArray captureFlows READ captureFlows NOTIFY captureChanged)
     Q_PROPERTY(int captureTotal READ captureTotal NOTIFY captureChanged)
     Q_PROPERTY(QJsonObject captureDetail READ captureDetail NOTIFY captureChanged)
+    // ecapture 组件（app 不内置）：present/安装中状态 + 下载任务进度
+    Q_PROPERTY(QJsonObject captureBinStatus READ captureBinStatus NOTIFY captureBinChanged)
+    Q_PROPERTY(QJsonObject captureBinTask READ captureBinTask NOTIFY captureBinTaskChanged)
+    // 流量分析功能开关（设置页；未开启时侧栏不显示入口）。QSettings 持久化
+    Q_PROPERTY(bool captureEnabled READ captureEnabled WRITE setCaptureEnabled
+                   NOTIFY captureEnabledChanged)
 
 public:
     explicit Backend(QObject *parent = nullptr);
@@ -167,6 +173,11 @@ public:
     QJsonArray captureFlows() const { return m_captureFlows; }
     int captureTotal() const { return m_captureTotal; }
     QJsonObject captureDetail() const { return m_captureDetail; }
+    QJsonObject captureBinStatus() const { return m_captureBinStatus; }
+    QJsonObject captureBinTask() const { return m_captureBinTask; }
+    bool captureEnabled() const { return m_captureEnabled; }
+    // Q_INVOKABLE：设置页以函数形式调用（仅作属性 WRITE 赋值不可函数调用）
+    Q_INVOKABLE void setCaptureEnabled(bool v);
 
     // ===== VM 控制 =====
     Q_INVOKABLE void startVm();
@@ -240,6 +251,10 @@ public:
                                        const QString &package = {});
     Q_INVOKABLE void captureLoadDetail(qint64 id);
     Q_INVOKABLE void captureClear();
+    // ecapture 组件按需下载（下载完成后发 captureBinInstalled，页面可自动开始采集）
+    Q_INVOKABLE void captureBinInstall();
+    Q_INVOKABLE void captureBinCancel();
+    Q_INVOKABLE void refreshCaptureBinStatus(); // 设置页可见时拉一次（平时仅采集页轮询）
 
     // ===== 页面级轮询开关 =====
     Q_INVOKABLE void setPerfActive(bool active);
@@ -285,6 +300,11 @@ signals:
     void imageSwitchFinished(bool ok, const QString &error);
     void officialImagesChanged();
     void runtimeTaskChanged();
+    void captureBinChanged();
+    void captureBinTaskChanged();
+    void captureBinInstalled(); // 组件下载落位成功（流量分析页自动开始采集）
+    void captureEnabledChanged();
+    void captureBinMissing();   // 开启流量分析但组件未装（设置页弹下载引导）
     void runtimeChanged();
     void configChanged();
     void diskChanged();
@@ -458,6 +478,9 @@ private:
     QJsonArray m_captureFlows;
     int m_captureTotal = 0;
     QJsonObject m_captureDetail;
+    QJsonObject m_captureBinStatus;   // {present, path, installing}
+    QJsonObject m_captureBinTask;     // 下载任务进度（TaskState 序列化）
+    bool m_captureEnabled = false;    // 功能开关（QSettings ui/captureEnabled）
 
     // 真机连接
     QJsonArray m_deviceList;

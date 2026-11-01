@@ -109,15 +109,22 @@ cp ~/.mwine/bin/scrcpy-server-v4.1 "$APP/Contents/Resources/bin/" 2>/dev/null \
   || echo "  ⚠ scrcpy-server 缺失（独立窗口/镜像将不可用）"
 cp "$ROOT/assets/companion/dist/mwine-bridge.apk" "$APP/Contents/Resources/bin/" 2>/dev/null \
   || echo "  ⚠ companion mwine-bridge.apk 缺失（矢量图标将退化为默认图标）"
-# 流量分析：eBPF 采集器（Apache-2.0，gojue/ecapture android-arm64）
-# ELF 可用 upx 压缩（~40MB → ~15MB）。宿主 Mach-O 不可 upx：arm64 macOS 会
-# 对自解压存根写可执行内存直接 SIGKILL（实测 ad-hoc 签名+entitlements 也无效）。
-cp ~/.mwine/bin/ecapture "$APP/Contents/Resources/bin/" 2>/dev/null \
-  || echo "  ⚠ ecapture 缺失（流量分析不可用；放入 ~/.mwine/bin/ecapture 后重新打包）"
-if command -v upx >/dev/null 2>&1 && [ -f "$APP/Contents/Resources/bin/ecapture" ]; then
-  upx --lzma -q "$APP/Contents/Resources/bin/ecapture" >/dev/null 2>&1 \
-    && echo "  ✓ ecapture 已 upx 压缩 $(du -h "$APP/Contents/Resources/bin/ecapture" | cut -f1)" \
-    || echo "  ⚠ upx 压缩 ecapture 失败（保留原样）"
+# 流量分析：eBPF 采集器 ecapture（Apache-2.0，gojue/ecapture android-arm64）。
+# 默认不打包——首启在流量分析页按需下载（GitHub Releases latest 资产
+# ecapture-android-arm64，daemon /api/capture/binary/install，断点续传）。
+# 需要"全量离线包"时：MWINE_BUNDLE_ECAPTURE=1（upx 压缩 ~40MB → ~13MB）。
+# （宿主 Mach-O 不可 upx：arm64 macOS 会对自解压存根写可执行内存直接 SIGKILL；
+#   ELF 的 ecapture 运行于 guest Linux，不受影响。）
+if [ -n "$MWINE_BUNDLE_ECAPTURE" ]; then
+  cp ~/.mwine/bin/ecapture "$APP/Contents/Resources/bin/" 2>/dev/null \
+    || echo "  ⚠ ecapture 缺失（离线包模式放弃内嵌；放入 ~/.mwine/bin/ecapture 后重新打包）"
+  if command -v upx >/dev/null 2>&1 && [ -f "$APP/Contents/Resources/bin/ecapture" ]; then
+    upx --lzma -q "$APP/Contents/Resources/bin/ecapture" >/dev/null 2>&1 \
+      && echo "  ✓ ecapture 已内嵌并 upx 压缩 $(du -h "$APP/Contents/Resources/bin/ecapture" | cut -f1)" \
+      || echo "  ⚠ upx 压缩 ecapture 失败（保留原样）"
+  fi
+else
+  echo "  ✓ 瘦身模式：ecapture 按需下载（流量分析页引导，MWINE_BUNDLE_ECAPTURE=1 可内嵌）"
 fi
 
 # AVD 模板（零依赖首启种子：只带配置，userdata 全新）——放基础包
@@ -142,12 +149,51 @@ cp "$SDK/build-tools/$BT_VER/aapt2" "$RUNTIME/build-tools/$BT_VER/" 2>/dev/null 
   || echo "  ⚠ aapt2 缺失（.app 壳生成将退化）"
 echo "  ✓ avd 模板 + aapt2"
 
-# 体积优化注意：Qt Quick Controls 的风格插件在 Resources/qml/QtQuick/Controls/<Style>/
-# 有 qmldir 引用且依赖对应 Frameworks 框架——引擎启动时会加载它们；三处（qml 目录/
-# PlugIns/Frameworks）不同步删除会导致 Controls 模块整体加载失败。故风格不裁剪，
-# 只做无引用风险的 QML 编译缓存清理（按需重建）。
+# 体积优化 1：QML 编译缓存清理（按需重建，零风险）
 find "$APP/Contents/Resources/qml" \( -name '*.qmlc' -o -name '*.jsc' \) -delete 2>/dev/null
-echo "  ✓ qmlc 清理"
+
+# 体积优化 2：Quick Controls 风格裁剪（~15MB）。前提：main.cpp 钉死
+# QQuickStyle::setStyle("Fusion")，根 qmldir 中其余风格均为 optional import
+# （引擎容忍缺失），Fusion 只回退 Basic，被删风格仅活在 Dialogs 的 +<风格>/
+# 文件选择器目录（对应风格激活才加载）。三处同步删：qml 目录 / PlugIns / Frameworks。
+# 若未来改用其他风格，改这里的列表即可。
+TRIM_STYLES=(FluentWinUI3 Imagine Material Universal macOS iOS)
+for st in "${TRIM_STYLES[@]}"; do
+  lower=$(echo "$st" | tr 'A-Z' 'a-z')
+  rm -rf "$APP/Contents/Resources/qml/QtQuick/Controls/$st" \
+         "$APP/Contents/Resources/qml/QtQuick/Dialogs/quickimpl/qml/+$st"
+  rm -f  "$APP/Contents/PlugIns/quick/libqtquickcontrols2${lower}styleplugin.dylib" \
+         "$APP/Contents/PlugIns/quick/libqtquickcontrols2${lower}styleimplplugin.dylib"
+  rm -rf "$APP/Contents/Frameworks/QtQuickControls2${st}.framework" \
+         "$APP/Contents/Frameworks/QtQuickControls2${st}StyleImpl.framework"
+done
+# NativeStyle 仅为 macOS/iOS 风格服务；designer/ 是 Qt Design Studio 元数据
+rm -rf "$APP/Contents/Resources/qml/QtQuick/NativeStyle" \
+       "$APP/Contents/Resources/qml/QtQuick/Controls/designer"
+rm -f  "$APP/Contents/PlugIns/quick/libqtquickcontrols2nativestyleplugin.dylib"
+
+# 体积优化 3：未被引用的 QML 模块（app 与保留模块的 import 集合之外）。
+# 注意：Qt.labs.folderlistmodel 被 Dialogs 引用必须保留；QtQuick.Shapes 被
+# Fusion/Basic 引用必须保留。每个模块同样三处同步删。
+TRIM_MODULES=(
+  "Particles:libparticlesplugin:QtQuickParticles:qml/QtQuick/Particles"
+  "VectorImage:libqquickvectorimageplugin:QtQuickVectorImage:qml/QtQuick/VectorImage"
+  "VectorImageHelpers:libqquickvectorimagehelpersplugin:QtQuickVectorImageHelpers:"
+  "VectorImageGenerator::QtQuickVectorImageGenerator:"
+  "ShapesDesignHelpers:libqtquickshapesdesignhelpersplugin:QtQuickShapesDesignHelpers:"
+  "LocalStorage:libqmllocalstorageplugin:QtQmlLocalStorage:qml/QtQuick/LocalStorage"
+  "XmlListModel:libqmlxmllistmodelplugin:QtQmlXmlListModel:qml/QtQml/XmlListModel"
+)
+for mod in "${TRIM_MODULES[@]}"; do
+  IFS=':' read -r _ plugin fw qmldir <<<"$mod"
+  [ -n "$plugin" ] && rm -f "$APP/Contents/PlugIns/quick/${plugin}.dylib"
+  [ -n "$fw" ] && rm -rf "$APP/Contents/Frameworks/${fw}.framework"
+  [ -n "$qmldir" ] && rm -rf "$APP/Contents/$qmldir"
+done
+
+# 体积优化 4：剥离可执行文件本地符号（Qt 框架 Homebrew 侧已 strip，无需处理）
+for exe in "$APP/Contents/MacOS/"*; do strip -x "$exe" 2>/dev/null || true; done
+echo "  ✓ 风格/模块裁剪 + strip（体积优化 2/3/4）"
 
 # 图标（鱼腥草心形叶）
 mkdir -p "$APP/Contents/Resources"

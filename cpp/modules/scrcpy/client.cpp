@@ -64,6 +64,20 @@ mw::Result<mw::adb::TcpConn> connectWithRetry(quint16 port, int timeoutMs)
 
 } // namespace
 
+namespace {
+
+// 稳定共享路径（与 start() 的 remoteJar 构造同源）：升级内容变化前的所有
+// 会话都复用它。该路径不做会话结束清理——jar 留在设备上供下次秒启
+//（老镜像重推意味着重新 dexopt 数秒）；/data/local/tmp 由 guest 重启自清。
+bool isSharedStableJar(const QString& path)
+{
+    return path == QStringLiteral("%1-v%2.jar")
+                       .arg(QString::fromLatin1(kServerRemotePath),
+                            QString::fromLatin1(kServerVersion));
+}
+
+} // namespace
+
 // ---- ControlChannel ----
 
 mw::Result<bool> ControlChannel::send(const ControlMessage& msg)
@@ -117,7 +131,8 @@ void SessionGuard::stop()
     // 远端 jar 清理移后台：adb shellBlocking 最长 10s，同步做会拖住调用方
     //（窗口关闭路径）。残留 /data/local/tmp jar 无害：随机名不会复用，
     // guest 重启自动清空。
-    if (!m_state->remoteJar.isEmpty() && !m_state->serial.isEmpty()) {
+    if (!m_state->remoteJar.isEmpty() && !m_state->serial.isEmpty()
+        && !isSharedStableJar(m_state->remoteJar)) {
         const QString escaped = [jar = m_state->remoteJar]() {
             QString out;
             for (const QChar c : jar) {
@@ -154,7 +169,7 @@ void Session::stop()
 
 void Session::cleanupJar()
 {
-    if (m_remoteJar.isEmpty() || serial.isEmpty())
+    if (m_remoteJar.isEmpty() || serial.isEmpty() || isSharedStableJar(m_remoteJar))
         return;
     QString escaped;
     for (const QChar c : m_remoteJar) {
@@ -201,18 +216,32 @@ mw::Result<Session> ScrcpyClient::start() &&
     if (!QFile::exists(serverJar))
         return mw::err<Session>(errServerJarNotFound(serverJar));
 
-    // 1. 推送 server jar（每会话独立路径，防并发会话互相覆盖写坏字节码）
-    //    scid 必须回写进 options：server 的 socket 名与 forward 目标都由它派生，
-    //    不回写时双方都退化为裸名 "scrcpy"，任何残留进程都会劫持新会话。
+    // 1. 推送 server jar
+    //    远端用「稳定路径 + 同尺寸跳过」而非每会话随机路径：Android 5.0 的 ART
+    //    对每个新 jar 路径都要做一次 dexopt（老镜像上数秒），随机路径意味着
+    //    每次开流都付出冷 dexopt——首连探测会先于 server 就绪耗尽耐心，
+    //    半开连接还把刚 accept 的 server 拖死（2026-10-20 实测定位）。
+    //    并发会话共享同一 jar 没有安全问题（jar 只读；scid 隔离 socket），
+    //    上游 scrcpy 也是单一远端路径。内容变化（升级）时覆盖推送一次即可。
     const quint32 session = options.scid.value_or(ServerOptions::randomScid());
     options.scid = session;
-    const QString remoteJar = sessionRemotePath(session);
+    const QString remoteJar = QStringLiteral("%1-v%2.jar")
+                                  .arg(QString::fromLatin1(kServerRemotePath),
+                                       QString::fromLatin1(kServerVersion));
 
     QFile jarFile(serverJar);
     if (!jarFile.open(QIODevice::ReadOnly))
         return mw::err<Session>(errIo(QStringLiteral("读取 server jar 失败: %1").arg(serverJar)));
     const QByteArray jar = jarFile.readAll();
+    // 已存在同尺寸 jar 则跳过推送（dexopt 已热，启动快一个数量级）
+    bool skipPush = false;
     {
+        const auto st = adb.shellBlocking(
+            serial, QStringLiteral("stat -c %s '%1' 2>/dev/null || echo 0").arg(remoteJar), 5000);
+        if (st.ok() && st.value().outStr().trimmed().toLongLong() == jar.size())
+            skipPush = true;
+    }
+    if (!skipPush) {
         auto pushed = adb.pushBytes(serial, jar, remoteJar);
         if (!pushed.ok())
             return mw::err<Session>(errLaunchFailed(
@@ -246,14 +275,18 @@ mw::Result<Session> ScrcpyClient::start() &&
     // 因此必须把"读到 dummy 字节"作为 server 就绪判据，失败即重连。
     // 首探前置等待：server 进程启动到监听需数百毫秒，零延迟首探几乎必失败
     // （每次失败探测 = 一次经 emulator ADB vsock 代理的被拒连接，高频抖动
-    // 正是上游 AdbVsockPipe 竞态崩溃的触发面），先等 400ms 再探可消掉
-    // 绝大多数失败探测
+    // 正是上游 AdbVsyncPipe 竞态崩溃的触发面），先等 400ms 再探可消掉
+    // 绝大多数失败探测。
+    // 首个 dummy 读取给足 12s：直连 accept 池内部对未绑定的 abstract socket
+    // 重试 ~10s——探测方 2s 就放弃会把 server 刚 accept 的连接掐死，
+    // server 视首个连接断开为会话结束直接退出（老镜像冷启动必现）。
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     mw::adb::TcpConn videoTcp;
     {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(15);
         bool got = false;
+        bool first = true;
         while (std::chrono::steady_clock::now() < deadline) {
             auto conn = mw::adb::TcpConn::connect(QStringLiteral("127.0.0.1"), port.value(), 2000);
             if (!conn.ok()) {
@@ -261,12 +294,13 @@ mw::Result<Session> ScrcpyClient::start() &&
                 continue;
             }
             conn.value().setNoDelay(true);
-            auto dummy = conn.value().readAtMost(1, 2000);
+            auto dummy = conn.value().readAtMost(1, first ? 12000 : 2000);
             if (dummy.ok() && !dummy.value().isEmpty()) {
                 videoTcp = std::move(conn.value());
                 got = true;
                 break;
             }
+            first = false;
             // server 尚未监听（或刚启动即退出），重试
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }

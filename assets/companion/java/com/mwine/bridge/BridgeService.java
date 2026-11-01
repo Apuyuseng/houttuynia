@@ -38,6 +38,7 @@ public class BridgeService extends NotificationListenerService {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         synchronized (LOCK) {
             if (server == null) {
                 try {
@@ -53,22 +54,40 @@ public class BridgeService extends NotificationListenerService {
     }
 
     private static void serve() {
-        try {
-            android.util.Log.i("mwine", "bridge server listening on 127.0.0.1:" + PORT);
-            while (true) {
-                final Socket s = server.accept();
-                android.util.Log.i("mwine", "host connected: " + s);
-                io.execute(() -> {
-                    sendToOne(s, eventJson("hello"));
-                    synchronized (clients) {
-                        clients.add(s);
+        // 自愈循环：accept 异常（如 backlog 占满后文件描述符问题）不永久杀死监听，
+        // 关闭旧 ServerSocket 重建再收（荣耀 MagicOS 长时间运行实测会偶发 accept 失败）
+        while (true) {
+            try {
+                android.util.Log.i("mwine", "bridge server listening on 127.0.0.1:" + PORT);
+                while (true) {
+                    final Socket s = server.accept();
+                    android.util.Log.i("mwine", "host connected: " + s);
+                    io.execute(() -> {
+                        sendToOne(s, eventJson("hello"));
+                        synchronized (clients) {
+                            clients.add(s);
+                        }
+                    });
+                    // 请求通道（与通知推送共用同一条连接）：
+                    //   {"req":"apps"} → {"resp":"apps","apps":[{pkg,label,icon}…]}
+                    //   icon 为 base64 PNG（系统 API 渲染，密度/本地化与桌面一致）
+                    Thread rt = new Thread(() -> serveRequests(s), "mwine-bridge-req");
+                    rt.start();
+                }
+            } catch (Exception e) {
+                android.util.Log.w("mwine", "bridge server died, rebuilding: " + e);
+                synchronized (LOCK) {
+                    try { if (server != null) server.close(); } catch (Exception ignored) {}
+                    server = null;
+                    try {
+                        server = new ServerSocket(PORT, 8, InetAddress.getByName("127.0.0.1"));
+                        android.util.Log.i("mwine", "bridge server rebuilt");
+                    } catch (Exception e2) {
+                        android.util.Log.w("mwine", "rebuild failed: " + e2);
                     }
-                });
-            }
-        } catch (Exception e) {
-            android.util.Log.w("mwine", "bridge server died: " + e);
-            synchronized (LOCK) {
-                server = null;
+                }
+                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                if (server == null) return; // 重建也失败：等下次 onCreate/重绑
             }
         }
     }
@@ -100,6 +119,93 @@ public class BridgeService extends NotificationListenerService {
             android.util.Log.w("mwine", "json failed: " + e);
         }
     }
+
+    /** 单客户端请求循环：一行一个请求，读到断开为止。 */
+    private static void serveRequests(Socket s) {
+        try {
+            java.io.BufferedReader in = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
+            while (true) {
+                String line = in.readLine();
+                if (line == null) break;
+                String resp = handleRequest(line.trim());
+                if (resp != null) {
+                    synchronized (clients) {
+                        // 直接写（可能数 MB，不能经 io 单线程排队阻塞通知）
+                        try {
+                            java.io.OutputStream out = s.getOutputStream();
+                            out.write((resp + "\n").getBytes("UTF-8"));
+                            out.flush();
+                        } catch (Exception e) {
+                            closeQuietly(s);
+                            synchronized (clients) { clients.remove(s); }
+                            return;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static String handleRequest(String line) {
+        try {
+            JSONObject req = new JSONObject(line);
+            String r = req.optString("req", "");
+            if ("apps".equals(r)) {
+                return appsJson();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /** 全量可启动应用：系统 PackageManager 取 label + 图标（144px PNG base64）。 */
+    private static String appsJson() {
+        try {
+            android.content.pm.PackageManager pm = getCtx().getPackageManager();
+            android.content.Intent it = new android.content.Intent(
+                    android.content.Intent.ACTION_MAIN);
+            it.addCategory(android.content.Intent.CATEGORY_LAUNCHER);
+            java.util.List<android.content.pm.ResolveInfo> ris =
+                    pm.queryIntentActivities(it, 0);
+            org.json.JSONArray arr = new org.json.JSONArray();
+            java.util.HashSet<String> seen = new java.util.HashSet<>();
+            for (android.content.pm.ResolveInfo ri : ris) {
+                String pkg = ri.activityInfo == null ? null : ri.activityInfo.packageName;
+                if (pkg == null || !seen.add(pkg)) continue;
+                try {
+                    CharSequence labelCs = ri.loadLabel(pm);
+                    String label = labelCs == null ? pkg : labelCs.toString();
+                    android.graphics.drawable.Drawable icon = ri.loadIcon(pm);
+                    String b64 = "";
+                    if (icon != null) {
+                        b64 = android.util.Base64.encodeToString(
+                                IconRender.renderPng(icon, 144), android.util.Base64.NO_WRAP);
+                    }
+                    JSONObject o = new JSONObject();
+                    o.put("pkg", pkg);
+                    o.put("label", label);
+                    o.put("icon", b64);
+                    arr.put(o);
+                } catch (Exception ignored) {
+                }
+            }
+            JSONObject resp = new JSONObject();
+            resp.put("resp", "apps");
+            resp.put("apps", arr);
+            return resp.toString();
+        } catch (Exception e) {
+            android.util.Log.w("mwine", "appsJson failed: " + e);
+            return "{\"resp\":\"apps\",\"apps\":[]}";
+        }
+    }
+
+    private static android.content.Context getCtx() {
+        return ctx != null ? ctx : (ctx = instance);
+    }
+    private static volatile android.content.Context ctx;
+    private static volatile android.content.Context instance;
 
     private static String eventJson(String event) {
         try {

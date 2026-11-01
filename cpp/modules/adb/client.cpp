@@ -145,7 +145,22 @@ mw::Result<SmartConnection> AdbClient::transport(const QString& serial) const
     auto conn = connectServer(10000);
     if (!conn.ok())
         return conn;
-    auto st = conn.value().sendService(QStringLiteral("host:transport:%1").arg(serial));
+    // 优先新协议 host:tport（adb server 34+）。实测 37.0.0 server 上走旧式
+    // host:transport 后一切 shell v2 服务必现 FAIL closed（2026-10-20 排查：
+    // 直连回落 server 模式的 shellStream 全灭根因）；旧 server 无 tport
+    // 服务时 FAIL，同一连接上再发 legacy 兜底（smart-socket 允许 FAIL 后续发）。
+    auto st = conn.value().sendService(QStringLiteral("host:tport:%1").arg(serial));
+    if (st.ok()) {
+        // tport OKAY 后 server 会立即推送 8 字节 transport_id（LE u64）——
+        // 不消费它，下一个服务的状态字节会错位读出（8 字节塞进 status 窗口）。
+        const auto id = conn.value().stream().readExact(8, 2000);
+        if (!id.ok() || id.value().size() != 8) {
+            return mw::err<SmartConnection>(
+                errProtocol(QStringLiteral("tport 后读取 transport_id 失败")));
+        }
+        return conn;
+    }
+    st = conn.value().sendService(QStringLiteral("host:transport:%1").arg(serial));
     if (!st.ok())
         return mw::err<SmartConnection>(st.error());
     return conn;
@@ -434,6 +449,11 @@ mw::Result<ShellSession> AdbClient::shellPtySession(const QString& serial, const
 mw::Result<ShellStream> AdbClient::shellStream(const QString& serial, const QString& cmd) const
 {
     auto conn = deviceConn(serial, v2Service(cmd));
+    // 老 adb server 不认 shell v2（实测某 SDK 旧 server 对任何 v2 服务
+    // 一律 FAIL closed）且直连偶发不可达时，与 shellBlocking 同策略回退
+    // v1——scrcpy server 保活流不读分帧，v1 混流完全够用
+    if (!conn.ok())
+        conn = deviceConn(serial, v1Service(cmd));
     if (!conn.ok())
         return mw::err<ShellStream>(conn.error());
     return mw::Result<ShellStream>::Ok(ShellStream(conn.value().takeStream()));

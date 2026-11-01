@@ -1,0 +1,33 @@
+# ============================================================
+# 鱼腥草（Houttuynia）NAS 版 —— 预编译二进制直打镜像（零网络拉取）
+#
+# 适用：arm64 等宿主拉不动 rust/debian 基础镜像的场景。二进制在构建机
+# 交叉编译（cargo build --release --target aarch64-unknown-linux-musl，
+# zig cc 链接，musl 静态），此镜像 FROM scratch 只组装运行时文件。
+#
+#   docker build -t houttuynia-nas:prebuilt -f nas/Dockerfile.prebuilt .
+#
+# 与 nas/Dockerfile 的差异：无 shell/curl/ca-certificates（rustls 内置
+# webpki-roots，健康检查移到宿主侧 curl）。NAS 版为纯真机网关，无模拟器。
+# ============================================================
+
+FROM scratch
+
+# 预编译 musl 静态二进制（见上注释的构建命令）
+COPY prebuilt/mwine-nas /usr/local/bin/mwine-nas
+COPY web-vue/dist/ /opt/mwine/web/
+COPY assets/companion/dist/mwine-bridge.apk /opt/mwine/bin/mwine-bridge.apk
+COPY dist/Houttuynia.app/Contents/Resources/bin/scrcpy-server-v4.1 /opt/mwine/bin/scrcpy-server-v4.1
+# scratch 没有 /tmp（Rust temp_dir / 上传中转用）
+COPY --chmod=1777 prebuilt/tmp/ /tmp/
+
+# HOME=/data：~/.mwine（配置/日志/图标缓存）全部落在持久卷
+VOLUME /data
+ENV HOME=/data \
+    MWINE_HOST=0.0.0.0 \
+    MWINE_PORT=7788 \
+    MWINE_WEB_DIR=/opt/mwine/web \
+    MWINE_HEADLESS=1
+
+EXPOSE 7788
+ENTRYPOINT ["/usr/local/bin/mwine-nas"]
