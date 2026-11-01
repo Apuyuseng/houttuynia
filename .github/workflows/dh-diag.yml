@@ -1,0 +1,16 @@
+name: dh-diag
+on: [push]
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - name: diag
+        run: |
+          V='${{ secrets.DOCKERHUB }}'
+          T='${{ secrets.DOCKERHUB_TOKEN }}'
+          U='${{ secrets.DOCKERHUB_USERNAME }}'
+          echo "DOCKERHUB: len=${#V} 前2字符=$(echo -n "$V" | cut -c1-2) 末字符类型=$(echo -n "$V" | tail -c1 | od -An -c | tr -d ' ')"
+          echo "DOCKERHUB_TOKEN: len=${#T}"
+          echo "DOCKERHUB_USERNAME: len=${#U} 值=${U:-<空>}"
+          [ -n "$V" ] && curl -s -o /dev/null -w "registry认证(apuyuseng+DOCKERHUB): %{http_code}\n" -u "apuyuseng:$V" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:apuyuseng/houttuynia-nas:pull,push"
+          [ -n "$V" ] && curl -s -o /dev/null -w "hub-api认证: %{http_code}\n" -u "apuyuseng:$V" "https://hub.docker.com/v2/users/me"
