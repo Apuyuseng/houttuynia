@@ -145,12 +145,23 @@ jobs:
           cache-from: type=gha
 
       # Docker Hub：secrets 配好后自动生效（未配置时整段跳过）
+      # 净化 DOCKERHUB 值：剥离误粘的「NAME=」前缀/引号/空白（真令牌 dckr_pat_ 开头）
+      - name: Sanitize DockerHub token
+        if: env.HAS_DH == 'true' && env.HAS_DH_TOKEN != 'true'
+        run: |
+          V='${{ secrets.DOCKERHUB }}'
+          P="${V#*=}"
+          P="$(printf %s "$P" | tr -d '\"\r\n' | xargs)"
+          echo "sanitized: len=${#P} prefix=$(printf %s "$P" | cut -c1-2)"
+          if [ -n "$P" ]; then
+            { echo "DH_PASS<<DH_EOF"; echo "$P"; echo "DH_EOF"; } >> "$GITHUB_ENV"
+          fi
       - name: Login Docker Hub
         if: env.HAS_DH_TOKEN == 'true' || env.HAS_DH == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME || 'apuyuseng' }}
-          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || env.DH_PASS }}
       - name: Push Docker Hub multi-arch (latest + sha)
         if: env.HAS_DH_TOKEN == 'true' || env.HAS_DH == 'true'
         uses: docker/build-push-action@v6
