@@ -150,8 +150,8 @@ jobs:
         if: env.HAS_DH == 'true' && env.HAS_DH_TOKEN != 'true'
         run: |
           V='${{ secrets.DOCKERHUB }}'
-          P="${V#*=}"
-          P="$(printf %s "$P" | tr -d '\"\r\n' | xargs)"
+          P="$(printf %s "$V" | grep -oE 'dckr_pat_[A-Za-z0-9_-]+' | head -1)"
+          [ -z "$P" ] && P="$(printf %s "${V#*=}" | awk '{print $1}')"
           echo "sanitized: len=${#P} prefix=$(printf %s "$P" | cut -c1-2)"
           if [ -n "$P" ]; then
             { echo "DH_PASS<<DH_EOF"; echo "$P"; echo "DH_EOF"; } >> "$GITHUB_ENV"
